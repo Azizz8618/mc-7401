@@ -23,23 +23,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mc7401-emulator"
-version = "0.1.0"
-description = "Эмулятор векторного графического терминала «Электроника МС 7401»"
+version = "1.0.0"
+description = "Эмулятор растрового графического терминала «Электроника МС 7401»"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [
-    { name = "Ваше имя", email = "you@example.com" },
-]
+authors = [{ name = "Проект МС 7401" }]
 keywords = [
     "emulator",
     "terminal",
     "mc7401",
     "electronika",
-    "vector-graphics",
+    "raster-graphics",
     "retrocomputing",
     "pascal",
     "graf",
+    "dks",
+    "besm6",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -115,14 +115,8 @@ all = [
 # Скрипты командной строки
 # ─────────────────────────────────────────────────────────────────────────────
 
-[project.scripts]
-mc7401 = "main:main"
-mc7401-patch = "tools.pascal_patcher:main"
-mc7401-vuk = "tools.vuk_emulator:main"
-
-
 [project.urls]
-Homepage = "https://github.com/<user>/mc7401-emulator"
+Homepage = "https://github.com/<user>/mc7401-emulator"  # TODO: заменить
 Repository = "https://github.com/<user>/mc7401-emulator"
 Issues = "https://github.com/<user>/mc7401-emulator/issues"
 Documentation = "https://github.com/<user>/mc7401-emulator/blob/main/README.md"
@@ -133,22 +127,16 @@ Changelog = "https://github.com/<user>/mc7401-emulator/blob/main/CHANGELOG.md"
 # Конфигурация setuptools
 # ─────────────────────────────────────────────────────────────────────────────
 
+[project.scripts]
+# Короткие команды после установки: `mc7401`, `mc` и `mc7401-гр` —
+# сценарии графики из tools/gen_golden.py.
+mc7401 = "mc7401.cli:main"
+mc = "mc7401.cli:main"
+
 [tool.setuptools]
-# Все модули лежат в корне проекта, без единого «пакета-обёртки».
-# setuptools соберёт их как top-level modules.
-py-modules = [
-    "main",
-    "reader",
-    "parser",
-    "state",
-    "emulator",
-]
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["backends*", "fonts*", "tools*"]
-exclude = ["tests*", "docs*"]
-
+# Пакет один — `mc7401`; `tools/` в установку не входит (это
+# транслятор и генератор сценариев, нужные только из исходников).
+packages = ["mc7401", "mc7401.backends"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ruff — быстрый линтер и форматтер

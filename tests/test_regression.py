@@ -416,3 +416,38 @@ def test_cyrillic_code_mapping_is_seven_bit_koi8():
     from mc7401.chars import GLYPHS_RU
     for ch, koi8 in (('п', 0xF0), ('и', 0xE9), ('т', 0xF4)):
         assert (koi8 & 0x7F) in GLYPHS_RU
+
+
+# ── развёртывание и документация ───────────────────────────────────────────
+
+def test_packaging_points_at_real_package():
+    """`pyproject.toml` описывает пакет `mc7401`, а не старые модули.
+
+    Секция `[tool.setuptools]` прежде перечисляла плоские `main`,
+    `reader`, `backends*` — установка падала бы.
+    """
+    import tomllib
+    root = Path(__file__).resolve().parent.parent
+    with open(root / 'pyproject.toml', 'rb') as fh:
+        cfg = tomllib.load(fh)
+    assert cfg['tool']['setuptools']['packages'] == ['mc7401', 'mc7401.backends']
+    assert cfg['project']['scripts']['mc7401'] == 'mc7401.cli:main'
+
+
+def test_shell_helpers_exist():
+    """Сценарии развёртывания и короткие команды на месте."""
+    root = Path(__file__).resolve().parent.parent
+    for rel in ('install.sh', 'install.ps1', 'tools/mc7401-completion.bash',
+                'tools/mc7401.fish', 'tools/check_dks_link.py',
+                'docs/DEPLOY.md', 'docs/COMMANDS.md'):
+        assert (root / rel).is_file(), f'нет {rel}'
+
+
+def test_completion_scripts_are_valid():
+    """Скрипты автодополнения разбираются оболочкой."""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    for script in ('tools/mc7401-completion.bash',):
+        r = subprocess.run(['bash', '-n', str(root / script)],
+                           capture_output=True)
+        assert r.returncode == 0, r.stderr.decode()
