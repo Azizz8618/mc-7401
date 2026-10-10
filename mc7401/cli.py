@@ -130,7 +130,7 @@ def main(argv=None) -> int:
                         timeout=args.link_timeout,
                         verbose=args.verbose)
 
-    data = sys.stdin.buffer.read() if args.input == '-' \
+    data = sys.stdin.buffer.read() if args.input in ('-', None) \
         else Path(args.input).read_bytes()
     if not data:
         print('пустой поток команд', file=sys.stderr)
