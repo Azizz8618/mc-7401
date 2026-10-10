@@ -56,6 +56,10 @@ HELP = [
 DEMO_KEYS = 'ЛИН 3 ВЫХ '
 
 
+class LinkRefused(Exception):
+    """Линия ДКС не открылась; текст — готовое объяснение для пользователя."""
+
+
 # ── драйверы ────────────────────────────────────────────────────────────────
 
 class Driver:
@@ -103,9 +107,48 @@ class LiveDriver(Driver):
     name = 'ДКС'
 
     def __init__(self, endpoint: str) -> None:
-        from .link import DKSLink
-        self.link = DKSLink(*_split(endpoint))
-        self.link.connect()
+        from .link import DKSLink, LinkError, spec_hint, split_endpoint
+        host, ports = split_endpoint(endpoint)
+        self.endpoint = endpoint
+        self.host, self.ports = host, ports
+        self.link = DKSLink(host, ports)
+        try:
+            self.link.connect()
+        except LinkError as exc:
+            raise LinkRefused(self._diagnose(exc)) from exc
+        self.name = f'ДКС {host}:{self.link.port}'
+
+    def _diagnose(self, exc: Exception) -> str:
+        """Человекочитаемое объяснение, почему линия не открылась."""
+        from .link import DEFAULT_PORTS
+        lines = [
+            f'Не удалось подключиться к линии ДКС: {exc}',
+            '',
+            f'  запрошено     : {self.host}:{spec_hint(self.ports)}',
+            f'  ЭВМ слушает   : порты {spec_hint(self.ports)}',
+        ]
+        if len(self.ports) == 1:
+            lines += [
+                '',
+                'Причины по порядку:',
+                f'  1. линия {self.ports[0]} уже занята другим терминалом '
+                '(ДКС допускает один терминал на линию);',
+                '  2. линия не создана: ОС Диспак не зарегистрировала канал '
+                f'(КРК {self.ports[0] - 4200 + 2});',
+                '  3. эмулятор БЭСМ-6 не запущен либо линия не в режиме ДКС '
+                '(`set ttyN dks,raw`).',
+                '',
+                f'Попробовать другие линии: --link {self.host}:'
+                f'{spec_hint(range(self.ports[0] + 1, self.ports[0] + 4))}',
+                f'  или весь диапазон: --link {self.host}:{DEFAULT_PORTS}',
+            ]
+        else:
+            lines += [
+                '',
+                'Все указанные порты заняты или не слушаются. Проверьте,',
+                'что линии в режиме ДКС и свободны.',
+            ]
+        return '\n'.join(lines)
 
     def poll(self, timeout: float) -> bytes:
         try:
@@ -352,27 +395,110 @@ class TerminalApp:
 
 # ── запуск из командной строки ──────────────────────────────────────────────
 
+def builtin_stream() -> bytes:
+    """Пробный поток команд, собираемый прямо в коде.
+
+    Нужен, чтобы `mc7401` сразу после установки показывал осмысленный
+    кадр: эталонные потоки лежат в каталоге исходников, а в
+    `site-packages` их нет.  Формат записи тот же, что у `graf.pas`:
+    команды разделены `ВК`, кадр обрамляется маркерами ВУК.
+    """
+    from .constants import AR2, S0, S1, VK
+
+    def rec(text) -> bytes:
+        """Одна запись потока: данные + разделитель `ВК`."""
+        if isinstance(text, bytes):
+            return text + bytes((VK,))
+        return text.encode('koi8-r', errors='replace') + bytes((VK,))
+
+    def blk(data: bytes) -> bytes:
+        """Обрамить данные блоком ВУК."""
+        return (b'/' + bytes((VK,)) + b'z' + b'0' * 19 + data
+                + bytes((AR2,)) + b'\xf5  '          # АР2 'У  '
+                + bytes((AR2,)) + b'F~' + bytes((VK,)))
+
+    out = bytearray()
+    out += blk(rec('J1') + rec('S'))
+    out += rec('] 8 1 551 398')                        # рамка
+    for n in range(1, 8):                              # образцы типов линий
+        y = 40 + n * 24
+        out += rec(f'4 40 {y}') + rec(f'7 {n} 400 {y}')
+    out += rec('4 60 180') + rec('> 2 60')             # окружность
+    out += rec('4 300 180') + rec('> 1 60')
+    out += rec('] 420 120 520 240')                    # прямоугольник
+    out += rec(f'4 60 300') + rec('9\x01') + rec(b';\x00 ' + b'\x70'
+           + 'ПРОБА ЭМУЛЯТОРА'.encode('koi8-r'))
+    out += blk(rec('4 60 320') + rec('9\x01')
+               + rec(b';\x00 ' + b'\x70'
+                     + 'ДИАЛОГОВЫЙ РЕЖИМ'.encode('koi8-r')))
+    return bytes(out)
+
+
+class BuiltinDriver(Driver):
+    """Пробный поток из :func:`builtin_stream` — работает всегда."""
+
+    name = 'проба'
+
+    def __init__(self) -> None:
+        self.inner = FileDriver.__new__(FileDriver)
+        self.inner.path = Path('<встроенный>')
+        self.inner.data = builtin_stream()
+        self.inner.pos = 0
+
+    def poll(self, timeout: float) -> bytes:
+        return self.inner.poll(timeout)
+
+    def send_keys(self, text: str) -> None:
+        log.info('пробный поток: ввод %r не требуется', text)
+
+
 def _default_stream() -> Optional[Path]:
-    here = Path(__file__).resolve().parent.parent
-    for name in ('ГРА', 'СЕТ', 'ЧАС'):
-        p = here / 'golden' / 'streams' / f'{name}.bin'
-        if p.exists():
-            return p
+    """Найти эталонный поток для запуска без аргументов.
+
+    Установленный пакет лежит в `site-packages`, где каталога `golden/`
+    нет, поэтому ищем в нескольких местах: рядом с исходниками, в текущем
+    каталоге и в каталоге пользователя.
+    """
+    names = ('ГРА', 'СЕТ', 'ЧАС', 'ЛИН')
+    roots = [Path(__file__).resolve().parent.parent, Path.cwd(),
+             Path.home() / '.local' / 'share' / 'mc7401']
+    for root in roots:
+        for name in names:
+            for cand in (root / 'golden' / 'streams' / f'{name}.bin',
+                         root / 'streams' / f'{name}.bin',
+                         root / f'{name}.bin'):
+                if cand.exists():
+                    return cand
     return None
+
+
+def _no_stream_hint() -> str:
+    return (
+        'Не найдено ни одного эталонного потока команд.\n'
+        'Укажите файл или подключитесь к ЭВМ:\n'
+        '  mc7401 golden/streams/ГРА.bin      — файл потока\n'
+        '  mc7401 --link 127.0.0.1:4202       — линия ДКС БЭСМ-6\n'
+        'Потоки создаются командой:\n'
+        '  python3 tools/gen_golden.py         — из golden/graf.pas')
 
 
 def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
             demo: bool = False, mode: str = 'color',
             grid: bool = False, pen: bool = False) -> int:
     if endpoint:
-        driver: Driver = LiveDriver(endpoint)
+        try:
+            driver: Driver = LiveDriver(endpoint)
+        except LinkRefused as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     elif demo or path is None:
         p = path or _default_stream()
         if p is None:
-            print('нет эталонных потоков; укажите файл или --link',
-                  file=sys.stderr)
-            return 2
-        driver = ScriptedDriver(p)
+            # Ни исходников, ни эталонных потоков рядом — показываем
+            # встроенную пробу, чтобы терминал всегда был на что посмотреть.
+            driver = BuiltinDriver()
+        else:
+            driver = ScriptedDriver(p)
     else:
         driver = FileDriver(path)
 

@@ -113,8 +113,19 @@ def main(argv=None) -> int:
     # заданный параметр вывода отключает его.
     action_flags = (args.link or args.listen or args.dump_ascii or args.stats
                     or args.png or args.frames or args.list_backends)
+    # Интерактивный режим — по умолчанию: без файла на входе и при
+    # терминале на stdin открываем диалог с терминалом.  Любой явно
+    # заданный параметр вывода отключает его.
+    action_flags = (args.link or args.listen or args.dump_ascii or args.stats
+                    or args.png or args.frames or args.list_backends)
     interactive = args.tui or (
         args.input is None and not action_flags and sys.stdin.isatty())
+
+    # `--link` без указания выходного файла тоже открывает окно: иначе
+    # связь с ЭВМ выглядит как команда, которая «ничего не делает».
+    if (args.link and args.input is None and not args.png
+            and not args.dump_ascii and not args.stats):
+        interactive = True
 
     if interactive:
         from .tui import run_tui
