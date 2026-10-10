@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help='слушать порт и обслуживать ЭВМ (обратный режим)')
     ap.add_argument('--link-timeout', type=float, default=0.0,
                     help='таймаут линии ДКС, с (0 — 10 с)')
+    ap.add_argument('--gui', '--window', action='store_true', dest='gui',
+                    help='графическое окно: кадр 560×400 вместе с текстом')
     ap.add_argument('--tui', action='store_true',
                     help='интерактивный режим (включён по умолчанию)')
     ap.add_argument('--pen', action='store_true',
@@ -106,6 +108,11 @@ def main(argv=None) -> int:
         print(f'записан образец конфигурации: {path}')
         print('правьте значения; файл подхватывается автоматически.')
         return 0
+
+    if args.gui:
+        from .window import run_window
+        return run_window(endpoint=args.link, scale=max(1, args.scale // 2),
+                          demo=args.demo)
 
     from .config import load as load_config
     cfg = load_config(args.conf)
