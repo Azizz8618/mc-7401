@@ -60,6 +60,17 @@ class Window:
         return self.x1 < self.x0 or self.y1 < self.y0
 
 
+def _code_int(value) -> int:
+    """Код символа как число.
+
+    Параметры команды `9` приходят из потока как коды символов
+    (`СНР(МСШ)`, `СНР(ОРН)`), то есть это байты, а не десятичные числа.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return value[0] if value else 0
+    return int(value)
+
+
 @dataclass
 class TerminalState:
     """Изменяемое состояние терминала."""
@@ -411,12 +422,12 @@ class TerminalEmulator:
         direction = st.text_direction
         if len(cmd.args) >= 1 and cmd.args[0]:
             try:
-                size = int(cmd.args[0])
+                size = _code_int(cmd.args[0])
             except (TypeError, ValueError):
                 pass
         if len(cmd.args) >= 2 and cmd.args[1]:
             try:
-                direction = int(cmd.args[1])
+                direction = _code_int(cmd.args[1])
             except (TypeError, ValueError):
                 direction = 0
         russian = st.font == 'RU'

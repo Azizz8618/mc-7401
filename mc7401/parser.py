@@ -132,6 +132,8 @@ class CommandParser:
 
     def __init__(self, xor_code: int = CMD_NOT):
         self.xor_code = xor_code
+        #: Размер текста из последней записи `9 S`.
+        self.text_size = b'\x00'
         #: Статистика нераспознанных записей (для отчётов).
         self.unknown: dict[bytes, int] = {}
 
@@ -205,11 +207,30 @@ class CommandParser:
         if fn == ord('9'):
             return self._parse_text(rec, rest)
 
+        if fn == ord(';'):
+            return self._parse_text_data(rec, rest)
+
         self.unknown[body] = self.unknown.get(body, 0) + 1
         return Command(Op.UNKNOWN, args=[body], raw=rec,
                        name=body.decode('koi8-r', 'replace'))
 
     # ── текст ────────────────────────────────────────────────────────────────
+
+    def _parse_text_data(self, rec: bytes, rest: bytes) -> Command:
+        """Разобрать запись данных текста `;O` П1 <строка> ВК.
+
+        Программа выводит размер и данные двумя записями
+        (`WRIТЕ('9', СНР(МСШ), ВК, ';', СНР(ОРН), П1)`), поэтому размер
+        берётся из предыдущей записи `9 S`, а `rest` содержит ориентацию
+        и саму строку.
+        """
+        orient = rest[:1]
+        payload = rest[1:]
+        # Разделитель параметров — пробел; он часть заголовка.
+        if payload[:1] == bytes((P1,)):
+            payload = payload[1:]
+        return Command(Op.TEXT, args=[self.text_size, orient],
+                       payload=payload, raw=rec, name='9')
 
     def _parse_text(self, rec: bytes, rest: bytes) -> Command:
         """Разобрать команду `9`.
@@ -223,11 +244,14 @@ class CommandParser:
         # `rest` начинается с кода размера (одного символа) и далее
         # заканчивается первым `ВК`, который отделяет «шапку» от данных.
         head, _, tail = rest.partition(bytes((VK,)))
+        # Размер запоминается сразу: запись `9 S` идёт отдельно от данных.
+        self.text_size = head[:1] or self.text_size
         if not _:
             # Нет разделителя — считаем, что данных нет.
             return Command(Op.TEXT, args=[head[:1]], payload=b'',
                            raw=rec, name='9')
         size = head[:1]
+        self.text_size = size
 
         # Форма `:N` — установка размера.
         if tail[:1] == b':':

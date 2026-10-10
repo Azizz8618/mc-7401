@@ -69,6 +69,23 @@ CHAR_MAP = {
 }
 
 
+def to_wire_char(c: str) -> int:
+    """Код символа в алфавите терминала (КОИ-8).
+
+    Терминал — растровое табло с КОИ-8 (`mc7401/chars.py`), поэтому
+    кириллица исходника должна попадать в линию как КОИ-8, а не как
+    младшие восемь бит кода Unicode.  Латиница, цифры и знаки
+    препинания в КОИ-8 совпадают с ASCII, поэтому командами потока
+    ничего не портится.
+    """
+    if c in CHAR_MAP:
+        return CHAR_MAP[c]
+    try:
+        return c.encode('koi8-r')[0]
+    except UnicodeEncodeError:
+        return ord(c) & 0xFF
+
+
 def _is_cyrillic(code: int) -> bool:
     return 0x410 <= code <= 0x44F
 
@@ -162,6 +179,14 @@ def _in(item, container) -> bool:
     return item in _set(container)
 
 
+class _InputExhausted(Exception):
+    """Оператор не ввёл ни одного символа.
+
+    Настоящий Монитор-80 в этой точке ждал бы нажатия клавиши; при
+    эмуляции программа прерывается на последнем выведенном кадре.
+    """
+
+
 def hchar(ch):
     """Символ как есть (заглушка для будущих раскладок)."""
     return ch
@@ -187,8 +212,16 @@ class PasFile:
         return Char(chr(END))
 
     def get(self) -> Char:
-        """`GЕТ(f)` — перейти к следующему символу, вернуть прежний."""
+        """`GЕТ(f)` — перейти к следующему символу, вернуть прежний.
+
+        За концом входного потока настоящий терминал блокируется на
+        ожидании клавиатуры оператора.  В эмуляции блокировку моделировать
+        нечем, поэтому выдаётся :class:`_InputExhausted`: программа
+        прерывается на том кадре, который был выведен последним.
+        """
         old = self.cur
+        if self.pos >= len(self.data):
+            raise _InputExhausted()
         self.pos += 1
         return old
 
@@ -212,7 +245,11 @@ def to_chars(value) -> list[str]:
     if isinstance(value, float):
         return list(str(value))
     if isinstance(value, str):
-        return [chr(CHAR_MAP.get(c, ord(c) & 0xFF)) for c in value]
+        # Символы хранятся как есть: кодирование в алфавит терминала
+        # выполняется при выдаче в линию (`Terminal.flush`).  Иначе
+        # рабочий файл программы (`INР` в `ЗАГОЛ`) содержал бы байты
+        # КОИ-8, и проверка `INР↑_IN РУСЛИТ` перестала бы работать.
+        return list(value)
     if isinstance(value, (list, tuple)):
         out: list[str] = []
         for item in value:
@@ -263,7 +300,7 @@ class Terminal:
         self.wire += VUK_MARK
         self.wire += bytes(VUK_HEADER_LEN - 1)     # хвост служебной записи
         for ch in self.data:
-            self.wire.append(ord(ch) & 0xFF)
+            self.wire.append(to_wire_char(ch))
         self.clear()
         return True
 
@@ -275,7 +312,7 @@ class Terminal:
         """
         n = len(self.data)
         for ch in self.data:
-            self.wire.append(ord(ch) & 0xFF)
+            self.wire.append(to_wire_char(ch))
         return n
 
     def frame_end(self) -> None:
@@ -612,6 +649,10 @@ def make_program(source: str, input_text: str = '',
         pass
     except _Goto as g:
         log_unreached(g)
+    except _InputExhausted:
+        # Оператор не ввёл команду: программа останавливается на кадре,
+        # который был выведен последним (см. _InputExhausted).
+        log.info('ввод исчерпан — программа прервана на последнем кадре')
     _terminal.flush(True)
     return {
         'wire': bytes(_terminal.wire),

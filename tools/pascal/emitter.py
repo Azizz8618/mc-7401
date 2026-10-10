@@ -293,9 +293,16 @@ class Emitter:
         return out
 
     def file_object(self, name: str) -> str:
-        """Файловая переменная диалекта: `INР` — ввод, `OUTRUT` — вывод."""
+        """Файловая переменная диалекта.
+
+        `INРUТ` — клавиатура оператора (единственный вход, с которого
+        программа читает команды).  `INР` — рабочий файл программы: в
+        `graf.pas` им пользуется `ЗАГОЛ` как записной книжкой
+        (`RЕWRIТЕ(INР); WRIТЕ(INР,'ИТМ')`) под вывод текста.  Смешивать
+        их нельзя: `REWRITE(INР)` обнулил бы поток ввода.
+        """
         c = canon(name)
-        if c in ('INP', 'INPUT'):
+        if c in ('INRUT', 'INPUT'):
             return '_input'
         if c in ('OUTPUT', 'OUTRUT', 'OUT'):
             return '_output'
@@ -330,14 +337,26 @@ class Emitter:
         shadow |= {k for k in r.locals if not k.startswith('#')}
         shadow |= {raw for raw, _v in r.consts.values()}
         visible = set(shadow)
+        enclosing: set = set()
         for frame in self.shadow_stack:      # локальные внешних подпрограмм
             visible |= frame
+            enclosing |= frame
         outer = [_py_name(v) for v in self.prog.vars if v not in visible]
+        # В диалекте вложенность разрешена: подпрограмма видит переменные
+        # всех объемлющих подпрограмм.  В Python чтение такой переменной
+        # работает через замыкание, но ПРИСВАИВАНИЕ делает её локальной
+        # (и даёт `UnboundLocalError` при чтении).  Поэтому имена,
+        # принадлежащие внешним подпрограммам, объявляем `nonlocal`.
+        # Имена из `shadow` (собственные локальные и параметры) из этого
+        # списка исключены — они и так имеют приоритет.
+        enclosing -= shadow
         self.shadow_stack.append(shadow)
         self.scope_stack.append(
             {**r.locals, **{p[0]: p[1] for p in r.params}})
         if outer:
             self.w('global ' + ', '.join(outer))
+        if enclosing:
+            self.w('nonlocal ' + ', '.join(_py_name(v) for v in enclosing))
         saved = self.routine
         self.routine = r
         for _c, (raw, value) in r.consts.items():
@@ -392,6 +411,15 @@ class Emitter:
                 self.indent -= 1
         if var_names:
             self.w('return (' + ', '.join(var_names) + ')')
+        if canon(name) == 'PRIKAZ':
+            # Оператор не ввёл команду: на настоящем терминале программа
+            # ждала бы нажатия клавиши и экран сохранял бы последний кадр.
+            # Без этой остановки `СЕЛЕСТ` попадает в ветвь `ТР:` и
+            # бесконечно перерисовывает картину.
+            self.w('if not А and INРUТ.pos >= len(INРUТ.data):')
+            self.indent += 1
+            self.w('raise SystemExit(0)')
+            self.indent -= 1
         self.routine = saved
         self.indent = base
         self.rid += 1
@@ -454,7 +482,8 @@ class Emitter:
             self.body(st[1], None)
             self.indent -= 1
         elif kind == 'assign':
-            self.w(f'{self.assign_target(st[1])} = {self.expr(st[2])}')
+            self.w(f'{self.assign_target(st[1])} = '
+                   f'{self.assigned_value(st[1], st[2])}')
         elif kind == 'call':
             name, args = st[1], st[2]
             if canon(name) == 'CODE':
@@ -738,6 +767,25 @@ class Emitter:
         if ty.get('kind') == 'array':
             return self.resolve(ty['elem'])
         return {'kind': 'int'}
+
+    def assigned_value(self, target: list, value: list) -> str:
+        """Правая часть присваивания с учётом типа переменной.
+
+        Запись массива в запись (`МАС = RЕСОRD М: АRRАУ [1..7] ОF INТ`)
+        задаётся литералом `[376В, 202В, …]`, а не `ММ.М := …`.  Без
+        подстановки литерал трактовался бы как множество, и обращение
+        `ММ.М[К]` падало бы с «'set' object is not subscriptable».
+        """
+        if target[0] != 'var' or value[0] not in ('list', 'setlit'):
+            return self.expr(value)
+        ty = self.resolve(self.type_of(target))
+        fields = ty.get('fields') or {}
+        arr = [f for f, t in fields.items()
+               if self.resolve(t).get('kind') == 'array']
+        if ty.get('kind') == 'record' and len(fields) == 1 and arr:
+            return "{'" + arr[0] + "': [" + \
+                ', '.join(self.expr(it[1]) for it in value[1]) + ']}'
+        return self.expr(value)
 
     def call_expr(self, name: str, args: list) -> str:
         c = canon(name)
