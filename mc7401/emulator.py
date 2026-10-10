@@ -24,6 +24,7 @@ from typing import Callable, Optional
 
 from . import chars
 from .constants import (
+    END,
     LINE_PATTERNS,
     LINE_TYPE_DISABLED,
     PEN_BY_CODE,
@@ -258,6 +259,8 @@ class TerminalEmulator:
             self.draw_text(cmd)
             return
         if op is Op.SET_TEXT_SIZE:
+            # Запись `9 : N` задаёт размер для всех следующих строк.
+            st.text_size = _code_int(a[0]) if a else 0
             return
 
         if op is Op.SHIFT_WINDOW:
@@ -431,6 +434,9 @@ class TerminalEmulator:
             except (TypeError, ValueError):
                 direction = 0
         russian = st.font == 'RU'
+        # Нулевой размер в потоке означает «мелкий знак», а не отсутствие
+        # знака: без этого глифы вырождаются в одну точку.
+        size = max(1, size)
         payload = self._prepare_payload(cmd.payload, russian)
         if not payload:
             return
@@ -450,6 +456,8 @@ class TerminalEmulator:
         """Разобрать байты строки: S0/S1 переключают шрифт, 0o240 — пропуск."""
         out: list[int] = []
         for b in payload:
+            if b == END:                        # признак конца текста
+                break
             if b == 0o160:                     # S0 — русский шрифт
                 self.state.font = 'RU'
                 russian = True

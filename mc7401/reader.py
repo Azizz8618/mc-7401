@@ -100,6 +100,8 @@ class CommandStreamReader:
         self._defrows: list[int] = []
         #: Последняя запись `9 S ВК` — её данные придут следующей записью.
         self._text_size: bytes = b''
+        #: Накопленные данные строки текста.
+        self._text_buf = bytearray()
         self._text_mode = False
 
     # ── состояние ────────────────────────────────────────────────────────────
@@ -123,6 +125,7 @@ class CommandStreamReader:
         if self._closed:
             return
         self._closed = True
+        self._flush_text()
         if self._buf:
             self._emit(EventKind.COMMAND, bytes(self._buf))
             self._buf.clear()
@@ -198,6 +201,7 @@ class CommandStreamReader:
         # конец строки текста: ESC 0o306 0o336 0o215
         if head == SC_TXT_LINE:
             self._skip(4)
+            self._flush_text()
             self._text_mode = False
             self._emit(EventKind.TEXT_LINE)
             return True
@@ -255,14 +259,34 @@ class CommandStreamReader:
             return True
 
         # Данные текста: запись `;O <строка>` открывает текстовый режим,
-        # последующие записи — продолжение строки (процедура `СТРОКИ`).
+        # а процедура `СТРОКИ` дописывает символы по одному
+        # (`WРИТЕ(INРUТ↑)`), каждый — отдельной записью.  Продолжения
+        # накапливаются и отдаются одной записью при `≡033≡306≡336≡215`
+        # (конец строки текста) либо перед следующей командой — иначе
+        # каждый символ разбирался бы как отдельная команда.
         if rec[:1] == b';' or self._text_mode:
-            self._text_mode = True
-            self._emit(EventKind.COMMAND, rec, text=True)
-            return True
+            if len(rec) <= 2:            # одиночный символ — продолжение
+                self._text_mode = True
+                if rec[:1] == b';':
+                    self._flush_text()
+                    self._text_buf = bytearray(rec)
+                else:
+                    self._text_buf += rec
+                return True
+            # Строка закончилась: отдаём накопленное, запись разбирается
+            # как обычная команда.
+            self._flush_text()
+            self._text_mode = False
 
         self._emit(EventKind.COMMAND, rec)
         return True
+
+    def _flush_text(self) -> None:
+        """Отдать накопленную строку текста как одну запись."""
+        if not self._text_buf:
+            return
+        buf, self._text_buf = bytes(self._text_buf), bytearray()
+        self._emit(EventKind.COMMAND, buf, text=True)
 
     def _emit_frame_marker(self, rec: bytes) -> None:
         """Разобрать ESC-запись кадра.

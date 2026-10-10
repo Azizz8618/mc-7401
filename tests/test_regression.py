@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 
 from mc7401 import Framebuffer, TerminalEmulator                     # noqa: E402
 from mc7401.chars import glyph_matrix                               # noqa: E402
-from mc7401.constants import S0, VK                                # noqa: E402
+from mc7401.constants import END, S0, VK                          # noqa: E402
 from mc7401.reader import PAD_CMD                                     # noqa: E402
 from mc7401.link import (                                           # noqa: E402
     IacStripper, LinkError, busy_reply, parse_port_spec, spec_hint, split_endpoint,
@@ -313,3 +313,56 @@ def test_iac_stripper_state_survives_split():
     first = s.feed(b'\xff')
     assert first == b''
     assert s.feed(b'\xfb\x18OK') == b'OK'
+
+# ── дефекты 30-33: текст, размеры, заглушки ───────────────────────────────
+
+def test_text_size_command_sets_size():
+    """Запись `9 : N` (`':0 '`) задаёт размер для следующих строк.
+
+    В `СТРОКИ` размер приходит отдельной записью `9 : N`; раньше она
+    разбиралась как неизвестная, и знаки выходили вырожденными.
+    """
+    parser = CommandParser()
+    parser.parse(b'91' + bytes((VK,)))          # запись размера `9 1`
+    cmd = parser.parse(b':0 ' + bytes((VK,)))    # установка размера 0
+    assert cmd.op is Op.SET_TEXT_SIZE
+    assert cmd.args[0] == b'\x00'
+    assert parser.text_size == b'\x00'
+
+
+def test_end_byte_terminates_text():
+    """`ЕND` (0xFF) обрывает строку текста, а не рисуется как знак.
+
+    Программа его не выводит (цикл `WНILЕ INРUТ↑≠ЕND`), но в отличие от
+    прочих служебных кодов он не должен попадать на экран.
+    """
+    data = (stream('J1', '4 10 300', b'9\x01')
+            + b';\x00 ' + 'АБ'.encode('koi8-r') + bytes((END,))
+            + 'ВГ'.encode('koi8-r') + bytes((VK,)))
+    emu = TerminalEmulator()
+    emu.run(data)
+    assert emu.stats['chars'] == 2      # только «АБ», «ВГ» отброшено
+
+
+def test_zero_text_size_still_draws_glyphs():
+    """Размер 0 — это «мелкий знак», а не отсутствие знака."""
+    data = stream('J1', '4 10 300', b'91', b':0 ', ';\x00 АБВ')
+    emu = TerminalEmulator()
+    emu.run(data)
+    assert emu.stats['chars'] == 3
+    assert emu.fb.count_set() > 3          # знаки не выродились в точку
+
+
+def test_bind_does_not_pollute_stream():
+    """`ВIND` привязывает файл к устройству и ничего не пишет.
+
+    Заглушка выводила строку устройства (`'> ≡377'`) в поток команд,
+    откуда в текст попадали посторонние символы.
+    """
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import pascal.runtime as rt
+    rt._terminal.clear()
+    del rt._terminal.wire[:]
+    rt.BIND('> ≡377')
+    rt.BIND(' ==) ≡377')
+    assert bytes(rt._terminal.wire) == b''

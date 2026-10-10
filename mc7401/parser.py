@@ -210,6 +210,18 @@ class CommandParser:
         if fn == ord(';'):
             return self._parse_text_data(rec, rest)
 
+        if fn == ord(':'):
+            # `9 : N` — установка размера текста (процедура `СТРОКИ`:
+            # `WRIТЕ('91', ВК, ':0 ', ВК, '; ')`).  Размер действует до
+            # следующей установки и влияет на все последующие строки.
+            spec = rest.strip()
+            try:
+                self.text_size = bytes((int(spec),))
+            except ValueError:
+                self.text_size = b'\x00'
+            return Command(Op.SET_TEXT_SIZE, args=[self.text_size],
+                           raw=rec, name='9:')
+
         self.unknown[body] = self.unknown.get(body, 0) + 1
         return Command(Op.UNKNOWN, args=[body], raw=rec,
                        name=body.decode('koi8-r', 'replace'))

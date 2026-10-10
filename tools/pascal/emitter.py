@@ -392,8 +392,19 @@ class Emitter:
                 self.indent -= 1
             else:
                 self.w('pass')
-            # Сторож офлайн-прогона: при исчерпанном вводе программа
-            # завершает работу, как при нажатии `К` на терминале.
+            # Сторож офлайн-прогона: если команда не прочитана и впереди
+            # не осталось ни одной буквы, оператор больше ничего не
+            # введёт — на настоящем терминале программа ждала бы
+            # нажатия клавиши.  Без остановки `СЕЛЕСТ` попадает в
+            # ветвь `ТР:` и бесконечно перерисовывает картину.
+            # `canon` даёт `PPIKAZ`: кириллические `П` и `Р` обе
+            # отображаются в латинскую `P`.
+            if canon(r.name) in ('PRIKAZ', 'PPIKAZ'):
+                self.w('if not А and not any(c in LIТ '
+                       'for c in INРUТ.data[INРUТ.pos:]):')
+                self.indent += 1
+                self.w('raise SystemExit(0)')
+                self.indent -= 1
             self.w(f'return {_py_name(rname)}')
         else:  # обычная подпрограмма
             if not body and not r.nested:
@@ -411,15 +422,6 @@ class Emitter:
                 self.indent -= 1
         if var_names:
             self.w('return (' + ', '.join(var_names) + ')')
-        if canon(name) == 'PRIKAZ':
-            # Оператор не ввёл команду: на настоящем терминале программа
-            # ждала бы нажатия клавиши и экран сохранял бы последний кадр.
-            # Без этой остановки `СЕЛЕСТ` попадает в ветвь `ТР:` и
-            # бесконечно перерисовывает картину.
-            self.w('if not А and INРUТ.pos >= len(INРUТ.data):')
-            self.indent += 1
-            self.w('raise SystemExit(0)')
-            self.indent -= 1
         self.routine = saved
         self.indent = base
         self.rid += 1
