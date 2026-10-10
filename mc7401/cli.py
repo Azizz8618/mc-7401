@@ -71,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help='интерактивный режим (включён по умолчанию)')
     ap.add_argument('--pen', action='store_true',
                     help='световое перо: мышь рисует линию (с --tui)')
+    ap.add_argument('--graphics', choices=('auto', 'kitty', 'blocks', 'mono'),
+                    default=None,
+                    help='показ графики: протокол графики терминала, '
+                         'половинные блоки или один знак на знакомест '
+                         '(по умолчанию из конфигурации — auto)')
     ap.add_argument('--demo', action='store_true',
                     help='демонстрация без ЭВМ (сценарий нажатий)')
     ap.add_argument('--conf', metavar='FILE',
@@ -157,7 +162,8 @@ def main(argv=None) -> int:
         path = Path(args.input) if args.input not in ('-', None) else None
         mode = 'mono' if args.dump_ascii else None
         return run_tui(path, endpoint=args.link, demo=args.demo,
-                       mode=mode, pen=args.pen, config=cfg)
+                       mode=mode, pen=args.pen, config=cfg,
+                       graphics=args.graphics)
 
     if args.link:
         from .link import run_link

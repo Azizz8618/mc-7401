@@ -103,16 +103,15 @@ class Session:
 
     # ── SEND ────────────────────────────────────────────────────────────────
 
-    def send(self, *, line_end: bool = True) -> bytes:
+    def send(self, *, line_end: int = ETX) -> bytes:
         """SEND: передать накопленное в линию, буфер очистить.
 
-        `line_end` добавляет `ВК` — программа на стороне ЭВМ ждёт его
-        как конец команды.
+        `line_end` — символ конца строки на линии ДКС; по умолчанию ETX
+        (так по правилам 15ИЭ).  Значение 0 — не добавлять ничего.
         """
         data = self.pending()
         if line_end and data:
-            # Конец строки на линии ДКС — ETX (см. chars.encode_input)
-            data += bytes((ETX,))
+            data += bytes((line_end,))
         self.buffer.clear()
         return data
 

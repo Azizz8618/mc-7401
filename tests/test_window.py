@@ -1,0 +1,286 @@
+"""Проверки окна терминала: вывод кадра, текст ЭВМ, ввод, графика.
+
+Собрано по жалобам на стенде: строки двоились, приглашения ЭВМ не было
+видно, символы не передавались.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from mc7401 import chars                                          # noqa: E402
+from mc7401.config import Config                                   # noqa: E402
+from mc7401.tui import TerminalApp                                # noqa: E402
+
+
+class FakeDriver:
+    """Драйвер без линии: всё заранее известно, отправка собирается."""
+
+    name = 'фейк'
+    greeting = b''
+
+    def __init__(self, data: bytes = b'') -> None:
+        self.data = data
+        self.sent: list[str] = []
+        self.closed = False
+
+    def poll(self, timeout: float) -> bytes:
+        data, self.data = self.data, b''
+        return data
+
+    def send_keys(self, text: str) -> None:
+        self.sent.append(text)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def app():
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    return a
+
+
+def draw_capture(app, cols=80, rows=24):
+    """Отрисовать кадр и вернуть текст, ушедший в терминал."""
+    buf = io.StringIO()
+    real, sys.stdout = sys.stdout, buf
+    try:
+        app.draw()
+    finally:
+        sys.stdout = real
+    return buf.getvalue()
+
+
+# ── вывод кадра ─────────────────────────────────────────────────────────────
+
+def test_draw_never_scrolls_past_window(monkeypatch):
+    """Рядов не больше, чем строк в окне: иначе кадр прокручивает экран."""
+    from mc7401 import tui
+    monkeypatch.setattr(tui, 'terminal_size', lambda default=(80, 24): (80, 24))
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    out = draw_capture(a)
+    rows = [int(n) for n in re.findall(r'\x1b\[(\d+);1H', out)]
+    assert rows, 'кадр не выведен'
+    assert max(rows) <= 24, f'кадр вышел за окно: ряд {max(rows)}'
+    # Каждый ряд ставится курсором — переводов строки быть не должно.
+    assert '\n' not in out, 'в кадре есть переводы строки — будет прокрутка'
+
+
+def test_draw_erases_row_tail():
+    """Остаток строки стирается, иначе следы прежнего кадра остаются."""
+    from mc7401 import tui
+    tui.terminal_size = lambda default=(80, 24): (80, 24)
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    out = draw_capture(a)
+    assert out.count('\x1b[K') >= a.PANEL_ROWS
+
+
+def test_panel_below_body():
+    """Подвал идёт после кадра и занимает своё число рядов."""
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    panel = a._service_panel(80)
+    assert len(panel) == a.PANEL_ROWS
+    assert panel[3].startswith('-'), 'третий ряд подвала — черта'
+    assert 'РЕЖИМ=' in panel[0]
+    assert 'ПОСЛ:' in panel[2]
+
+
+# ── текст ЭВМ в окне ─────────────────────────────────────────────────────────
+
+def test_dks_text_is_visible():
+    """Приглашение ОС Диспак попадает в строки окна."""
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    a.feed(b'\x7c\x42\x4d-3,\x54\x30\x31\x37\r\n')
+    lines = a._text_lines()
+    assert lines, 'текст ЭВМ не разобран'
+    assert any('Т017' in ln for ln in lines), lines
+
+
+def test_dks_text_takes_lines_of_window():
+    """Текст занимает строки окна (а не прятался в подсказку)."""
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    a.feed(b'\x54\x30\x31\x37\r\n')          # «Т017»
+    assert a._text_window(80, 5)[0].strip() == 'Т017'
+    assert len(a._text_window(80, 5)) == 5
+
+
+def test_text_closes_splash():
+    """Первый байт от ЭВМ снимает заставку."""
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    assert a.splash
+    a.feed(b'\r\n')
+    assert not a.splash
+
+
+def test_dks_codes_are_koi7():
+    """ОС шлёт семибитные коды КОИ-7, а не КОИ-8Р.
+
+    Кириллица занимает обе строки: 0x40…0x5E (заглавные, как в наборе
+    Н1) и 0x60…0x7E; цифры и знаки препинания — свои места.  Латинской
+    строчки в КОИ-7 нет вообще: слот `0x68` — это «Х».
+    """
+    assert chars.display_dks(0x7C) == 'Э'
+    assert chars.display_dks(0x4D) == 'М'
+    assert chars.display_dks(0x54) == 'Т'
+    assert chars.display_dks(0x30) == '0'
+    assert chars.display_dks(0x2D) == '-'
+    assert chars.display_dks(0x68) == 'Х'       # не «h» — слот кириллицы
+    assert chars.display_dks(0x0D) == ''
+    assert chars.display_dks(0x20) == ' '
+
+
+def test_dks_uppercase_row_matches_rom():
+    """Буквы строки 0x40…0x5E совпадают с РУС7 (порядок ПЗУ)."""
+    from mc7401.chars import RUS7
+    for code in (0x40, 0x45, 0x4D, 0x54):
+        assert chars.display_dks(code) == RUS7[code - 0x40]
+    for code in (0x60, 0x6D, 0x7C):
+        assert chars.display_dks(code) == RUS7[code - 0x60]
+
+
+# ── передача символов ────────────────────────────────────────────────────────
+
+def test_host_mode_sends_chars_once(app):
+    """В режиме С ЭВМ знак уходит сразу, при ВК — только конец строки."""
+    for key in 'СЕТ ':
+        app.handle_key(key)
+    app.handle_key('\r')
+    assert app.driver.sent == ['s', 'e', 't', ' ', '\x03']
+
+
+def test_submit_does_not_resend_line(app):
+    """`_ПРПС` не должен слать строку второй раз (был дефект)."""
+    for key in 'ЛИН3':
+        app.handle_key(key)
+    app.driver.sent.clear()
+    app.handle_key('\r')
+    assert app.driver.sent == ['\x03'], app.driver.sent
+
+
+def test_local_mode_accumulates_then_sends(app):
+    """АВТОНОМНО: знаки копятся, ПЕРЕДАЧА уходит один раз."""
+    app.handle_key('L')
+    assert app.session.mode == 'local'
+    for key in 'ЛИН3':
+        app.handle_key(key)
+    assert app.driver.sent == [], 'в АВТОНОМНО знаки уходят по ПЕРЕДАЧА'
+    app.handle_key('S')
+    assert app.driver.sent == ['lin3\x03']
+    assert app.session.buffer == []
+
+
+def test_line_end_configurable():
+    """Символ конца строки берётся из настройки `[line] eol`."""
+    from mc7401.config import parse_eol
+    assert parse_eol('ETX') == 0o003
+    assert parse_eol('LF') == 0o012
+    assert parse_eol('CR') == 0o015
+    assert parse_eol('0o012') == 0o012
+    assert parse_eol('мусор', 0o003) == 0o003
+
+
+def test_send_uses_configured_eol(tmp_path):
+    """`[line] eol = LF` — строка заканчивается переводом строки."""
+    p = tmp_path / 'mc7401.conf'
+    p.write_text('[line]\neol = LF\n', encoding='utf-8')
+    a = TerminalApp(FakeDriver(), config=Config.load(p))
+    assert a.eol == 0o012
+    for key in 'СЕТ':
+        a.handle_key(key)
+    a.handle_key('\r')
+    assert a.driver.sent[-1] == '\n'
+
+
+# ── кадр после очистки экрана ───────────────────────────────────────────────
+
+def test_remembered_frame_shown_after_clear(app):
+    """`graf.pas` чистит экран в конце — показывается кадр оператора."""
+    from mc7401.framebuffer import Framebuffer
+    app.emu.fb.point(10, 10)
+    app._remember_frame()
+    app.emu.fb.clear()
+    assert app.emu.fb.count_set() == 0
+    assert app._visible_fb().count_set() == 1
+
+
+def test_current_frame_wins_when_not_empty(app):
+    """Пока есть точки на экране, показывается текущий кадр."""
+    app._best_fb = app.emu.fb.copy()
+    app._best_n = 1
+    app.emu.fb.point(20, 20)
+    assert app._visible_fb() is app.emu.fb
+
+
+# ── графика протоколом терминала ────────────────────────────────────────────
+
+def test_kitty_detect_by_environment():
+    from mc7401.backends.kitty import detect
+    assert detect({'KITTY_WINDOW_ID': '1'})
+    assert detect({'TERM': 'xterm-kitty'})
+    assert detect({'TERM_PROGRAM': 'WezTerm'})
+    assert not detect({'TERM': 'xterm-256color'})
+
+
+def test_kitty_response_parsed():
+    """Ответ на запрос размера клетки разбирается верно."""
+    from mc7401.backends.kitty import KittyGraphics, parse_response
+    reply = '\x1b_Gi=31;OK,c=10,r=20,a=T,t=d,f=24;AAAA\x1b\\'
+    fields = parse_response(reply)
+    assert fields['c'] == '10' and fields['r'] == '20'
+    g = KittyGraphics()
+    assert not g.active
+    assert g.apply_response(reply)
+    assert g.active and g.cell == (10, 20)
+
+
+def test_kitty_geometry():
+    """Кадр 560×400 занимает столько знакомест, каков размер клетки."""
+    from mc7401.backends.kitty import KittyGraphics
+    g = KittyGraphics()
+    g.cell = (8, 16)
+    assert g.size_for(560, 400) == (70, 25)
+    g.cell = (10, 20)
+    assert g.size_for(560, 400) == (56, 20)
+
+
+def test_kitty_payload_is_chunked():
+    """Данные режутся на куски по 4096 байт, ключи — в последнем."""
+    from mc7401.backends.kitty import _apc_stream
+    png = b'\x89PNG' + bytes(20000)
+    out = _apc_stream('a=T,f=100,t=d,i=1', png)
+    assert out.count('\x1b_G') > 1
+    assert out.endswith('\x1b\\')
+    assert '\x1b_Ga=T,f=100,t=d,i=1;' in out
+
+
+def test_graphics_disabled_by_config():
+    """`[display] graphics = blocks` — протокол не включается."""
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    a.graphics = 'blocks'
+    assert not a._enable_gfx()
+    assert a.gfx is None
+
+
+def test_paint_gfx_reports_height():
+    """Графика занимает столько рядов, сколько нужно кадру."""
+    from mc7401.backends.kitty import KittyGraphics
+    buf = io.StringIO()
+    g = KittyGraphics(buf)
+    g.cell = (8, 16)
+    g.active = True
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    a.gfx = g
+    a.emu.fb.point(100, 100)
+    height = a._paint_gfx(0, 80, 30)
+    assert height > 0
+    assert buf.getvalue().count('\x1b_G') == 1

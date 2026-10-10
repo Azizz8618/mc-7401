@@ -28,6 +28,42 @@ log = logging.getLogger('mc7401.config')
 
 CONFIG_NAME = 'mc7401.conf'
 
+#: Имена символов, которыми может заканчиваться введённая строка.
+EOL_NAMES = {'ETX': 0o003, 'LF': 0o012, 'CR': 0o015, 'ВК': 0o012,
+              'КР': 0o015, 'КЗ': 0o003}
+
+
+def parse_eol(value: Optional[str], default: int = 0o003) -> int:
+    """Разобрать `[line] eol`: имя символа, восьмеричный код или число.
+
+    Возвращает код символа; неразборчивое значение — значение по умолчанию
+    с предупреждением, а не молчаливая подмена.
+    """
+    if value is None:
+        return default
+    text = value.strip()
+    if not text:
+        return default
+    upper = text.upper()
+    if upper in EOL_NAMES:
+        return EOL_NAMES[upper]
+    try:
+        code = int(text, 8) if text.lower().startswith(('0o', '0х', '0x')) \
+            else int(text, 8)
+    except ValueError:
+        try:
+            code = int(text, 10)
+        except ValueError:
+            log.warning('не разобран конец строки %r, беру 0o%03o',
+                        text, default)
+            return default
+    if not 0 <= code <= 0o377:
+        log.warning('конец строки %r вне диапазона, беру 0o%03o',
+                    text, default)
+        return default
+    return code
+
+
 SAMPLE = f"""\
 # Конфигурация эмулятора терминала «Электроника МС 7401».
 # Аргументы командной строки имеют приоритет над этим файлом.
@@ -39,6 +75,11 @@ SAMPLE = f"""\
 endpoint = 127.0.0.1:4202-4223
 # Молча подменять связь эталонной картинкой нельзя: при недоступной
 # линии печатается объяснение и возвращается код 2.
+# Чем заканчивается введённая строка, когда терминал передаёт её на ЭВМ.
+# По правилам 15ИЭ конец строки на линии ДКС — ETX (03); приглашение
+# ОС Диспак выдаётся по LF (0A).  Значение — имя символа:
+# ETX (по умолчанию), LF, CR или код в восьмеричной записи (0o003).
+eol = ETX
 
 [terminal]
 # Режим сеанса: host (С ЭВМ) или local (АВТОНОМНО).
@@ -62,6 +103,14 @@ mode = color
 scale = 2
 # Показывать верхнюю строку с названием модели и временем.
 title = true
+# Показ графики:
+#   auto   — если терминал умеет протокол графики (kitty, WezTerm,
+#            Konsole, Ghostty, foot), кадр 560×400 показывается в окне
+#            как настоящая картинка; иначе — псевдографика;
+#   kitty  — требовать протокол, иначе сообщение об ошибке;
+#   blocks — всегда половинные блоки;
+#   mono   — один знак на знакомест, работает в любом терминале.
+graphics = auto
 # Заставка: имя рисунка без расширения из `golden/render`.
 # По умолчанию ПТИ — анимация полёта из `graf.pas`.
 # Можно указать свой (`СЕТ`, `ЧАС`, `КОТ`), без расширения.
@@ -85,6 +134,8 @@ class Config:
 
     # [line]
     endpoint: str = '127.0.0.1:4202-4223'
+    #: Символ конца введённой строки на линии ДКС (по умолчанию ETX).
+    eol: int = 0o003
     # [terminal]
     mode: str = 'host'
     charset: str = 'n2'
@@ -95,6 +146,10 @@ class Config:
     display_mode: str = 'color'
     scale: int = 2
     title: bool = True
+    # Показ графики: auto — протокол графики терминала, если он есть,
+    # иначе псевдографика; kitty — требовать протокол; blocks — всегда
+    # половинные блоки; mono — один знак на знакомест.
+    graphics: str = 'auto'
     # Заставка: имя рисунка без расширения из `golden/render`
     # (по умолчанию ПТИ — анимация полёта).  `none` — без картинки.
     # Закрывается при первом вводе или первом байте от ЭВМ.
@@ -136,6 +191,8 @@ class Config:
     def _apply(self, p: configparser.ConfigParser) -> None:
         if p.has_section('line'):
             self.endpoint = p.get('line', 'endpoint', fallback=self.endpoint)
+            self.eol = parse_eol(p.get('line', 'eol', fallback=None),
+                                 self.eol)
         if p.has_section('terminal'):
             self.mode = p.get('terminal', 'mode', fallback=self.mode)
             self.charset = p.get('terminal', 'charset', fallback=self.charset)
@@ -148,6 +205,7 @@ class Config:
             self.scale = p.getint('display', 'scale', fallback=self.scale)
             self.title = p.getboolean('display', 'title', fallback=self.title)
             self.splash = p.get('display', 'splash', fallback=self.splash)
+            self.graphics = p.get('display', 'graphics', fallback=self.graphics)
         if p.has_section('keys'):
             self.keys = {k.strip(): v.strip() for k, v in p.items('keys')
                          if k.strip() and not k.strip().startswith('#')}

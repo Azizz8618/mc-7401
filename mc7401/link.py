@@ -184,6 +184,8 @@ class DKSLink:
         self.strip_iac = strip_iac
         self.sock: Optional[socket.socket] = None
         self.port: Optional[int] = None
+        #: Приветствие линии, прочитанное при подключении (если было).
+        self.greeting = b''
         self._iac = IacStripper()
 
     def connect(self) -> None:
@@ -209,6 +211,11 @@ class DKSLink:
                 continue
             self.sock, self.port = s, port
             s.settimeout(self.timeout)
+            # Приветствие, пришедшее сразу после accept(), нельзя
+            # выбрасывать: на стенде это «Connected to the БЭСМ-6
+            # simulator TTY device, line N» — первое, что видит
+            # оператор, и по нему видно, какая линия досталась.
+            self.greeting = self._iac.feed(hello) if hello else b''
             log.info('линия ДКС %s:%d установлена', self.host, port)
             return
         raise LinkError(f'нет свободной линии ДКС на {self.host}:'

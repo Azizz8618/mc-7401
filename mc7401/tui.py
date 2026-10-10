@@ -34,7 +34,7 @@ from .emulator import TerminalEmulator
 from . import startup
 from .config import Config
 from .pen import LightPen
-from .session import Session
+from .session import MODE_HOST, Session
 
 #: Название модели терминала — показывается в заголовке.
 #: Гид-символ ОС Диспак (ETX): после подключения к линии ДКС
@@ -44,6 +44,17 @@ ETX = 0o003
 #: Именно он инициирует сеанс: после `LF` ОС Диспак отвечает
 #: приглашением «ЭВМ-3,ТNNN» (проверено на линии 4203).
 LF = 0o012
+
+#: Приветствие, которое выдаёт линия ДКС при подключении терминала
+#: (её выдаёт обвязка стенда — самой ОС Диспак это не свойственно):
+#: «Connected to the БЭСМ-6 simulator TTY device, line N».
+GREETING_EN = 'Connected to the'
+
+#: Конец строки, который терминал передаёт на ЭВМ.  Переопределяется
+#: настройкой `[line] eol`.
+DEFAULT_EOL = ETX
+#: Возврат каретки — им ОС Диспак и терминалы отделяют строку.
+CR = 0o015
 
 MODEL = 'Электроника МС 7401'
 
@@ -59,8 +70,9 @@ def title_line() -> str:
             f'{now}')
 from .reader import CommandStreamReader, EventKind
 from .screen import ScreenRenderer, Viewport
-from .term import (ALT_SCREEN_OFF, ALT_SCREEN_ON, BOLD, CLEAR, HIDE_CURSOR,
-                   HOME, RESET, SHOW_CURSOR, RawTerminal, bar,
+from .constants import VK
+from .term import (ALT_SCREEN_OFF, ALT_SCREEN_ON, BOLD, CLEAR, ERASE_EOL,
+                   HIDE_CURSOR, HOME, RESET, SHOW_CURSOR, RawTerminal, at, bar,
                    read_key, terminal_size)
 
 log = logging.getLogger('mc7401.tui')
@@ -224,6 +236,17 @@ def _render_svg(path, cols: int, rows: int) -> str:
     return '\n'.join(''.join(r) for r in grid)
 
 
+def _utf8_width(first: int) -> int:
+    """Длина UTF-8-последовательности по первому байту (0 — не UTF-8)."""
+    if 0xC2 <= first <= 0xDF:
+        return 2
+    if 0xE0 <= first <= 0xEF:
+        return 3
+    if 0xF0 <= first <= 0xF4:
+        return 4
+    return 0
+
+
 class LinkRefused(Exception):
     """Линия ДКС не открылась; текст — готовое объяснение для пользователя."""
 
@@ -234,6 +257,8 @@ class Driver:
     """Источник данных терминала и приёмник нажатий."""
 
     name = 'драйвер'
+    #: Приветствие линии, прочитанное при подключении (если было).
+    greeting: bytes = b''
 
     def poll(self, timeout: float) -> bytes:
         raise NotImplementedError
@@ -285,6 +310,9 @@ class LiveDriver(Driver):
         except LinkError as exc:
             raise LinkRefused(self._diagnose(exc)) from exc
         self.name = f'ДКС {host}:{self.link.port}'
+        # Приветствие линии показываем в окне: по нему видно, какая
+        # линия досталась и в каком режиме она работает.
+        self.greeting = self.link.greeting
         # Символ конца строки: после подключения его нужно передать,
         # иначе ОС Диспак не отвечает приглашением «ЭВМ-3,ТNNN».
         # Гид `ETX` посылаем тоже — так поступает
@@ -376,7 +404,8 @@ class TerminalApp:
 
     def __init__(self, driver: Driver, *, mode: str = 'color',
                  grid: bool = False, intro: str = '',
-                 config: Optional[Config] = None) -> None:
+                 config: Optional[Config] = None,
+                 graphics: str = 'auto') -> None:
         self.driver = driver
         self.emu = TerminalEmulator()
         self.reader = CommandStreamReader()
@@ -388,8 +417,13 @@ class TerminalApp:
         self.status_extra = ''
         self.input_line = ''
         self.message = ''
-        #: Накопленный текст, присланный ЭВМ (приглашения ОС Диспак).
-        self._text_log: list[str] = []
+        #: Байты, присланные ЭВМ (приглашения ОС Диспак, ответы программ).
+        #: Хранятся кодами: текст разбирается по набору знаков при выводе.
+        self._raw_text: list[int] = []
+        #: Графика в окне терминала (протокол kitty); `None`, если нет.
+        self.gfx = None
+        #: Способ показа графики: auto | kitty | blocks | mono.
+        self.graphics = 'auto'
         #: Режимы терминала по образцу 15ИЭ-00-013: АВТОНОМНО / С ЭВМ,
         #: SEND, ЭХО, ОЧИСТКА, переключение наборов.
         self.session = Session()
@@ -400,6 +434,20 @@ class TerminalApp:
         self.session.echo = self.config.echo
         self.pen.enabled = self.config.pen
         self.grid = self.config.grid or grid
+        self.graphics = self.config.graphics or graphics
+        self.eol = getattr(self.config, 'eol', DEFAULT_EOL)
+        self._splash_fb_cache = None
+        #: Самый наполненный кадр (программа чистит экран в конце).
+        self._best_fb = None
+        self._best_n = 0
+        #: Приветствие линии ДКС — видно, какая линия досталась.
+        #: Это единственный текст, который приходит не кодами знаков
+        #: терминала, а готовой строкой (её выдаёт обвязка стенда),
+        #: поэтому держим его отдельно.
+        self.greeting_text = ''
+        if getattr(driver, 'greeting', b''):
+            self.greeting_text = driver.greeting.decode(
+                'utf-8', errors='replace')
         #: Данные получены? до них показывается начальный экран.
         self._got_data = False
         #: Последняя нажатая клавиша — строка «ПОСЛ:» подвала.
@@ -439,8 +487,10 @@ class TerminalApp:
         if not data:
             return
         if not self.is_command_stream(data):
-            self._text_log.extend(
-                data.decode('koi8-r', errors='replace'))
+            # Текст от ЭВМ: приглашения ОС Диспак и ответы программ.
+            # Он идёт в то же окно, что и графика, и снимает заставку.
+            self._raw_text.extend(data)
+            self.splash = False
             return
         self._got_data = True
         self.splash = False
@@ -449,54 +499,292 @@ class TerminalApp:
             if ev.kind is EventKind.COMMAND:
                 self.emu.execute(self.emu.parser.parse(ev.data))
             else:
+                # Программа (`graf.pas`) чистит экран перед выходом, и
+                # после её работы кадр пуст.  Поэтому запоминаем самый
+                # наполненный кадр — тот, что видел оператор, — и
+                # показываем его, а не пустой результат.
                 self.emu.handle_event(ev)
+                self._remember_frame()
 
     def _clean_text(self) -> str:
         """Текст ОС без управляющих последовательностей, в одну строку."""
-        out = ''.join(self._text_log)
-        out = ''.join(ch for ch in out
-                      if ch.isprintable() or ch in ' \t')
-        return ' '.join(out.split())
+        return ' '.join(' '.join(self._text_lines()).split())
 
     # ── рисование ───────────────────────────────────────────────────────────
 
     def layout(self) -> tuple[int, int]:
         """Столбцы и строки под изображение.
 
-        Сверху — заголовок с моделью и временем, снизу — три строки
-        панели: состояние, подсказка и строка ввода.
+        Сверху — необязательная строка заголовка, снизу — подвал.  Кадр
+        выводится позиционированием курсора, поэтому важно, чтобы рядов
+        не оказалось больше, чем строк в окне: лишний ряд уводит курсор
+        на новую строку и прокручивает экран.
         """
-        cols, rows = terminal_size()
-        n = 9 + (1 if self.config.title else 0)
-        return cols, max(3, rows - n)
+        cols, trows = terminal_size()
+        n = self.PANEL_ROWS + (1 if self.config.title else 0)
+        return cols, max(1, trows - n)
+
+    #: Подвал: три строки состояния, черта и пять справочных рядов.
+    PANEL_ROWS = 9
 
     def draw(self) -> None:
+        """Вывести кадр целиком: каждый ряд — на своё место.
+
+        Раньше кадр печатался переводами строки, и последняя строка
+        прокручивала окно: следующий кадр ложился со сдвигом, и на экране
+        оставались хвосты прежнего — строки выглядели удвоенными.  Здесь
+        ряды ставятся курсором, а остаток строки стирается, поэтому
+        картинка всегда ровно на своём месте.
+        """
         cols, rows = self.layout()
-        self.renderer.vp.clamp(self.emu.fb, cols, rows)
-        if not self.renderer.vp.scale:
-            return
-        if self.pen.enabled:
-            self.pen.stroke(self.emu.fb)
-        body = self.renderer.render(cols, rows)
-        if self.grid:
-            body = self._overlay_grid(body, cols, rows)
-        if self.pen.enabled:
-            body = self._overlay_pen(body, cols, rows)
-        if not self._got_data:
-            body = startup.build(
-                cols, state=self._link_state(), summary=self.config.summary(),
-                hint=startup.hint_text())
-            body = body.replace('\n', ' \n') if False else body
-        out = [HOME]
+        out = [HIDE_CURSOR]
+        row = 1
         if self.config.title:
-            out.append(title_line() + '\n')
-        if self.splash:
-            body = self._splash_text(cols)
-        out.append(body + '\n')
+            out.append(at(row) + ERASE_EOL + title_line())
+            row += 1
+        # Графика протоколом терминала занимает свои строки, текст идёт
+        # под ней — то и другое в одном окне.
+        gfx_h = self._paint_gfx(row - 1, cols, rows)
+        if gfx_h:
+            for blank in range(gfx_h):
+                out.append(at(row) + ERASE_EOL)
+                row += 1
+            lines = self._text_window(cols, rows - gfx_h)
+        else:
+            lines = self._body_lines(cols, rows)
+        for line in lines:
+            out.append(at(row) + ERASE_EOL + line)
+            row += 1
         for line in self._service_panel(cols):
-            out.append(bar(line, cols) + '\n')
+            out.append(at(row) + ERASE_EOL + bar(line, cols))
+            row += 1
         sys.stdout.write(''.join(out))
         sys.stdout.flush()
+
+    def _remember_frame(self) -> None:
+        """Запомнить самый наполненный кадр.
+
+        `graf.pas` по завершении очищает экран, поэтому «текущий» кадр в
+        конце пуст; без этой памяти окно показывало бы пустоту вместо
+        рисунка.
+        """
+        n = self.emu.fb.count_set()
+        if n > self._best_n:
+            self._best_fb = self.emu.fb.copy()
+            self._best_n = n
+
+    def _visible_fb(self):
+        """Кадр для показа: текущий, а если тот пуст — лучший из бывших."""
+        if self.emu.fb.count_set():
+            return self.emu.fb
+        return self._best_fb
+
+    def _text_window(self, cols: int, rows: int) -> list:
+        """Строки текста ЭВМ под картинкой, ровно `rows` штук."""
+        text = self._text_lines()
+        lines = text[-rows:] if rows > 0 else []
+        while len(lines) < rows:
+            lines.append('')
+        return lines[:max(0, rows)]
+
+    def _body_lines(self, cols: int, rows: int) -> list:
+        """Содержимое окна: текст ЭВМ, заставка и кадр — вместе.
+
+        Текст, присланный ЭВМ (приглашения и ответы ОС Диспак), идёт
+        сверху; под ним — рисунок, если кадр есть.  Окно одно: и надпись,
+        и графика видны одновременно, как на настоящем терминале.
+        """
+        from . import chars
+        text = self._text_lines()
+        has_fb = self._visible_fb() is not None
+        # Текста берём столько, сколько помещается, кадру оставляем
+        # хотя бы треть окна — иначе при длинном ответе ЭВМ рисунок
+        # совсем пропадёт.
+        take = min(len(text), max(0, rows - max(3, rows // 3))) if has_fb \
+            else len(text)
+        lines = text[len(text) - take:] if take else []
+        rest = max(0, rows - len(lines))
+        if rest == 0:
+            return lines[:rows]
+        if self.splash and not self._got_data:
+            pic = self._splash_lines(cols, rest)
+            lines.extend(pic)
+            rest -= len(pic)
+        fb = self._visible_fb() if has_fb else None
+        if fb is not None and rest > 0:
+            vp = self.renderer.vp
+            vp.clamp(fb, cols, rest)
+            if self.pen.enabled:
+                self.pen.stroke(fb)
+            self.renderer.fb = fb
+            body = self.renderer.render(cols, rest)
+            if self.grid:
+                body = self._overlay_grid(body, cols, rest)
+            if self.pen.enabled:
+                body = self._overlay_pen(body, cols, rest)
+            lines.extend(body.split('\n'))
+        while len(lines) < rows:
+            lines.append('')
+        return lines[:rows]
+
+    # ── графика в окне терминала ────────────────────────────────────────────
+
+    def _enable_gfx(self) -> bool:
+        """Включить протокол графики, если терминал его понимает."""
+        if self.graphics in ('blocks', 'mono'):
+            return False
+        from .backends.kitty import KittyGraphics, detect
+        if self.graphics == 'auto' and not detect():
+            return False
+        self.gfx = KittyGraphics(sys.stdout)
+        self.renderer.mode = 'color'
+        return True
+
+    def _probe_gfx(self, timeout: float = 0.5) -> bool:
+        """Спросить у терминала размер знакоместа и включить графику.
+
+        Ответ приходит на вход — тем же каналом, что и нажатия, поэтому
+        он читается до входа в основной цикл.
+        """
+        if self.gfx is None:
+            return False
+        sys.stdout.write(self.gfx.request_cell().decode('ascii'))
+        sys.stdout.flush()
+        deadline = time.monotonic() + timeout
+        buf = ''
+        while time.monotonic() < deadline:
+            key = read_key(timeout=max(0.02, deadline - time.monotonic()))
+            if key is None:
+                continue
+            if key == 'EOF':
+                break
+            buf += key
+            if buf.endswith('\x1b\\'):
+                break
+        self.gfx.apply_response(buf)
+        if not self.gfx.active:
+            self.gfx = None
+            if self.graphics == 'kitty':
+                self.message = ('протокол графики не поддержан — '
+                                'показ псевдографикой')
+        return bool(self.gfx and self.gfx.active)
+
+    def _paint_gfx(self, row: int, cols: int, rows: int) -> int:
+        """Показать кадр протоколом графики терминала.
+
+        Возвращает число занятых знакомест по вертикали; под ними остаются
+        строки для текста — графика и текст видны в одном окне.
+        """
+        if self.gfx is None or not self.gfx.active:
+            return 0
+        fb = self._display_fb()
+        if fb is None or not fb.count_set():
+            return 0
+        cw, ch = self.gfx.cell
+        need_cols = (fb.width + cw - 1) // cw
+        need_rows = (fb.height + ch - 1) // ch
+        if need_cols > cols:
+            # Кадр шире окна: вписываем по ширине, высота считается от
+            # пропорции, иначе картинка получится сплющенной.
+            need_rows = max(1, int(fb.height * cols * cw / fb.width / ch))
+            need_cols = cols
+        height = min(need_rows, rows)
+        if height < 1:
+            return 0
+        self.gfx.blit(fb, row=row, col=0, cols=need_cols, rows=height,
+                      force=True)
+        return height
+
+    def _display_fb(self):
+        """Кадр для показа: заставка или то, что нарисовала программа."""
+        if self.splash and not self._got_data:
+            return self._splash_frame()
+        return self._visible_fb()
+
+    def _splash_frame(self):
+        """Кадр заставки из эталонного потока (берётся один раз)."""
+        if self._splash_fb_cache is not None:
+            return self._splash_fb_cache or None
+        if (self.config.splash or 'none').lower() == 'none':
+            self._splash_fb_cache = False
+            return None
+        from .backends.kitty import KittyGraphics
+        pic = startup.picture_path(self.config.splash, prefer_stream=True)
+        if not pic or not str(pic).lower().endswith('.bin'):
+            self._splash_fb_cache = False
+            return None
+        fb = KittyGraphics.frame_from_stream(Path(pic))
+        self._splash_fb_cache = fb if fb is not None else False
+        return self._splash_fb_cache or None
+
+    def _text_lines(self) -> list:
+        """Строки, присланные ЭВМ, разобранные по переводу строки.
+
+        Байты приходят кодами знаков терминала, а не готовым текстом:
+        каждый код переводится через таблицу набора (`chars.display_char`),
+        иначе вместо «ЭВМ-3,Т017» будет нечитаемая мешанина.
+        """
+        from . import chars
+        out: list = [ln.rstrip() for ln in self.greeting_text.splitlines()
+                     if ln.strip()]
+        cur: list = []
+        for piece in self._decode_bytes(self._raw_text):
+            if isinstance(piece, str):
+                cur.append(piece)
+                continue
+            code = piece
+            if code in (LF, CR, VK):
+                if cur:
+                    out.append(''.join(cur))
+                cur = []
+                continue
+            if code < 32 or code == 0x7F:
+                continue                        # управляющие не показываем
+            cur.append(chars.display_dks(code))
+        if cur:
+            out.append(''.join(cur))
+        return [ln.rstrip() for ln in out if ln.strip()]
+
+    def _decode_bytes(self, data) -> list:
+        """Разделить поток на куски: готовый текст и коды знаков.
+
+        ОС Диспак присылает по линии коды знаков терминала (0x60…0x7F), а
+        обвязка стенда — обычный UTF-8.  Различить их можно только по
+        самим байтам: многобайтная последовательность UTF-8 не может быть
+        кодом знака семибитного терминала.  Поэтому UTF-8 собирается в
+        строку, а всё остальное трактуется как код.
+        """
+        out: list = []
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if b == 0x0D:
+                out.append(CR)
+                i += 1
+                continue
+            if b == 0x0A:
+                out.append(LF)
+                i += 1
+                continue
+            if b < 0x80:
+                out.append(b)
+                i += 1
+                continue
+            width = _utf8_width(b)
+            if width and i + width <= n:
+                chunk = bytes(data[i:i + width])
+                try:
+                    out.append(chunk.decode('utf-8'))
+                except UnicodeDecodeError:
+                    out.append(b)
+                    i += 1
+                else:
+                    i += width
+                continue
+            # Не UTF-8: это код семибитного знака терминала.
+            out.append(b)
+            i += 1
+        return out
 
     def _title(self) -> str:
         st = self.renderer.status(self.layout()[0], self.layout()[1])
@@ -574,9 +862,10 @@ class TerminalApp:
             'ПЕРО=' + ('ВКЛ' if self.pen.enabled else 'ВЫКЛ'),
             'БУФЕР=' + buf,
             'СЕТКА=' + ('ВКЛ' if self.grid else 'ВЫКЛ'))
+        shown = self._visible_fb()
         state3 = self._row(
             'МАСШТАБ=1:' + str(self.renderer.vp.scale),
-            'ТОЧЕК=' + str(self.emu.fb.count_set()),
+            'ТОЧЕК=' + str(shown.count_set() if shown else 0),
             'ПОСЛ: ' + (self.last_key or ''),
             'ВВОД=' + (self.input_line or ''))
         keys1 = self._row('ВК=Bksp', 'ТАБ=Tab', 'ЗВН=Ctrl-G', 'ПРПС=Enter')
@@ -591,24 +880,28 @@ class TerminalApp:
 
     COLS_N = 4
 
-    def _splash_text(self, cols: int) -> str:
-        """Заставка: рисунок из `golden/render` плюс приветственный текст.
+    def _splash_lines(self, cols: int, rows: int) -> list:
+        """Заставка: рисунок из эталонного потока и приветственный текст.
 
         Рисунок задаётся конфигурацией (`[display] splash`), по умолчанию
         птица.  Закрывается при первом вводе или первом байте от ЭВМ.
+        Возвращает ровно `rows` строк: заставка не должна залезать на
+        подвал.
         """
-        rows = self.layout()[1]
         pic = startup.picture_path(self.config.splash, prefer_stream=True)
-        art = _render_picture(pic, cols, rows - 8) if pic else ''
-        art_lines = art.split('\n') if art else []
+        # Под рисунком — восемь строк приветствия и подсказок.
+        art_h = max(0, min(rows - 8, int(rows * 0.6)))
+        art_lines = (_render_picture(pic, cols, art_h).split('\n')
+                     if pic and art_h else [])
+        art_lines = art_lines[:art_h] + [''] * max(0, art_h - len(art_lines))
         text = startup.build(
             max(20, cols - 2), state=self._link_state(),
             summary=self.config.summary(), hint=startup.hint_text()).split('\n')
-        # Заставка должна строго уместиться в отведённые строки, иначе
-        # текст наезжает на подвал.
-        room = rows - len(art_lines)
-        lines = art_lines + text[:max(0, room)]
-        return '\n'.join(lines[:rows])
+        return (art_lines + text)[:rows]
+
+    def _splash_text(self, cols: int) -> str:
+        """Заставка одной строкой (для проверок и снимков экрана)."""
+        return '\n'.join(self._splash_lines(cols, self.layout()[1]))
 
     def _link_state(self) -> str:
         """Строка состояния линии для начального экрана и подвала."""
@@ -702,7 +995,7 @@ class TerminalApp:
             self.input_line += key
             out = self.session.type_key(key)
             if out:
-                self.driver.send_keys(out.decode('latin-1'))
+                self._send_raw(out)
             self.splash = False
         else:
             return
@@ -716,32 +1009,67 @@ class TerminalApp:
         if not text and not self.session.buffer:
             self.message = 'нечего отправлять'
             return
-        if text:
-            self.session.type_line(text)
-        out = self.session.send()
+        if self.session.mode == MODE_HOST:
+            # В режиме С ЭВМ знаки ушли по мере набора — осталось
+            # передать только конец строки.
+            self.session.reset_buffer()
+            self._send_raw(bytes((self.eol,)))
+            self.message = 'строка передана'
+            return
+        # В АВТОНОМНО знаки уже лежат в буфере по мере набора, добирать
+        # их из строки ввода нельзя — иначе строка уйдёт дважды.
+        out = self.session.send(line_end=self.eol)
         self.session.reset_buffer()
         if out:
-            self.driver.send_keys(out.decode('latin-1'))
+            self._send_raw(out)
             self.message = f'отправлено {len(out)} Б'
 
     def _submit(self) -> None:
+        """`ПРПС` (Enter): конец строки.
+
+        В режиме С ЭВМ знаки уже ушли по одному, поэтому передаётся только
+        завершитель.  В АВТОНОМНО строка дописывается в буфер и уходит по
+        ПЕРЕДАЧА (SEND) — как на 15ИЭ.
+        """
         text = self.input_line
         self.input_line = ''
+        if not text and self.session.mode == MODE_HOST:
+            # Пустая строка — тоже команда (например, пустой ввод в ОС).
+            self._send_raw(bytes((self.eol,)))
+            self.message = 'пустая строка передана'
+            return
         if not text:
             return
-        # Программа ждёт ВК в конце строки.
-        self.driver.send_keys(text + '\n')
-        self.message = f'отправлено: {text!r}'
+        if self.session.mode == MODE_HOST:
+            self.session.reset_buffer()
+            self._send_raw(bytes((self.eol,)))
+            self.message = f'передана строка ({len(text)} знаков)'
+            return
+        # АВТОНОМНО: знаки уже в буфере, повторно их добавлять нельзя.
+        self.message = ('строка в буфере — передать клавишей S '
+                        '(ПЕРЕДАЧА)')
+
+    def _send_raw(self, data: bytes) -> None:
+        """Отдать байты линии.
+
+        `send_keys` ждёт строку latin-1: каждый байт проходит насквозь
+        (latin-1 → koi8-r), поэтому кодировку набираемого набора знаков
+        менять здесь нельзя.
+        """
+        if data:
+            self.driver.send_keys(data.decode('latin-1'))
 
     # ── главный цикл ────────────────────────────────────────────────────────
 
     def run(self) -> int:
         cols, rows = self.layout()
         self.renderer.vp.fit(self.emu.fb, cols, rows)
+        self._enable_gfx()
         sys.stdout.write(ALT_SCREEN_ON + CLEAR + HIDE_CURSOR
                          + LightPen.enable_sequence())
         try:
             with RawTerminal():
+                self._probe_gfx()
                 while self.running:
                     self.draw()
                     data = self.driver.poll(0.05)
@@ -757,6 +1085,8 @@ class TerminalApp:
         except KeyboardInterrupt:
             pass
         finally:
+            if self.gfx is not None:
+                self.gfx.clear()
             sys.stdout.write(LightPen.disable_sequence() + SHOW_CURSOR
                              + ALT_SCREEN_OFF + RESET + '\n')
             sys.stdout.flush()
@@ -856,7 +1186,8 @@ def _no_stream_hint() -> str:
 def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
             demo: bool = False, mode: Optional[str] = None,
             grid: bool = False, pen: bool = False,
-            config: Optional[Config] = None) -> int:
+            config: Optional[Config] = None,
+            graphics: Optional[str] = None) -> int:
     """Запустить фронтенд.
 
     Без файла и без `--link` открывается интерактивная сессия с
@@ -883,7 +1214,8 @@ def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
             print(str(exc), file=sys.stderr)
             return 2
 
-    app = TerminalApp(driver, mode=mode, grid=grid, config=cfg)
+    app = TerminalApp(driver, mode=mode, grid=grid, config=cfg,
+                       graphics=graphics or 'auto')
     if pen:
         app.pen.enabled = True
     app._connect_note = getattr(driver, 'endpoint', '') or ''
