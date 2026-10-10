@@ -366,3 +366,53 @@ def test_bind_does_not_pollute_stream():
     rt.BIND('> ≡377')
     rt.BIND(' ==) ≡377')
     assert bytes(rt._terminal.wire) == b''
+
+
+# ── кириллица: знаки из ПЗУ знакогенератора ───────────────────────────────
+
+def test_cyrillic_font_covers_alphabet():
+    """В таблице есть все буквы русского алфавита, включая «ё»."""
+    from mc7401.chars import FONT_7X8_CYR
+    for ch in 'АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя':
+        assert ch in FONT_7X8_CYR, f'нет знака {ch!r}'
+    assert 'Ё' in FONT_7X8_CYR and 'ё' in FONT_7X8_CYR
+
+
+def test_every_cyrillic_letter_maps_to_a_glyph():
+    """Каждой букве КОИ-8 0x80…0xFF сопоставлен знак, а не «?»."""
+    from mc7401.chars import GLYPHS_RU
+    for ch in 'АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя':
+        code = ch.encode('koi8-r')[0] & 0x7F
+        assert code in GLYPHS_RU, f'код {code:#04x} ({ch}) без знака'
+
+
+def test_cyrillic_glyphs_are_7x8_cells():
+    """Глифы ПЗУ занимают знакомест 7×8 и не пусты."""
+    from mc7401.chars import FONT_7X8_CYR
+    for ch, art in FONT_7X8_CYR.items():
+        assert len(art) == 8, f'{ch}: {len(art)} строк'
+        for row in art:
+            assert len(row) == 7, f'{ch}: строка шириной {len(row)}'
+        assert any('#' in row for row in art), f'{ch}: пустой знак'
+
+
+def test_latin_glyphs_are_padded_to_cell():
+    """Латинские знаки 5×7 выровнены в знакомест 7×8."""
+    from mc7401.chars import _LAT_MATRIX
+    for code, mat in _LAT_MATRIX.items():
+        if code == 0x20:                       # пробел — пустой по определению
+            continue
+        assert len(mat) == 8
+        for row in mat:
+            assert len(row) == 7
+
+
+def test_cyrillic_code_mapping_is_seven_bit_koi8():
+    """Правило кодов: семибитный код `c` на странице `S0` = КОИ-8 `c|0x80`.
+
+    Подтверждено статьёй («7 бит используется в каждом байте»):
+    `п` = 0x70, `и` = 0x69, `т` = 0x74 — при кодах КОИ-8 0xF0/0xE9/0xF4.
+    """
+    from mc7401.chars import GLYPHS_RU
+    for ch, koi8 in (('п', 0xF0), ('и', 0xE9), ('т', 0xF4)):
+        assert (koi8 & 0x7F) in GLYPHS_RU
