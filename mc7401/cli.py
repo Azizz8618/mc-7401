@@ -136,14 +136,7 @@ def main(argv=None) -> int:
                             timeout=args.link_timeout,
                             verbose=args.verbose)
 
-    # Интерактивный режим — по умолчанию: без файла на входе открываем
-    # диалог с терминалом, а не читаем пустой stdin.
     # Интерактивный режим — по умолчанию.  Без файла на входе и при
-    # терминале на stdin открываем диалог с терминалом; любой явно
-    # заданный параметр вывода отключает его.
-    action_flags = (args.link or args.listen or args.dump_ascii or args.stats
-                    or args.png or args.frames or args.list_backends)
-    # Интерактивный режим — по умолчанию: без файла на входе и при
     # терминале на stdin открываем диалог с терминалом.  Любой явно
     # заданный параметр вывода отключает его.
     action_flags = (args.link or args.listen or args.dump_ascii or args.stats
