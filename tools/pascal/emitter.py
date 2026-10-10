@@ -785,8 +785,18 @@ class Emitter:
         arr = [f for f, t in fields.items()
                if self.resolve(t).get('kind') == 'array']
         if ty.get('kind') == 'record' and len(fields) == 1 and arr:
-            return "{'" + arr[0] + "': [" + \
-                ', '.join(self.expr(it[1]) for it in value[1]) + ']}'
+            # Массив может быть двумерным (`МАС: АRRАY[1..NП,0..4]` —
+            # траектория птицы в `ПТИЦА`).  Литерал плоский, поэтому
+            # приводим его к вложенным спискам по первой границе.
+            aty = self.resolve(fields[arr[0]])
+            dims = aty.get('index') or []
+            items = [self.expr(it[1]) for it in value[1]]
+            if len(dims) > 1:
+                lo0, hi0 = dims[0]
+                rows = hi0 - lo0 + 1
+                inner = ', '.join(items)
+                items = [f'[{inner}]' for _ in range(rows)]
+            return "{'" + arr[0] + "': [" + ', '.join(items) + ']}'
         return self.expr(value)
 
     def call_expr(self, name: str, args: list) -> str:

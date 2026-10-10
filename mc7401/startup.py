@@ -9,6 +9,7 @@ startup.py — начальный экран терминала.
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
 
@@ -20,6 +21,37 @@ TITLE_LINES = [
     f'  растровый графический терминал  {SCREEN_WIDTH}×{SCREEN_HEIGHT}',
     '',
 ]
+
+
+WELCOME = ('Электроника МС 7401 — растровый графический терминал БЭСМ-6. '
+           'Готов к работе: введите команду.')
+
+DEFAULT_PICTURE = 'ПТИ'
+
+
+def picture_path(name: str = DEFAULT_PICTURE):
+    """Найти рисунок заставки.
+
+    `name` — имя файла без расширения: ищется в `golden/render/` рядом с
+    исходниками, затем в текущем каталоге и в каталоге пользователя.
+    Пустое имя или `none` — заставка без картинки.
+    """
+    if not name or name.lower() in ('none', '-', 'нет'):
+        return None
+    stem = name
+    for suf in ('.png', '.svg', '.PNG'):
+        if stem.endswith(suf):
+            stem = stem[:-len(suf)]
+    roots = [Path(__file__).resolve().parent.parent, Path.cwd(),
+             Path.home() / '.local' / 'share' / 'mc7401']
+    for root in roots:
+        for cand in (root / 'golden' / 'render' / (stem + '.png'),
+                     root / 'render' / (stem + '.png'),
+                     root / 'golden' / 'render' / (stem + '.svg'),
+                     root / (stem + '.png')):
+            if cand.exists():
+                return cand
+    return None
 
 
 def build(lines_width: int, *, state: str, summary: str,
@@ -38,7 +70,7 @@ def build(lines_width: int, *, state: str, summary: str,
     for part in summary.split(', '):
         body.append(f'  · {part}')
     body.append('')
-    body.append('  Ожидание данных от ЭВМ…')
+    body.append('  ' + WELCOME)
     body.append('')
     body.append(f'  {hint}')
     body.append('')
@@ -52,4 +84,5 @@ def hint_text() -> str:
             '↑↓←→ сдвиг  + - масштаб')
 
 
-__all__ = ['MODEL', 'build', 'hint_text', 'TITLE_LINES']
+__all__ = ['MODEL', 'build', 'hint_text', 'TITLE_LINES',
+           'WELCOME', 'picture_path', 'DEFAULT_PICTURE']

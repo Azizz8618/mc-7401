@@ -37,6 +37,10 @@ from .pen import LightPen
 from .session import Session
 
 #: Название модели терминала — показывается в заголовке.
+#: Гид-символ ОС Диспак (ETX): после подключения к линии ДКС
+#: его надо передать, иначе приглашения «ЭВМ-3,ТNNN» не будет.
+ETX = 0o003
+
 MODEL = 'Электроника МС 7401'
 
 #: Линия ДКС, к которой подключается эмулятор по умолчанию.
@@ -74,6 +78,74 @@ HELP = [
 #: Сценарий нажатий для --demo: меню `graf.pas` рисует картины по
 #: очереди, текст уходит в программу, ответ приходит в поток.
 DEMO_KEYS = 'ЛИН 3 ВЫХ '
+
+
+def _render_picture(path, cols: int, rows: int) -> str:
+    """Показать готовый рисунок как ASCII-арт.
+
+    Рисунок берётся из `golden/render`; PNG читается собственным
+    декодером, SVG разбирается по координатам прямоугольников.
+    Внешние зависимости не нужны.
+    """
+    from pathlib import Path
+    p = Path(path)
+    if p.suffix.lower() == '.svg':
+        return _render_svg(p, cols, rows)
+    return _render_png(p, cols, rows)
+
+
+def _render_png(path, cols: int, rows: int) -> str:
+    import zlib
+    data = Path(path).read_bytes()
+    pos, idat, w = 8, b'', 0
+    while pos < len(data):
+        ln = int.from_bytes(data[pos:pos + 4], 'big')
+        typ = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + ln]
+        if typ == b'IHDR':
+            w = int.from_bytes(body[0:4], 'big')
+        elif typ == b'IDAT':
+            idat += body
+        pos += 12 + ln
+    if not w:
+        return ''
+    # Берём только яркость первого канала, построчно не разворачивая
+    # фильтры: картинка чёрно-зелёная на чёрном, этого достаточно.
+    try:
+        raw = zlib.decompress(idat)
+    except zlib.error:
+        return ''
+    step = max(1, w // cols)
+    lines = []
+    for r in range(rows):
+        y = r * step
+        base = y * (w + 1)
+        if base >= len(raw):
+            break
+        line = []
+        for c in range(cols):
+            x = c * step
+            off = base + 1 + x
+            if off >= len(raw):
+                break
+            line.append('#' if raw[off] > 40 else ' ')
+        lines.append(''.join(line))
+    return '\n'.join(lines)
+
+
+def _render_svg(path, cols: int, rows: int) -> str:
+    import re
+    text = Path(path).read_text(encoding='utf-8')
+    rects = re.findall(r'<rect[^>]*x="([\d.]+)"[^>]*y="([\d.]+)"', text)
+    if not rects:
+        return ''
+    grid = [[' '] * cols for _ in range(rows)]
+    for xs, ys in rects:
+        c = int(float(xs) * cols / 560)
+        r = int(float(ys) * rows / 400)
+        if 0 <= r < rows and 0 <= c < cols:
+            grid[r][c] = '#'
+    return '\n'.join(''.join(r) for r in grid)
 
 
 class LinkRefused(Exception):
@@ -137,10 +209,17 @@ class LiveDriver(Driver):
         except LinkError as exc:
             raise LinkRefused(self._diagnose(exc)) from exc
         self.name = f'ДКС {host}:{self.link.port}'
+        # Гид-символ ОС Диспак: после подключения линии его нужно
+        # передать, иначе приглашения «ЭВМ-3,ТNNN» не будет — так же
+        # поступает `simh/BESM6/scripts/dks_tty.py`.
+        try:
+            self.link.send(bytes((ETX,)))
+        except OSError:
+            pass
 
     def _diagnose(self, exc: Exception) -> str:
         """Человекочитаемое объяснение, почему линия не открылась."""
-        from .link import DEFAULT_PORTS
+        from .link import DEFAULT_PORTS, spec_hint
         lines = [
             f'Не удалось подключиться к линии ДКС: {exc}',
             '',
@@ -246,6 +325,10 @@ class TerminalApp:
         self.grid = self.config.grid or grid
         #: Данные получены? до них показывается начальный экран.
         self._got_data = False
+        #: Последняя нажатая клавиша — строка «ПОСЛ:» подвала.
+        self.last_key = ''
+        #: Заставка закрыта ли? по умолчанию показывается.
+        self.splash = True
         self._connect_note = ''
         self.running = True
         self._grid_fb = None
@@ -283,6 +366,7 @@ class TerminalApp:
                 data.decode('koi8-r', errors='replace'))
             return
         self._got_data = True
+        self.splash = False
         self.reader.feed(data)
         for ev in self.reader.pop():
             if ev.kind is EventKind.COMMAND:
@@ -306,7 +390,8 @@ class TerminalApp:
         панели: состояние, подсказка и строка ввода.
         """
         cols, rows = terminal_size()
-        return cols, max(3, rows - 5)
+        n = 9 + (1 if self.config.title else 0)
+        return cols, max(3, rows - n)
 
     def draw(self) -> None:
         cols, rows = self.layout()
@@ -325,20 +410,23 @@ class TerminalApp:
                 cols, state=self._link_state(), summary=self.config.summary(),
                 hint=startup.hint_text())
             body = body.replace('\n', ' \n') if False else body
-        out = [HOME, title_line() + '\n', body, '\n']
-        out.append(bar(f' {self._title()}', cols) + '\n')
-        out.append(bar(self._hint(), cols) + '\n')
-        out.append(bar(self._input_row(), cols))
+        out = [HOME]
+        if self.config.title:
+            out.append(title_line() + '\n')
+        if self.splash:
+            body = self._splash_text(cols)
+        out.append(body + '\n')
+        for line in self._service_panel(cols):
+            out.append(bar(line, cols) + '\n')
         sys.stdout.write(''.join(out))
         sys.stdout.flush()
 
-    def _link_state(self) -> str:
-        """Строка состояния линии для начального экрана."""
-        return self._connect_note or f'линия {self.driver.name}'
-
     def _title(self) -> str:
         st = self.renderer.status(self.layout()[0], self.layout()[1])
-        parts = [f'МС 7401 — {self.driver.name}', self.session.panel(),
+        mode = ('С ЭВМ' if self.session.mode == 'host'
+                else 'АВТОНОМНО')
+        parts = [f'МС 7401 — {self.driver.name}',
+                 'РЕЖИМ=' + mode, self.session.panel(),
                  st, self.status_extra]
         return ' | '.join(p for p in parts if p)
 
@@ -349,9 +437,9 @@ class TerminalApp:
             return f'ЭВМ: {text[-200:]}'
         if self.message:
             return self.message
-        return ('L режим  S передать  e эхо  x очистить  z набор  '
-                '↑↓←→ сдвиг  + - масштаб  0 вписать  c центр  '
-                'm цвет  g сетка  p перо  q выход')
+        return ('РЕЖИМ=L  ПЕРЕДАЧА=S  ЭХО=e  ОЧИСТКА=x  НАБОР=z  '
+                'ПЕРО=p  МАСШТАБ=+/-  ВПИСАТЬ=0  ЦЕНТР=c  '
+                'ЦВЕТ=m  СЕТКА=g  ВЫХОД=q')
 
     def _input_row(self) -> str:
         return f' ВВОД: {self.input_line}▏'
@@ -381,6 +469,73 @@ class TerminalApp:
             lines[r] = ''.join(buf)
         return '\n'.join(lines)
 
+
+    # ── подвал (как в 15ИЭ-00-013) ──────────────────────────────────
+
+    #: Ширина колонки подвала: 4��олонки по 17 знаков и разделители
+    #: « | » — разделители стоят на одних позициях во всех рядах.
+    COL = 17
+
+    def _row(self, *fields) -> str:
+        return ' | '.join(f.ljust(self.COL) for f in fields).rstrip()
+
+    def _service_panel(self, cols: int) -> list:
+        """Сегмент состояния, черта и справочные ряды — как в 15ИЭ."""
+        from .chars import SET_LABELS
+        ses = self.session
+        host = ses.mode == 'host'
+        lay = ('ВЫКЛ' if not ses.layout else
+               ('ФОН' if ses.layout == 'phonetic' else 'ПОЗ'))
+        buf = str(len(ses.buffer)) if ses.buffer else 'ПУСТО'
+        state1 = self._row(
+            'РЕЖИМ=' + ('С ЭВМ' if host else 'АВТОНОМНО'),
+            'НАБОР=' + SET_LABELS.get(ses.charset_set, ses.charset_set),
+            'ЛИНИЯ=' + self._link_state().upper()[:self.COL],
+            'РАСК=' + lay)
+        state2 = self._row(
+            'ЭХО=' + ('ВКЛ' if ses.echo else 'ВЫКЛ'),
+            'ПЕРО=' + ('ВКЛ' if self.pen.enabled else 'ВЫКЛ'),
+            'БУФЕР=' + buf,
+            'СЕТКА=' + ('ВКЛ' if self.grid else 'ВЫКЛ'))
+        state3 = self._row(
+            'МАСШТАБ=1:' + str(self.renderer.vp.scale),
+            'ТОЧЕК=' + str(self.emu.fb.count_set()),
+            'ПОСЛ: ' + (self.last_key or ''),
+            'ВВОД=' + (self.input_line or ''))
+        keys1 = self._row('ВК=Bksp', 'ТАБ=Tab', 'ЗВН=Ctrl-G', 'ПРПС=Enter')
+        keys2 = self._row('ESC=Esc', 'КУРСОР=Стрелки', 'СДВИГ=PageUp/Dn',
+                          'МАСШТАБ=+/−')
+        keys3 = self._row('ВПИСАТЬ=0', 'ЦЕНТР=c', 'ЦВЕТ=m', 'СЕТКА=g')
+        keys4 = self._row('РЕЖИМ=L', 'ПЕРЕДАЧА=S', 'ЭХО=e', 'ОЧИСТКА=x')
+        keys5 = self._row('НАБОР=z', 'ПЕРО=p', 'ВЫХОД=q', '')
+        width = min(cols, self.COLS_N * self.COL + 3 * (self.COLS_N - 1))
+        return [state1, state2, state3, '-' * width,
+                keys1, keys2, keys3, keys4, keys5]
+
+    COLS_N = 4
+
+    def _splash_text(self, cols: int) -> str:
+        """Заставка: рисунок из `golden/render` плюс приветственный текст.
+
+        Рисунок задаётся конфигурацией (`[display] splash`), по умолчанию
+        птица.  Закрывается при первом вводе или первом байте от ЭВМ.
+        """
+        head = startup.build(
+            max(20, cols - 2), state=self._link_state(),
+            summary=self.config.summary(), hint=startup.hint_text())
+        pic = startup.picture_path(self.config.splash)
+        if not pic:
+            return head
+        art = _render_picture(pic, cols, max(3, self.layout()[1]))
+        return f'{art}\n{head}' if art else head
+
+    def _link_state(self) -> str:
+        """Строка состояния линии для начального экрана и подвала."""
+        return self._connect_note or self.driver.name
+
+    #: Приветственное сообщение на начальном экране.
+    WELCOME = ('Электроника МС 7401 — растровый графический терминал. '
+               'Готов к работе с ЭВМ.')
     # ── ввод ────────────────────────────────────────────────────────────────
 
     def handle_key(self, key: str) -> None:
@@ -461,9 +616,16 @@ class TerminalApp:
             self.input_line = ''
             self.message = 'ввод сброшен'
         elif key and len(key) == 1 and key.isprintable():
+            # Свободный ввод, как на 15ИЭ: в режиме С ЭВМ знак уходит в
+            # линию немедленно, в АВТОНОМНО копится в буфер до ПЕРЕДАЧА.
             self.input_line += key
+            out = self.session.type_key(key)
+            if out:
+                self.driver.send_keys(out.decode('latin-1'))
+            self.splash = False
         else:
             return
+        self.last_key = key if len(key) <= 12 else key[:12]
         vp.clamp(self.emu.fb, cols, rows)
 
     def _send(self) -> None:

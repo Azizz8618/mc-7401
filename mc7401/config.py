@@ -62,6 +62,12 @@ mode = color
 scale = 2
 # Показывать верхнюю строку с названием модели и временем.
 title = true
+# Заставка: имя рисунка без расширения из `golden/render`.
+# По умолчанию ПТИ — анимация полёта из `graf.pas`.
+# Можно указать свой (`СЕТ`, `ЧАС`, `КОТ`), без расширения.
+# Значение `none` — заставка без картинки, только текст.
+# Заставка закрывается при первом вводе или первом байте от ЭВМ.
+splash = ПТИ
 
 [keys]
 # Переназначение клавиш: «что нажато = что делается».
@@ -89,6 +95,10 @@ class Config:
     display_mode: str = 'color'
     scale: int = 2
     title: bool = True
+    # Заставка: имя рисунка без расширения из `golden/render`
+    # (по умолчанию ПТИ — анимация полёта).  `none` — без картинки.
+    # Закрывается при первом вводе или первом байте от ЭВМ.
+    splash: str = 'ПТИ'
     # [keys]
     keys: dict[str, str] = field(default_factory=dict)
     #: Откуда прочитали (для сообщения при запуске).
@@ -137,6 +147,7 @@ class Config:
                                       fallback=self.display_mode)
             self.scale = p.getint('display', 'scale', fallback=self.scale)
             self.title = p.getboolean('display', 'title', fallback=self.title)
+            self.splash = p.get('display', 'splash', fallback=self.splash)
         if p.has_section('keys'):
             self.keys = {k.strip(): v.strip() for k, v in p.items('keys')
                          if k.strip() and not k.strip().startswith('#')}
