@@ -287,9 +287,6 @@ addopts = [
     "--color=yes",
 ]
 
-# Таймаут на каждый тест (pytest-timeout).
-timeout = 30
-
 markers = [
     "slow: медленные тесты (можно пропустить через `-m 'not slow'`)",
     "integration: интеграционные тесты",

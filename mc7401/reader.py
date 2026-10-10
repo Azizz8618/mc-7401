@@ -297,14 +297,17 @@ class CommandStreamReader:
                 elif len(tail) < n + 1:
                     return False
                 if payload:
-                    # Маркер входа в кадр `АР2 'У  '` остался в хвосте
-                    # предыдущего блока — выделяем его из полезной нагрузки.
-                    while payload[:1] == bytes((AR2,)):
-                        self._emit(EventKind.FRAME_BEGIN,
-                                   payload[:4])
-                        payload = payload[4:]
+                    # Маркер входа в кадр `АР2 'У  '` приходит в хвосте
+                    # блока (перед `АР2 'F‾' ВК`, завершающим кадр):
+                    # выделяем его из полезной нагрузки, иначе он портит
+                    # разбор последней команды блока.
+                    while len(payload) >= 4 and payload[-4:-3] == bytes((AR2,)):
+                        self._emit(EventKind.FRAME_BEGIN, payload[-4:])
+                        payload = payload[:-4]
                     if payload:
                         self._emit(EventKind.COMMAND, payload, payload=True)
+                self._emit(EventKind.FRAME_END,
+                           bytes(self._buf[idx:idx + n]))
                 self._skip(idx + n)
                 self._state = _State.NORMAL
                 return True
