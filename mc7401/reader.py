@@ -43,6 +43,9 @@ VUK_HEADER_LEN = 20       # длина служебной записи в бай
 #: Префикс блока ВУК: `'/'` + ВК.
 VUK_BLOCK = bytes((ord('/'), VK))
 
+#: Заполнитель кадра: 0o32 (SUB) + ВК — операции не несёт.
+PAD_CMD = bytes((0o32, VK))
+
 
 class EventKind(Enum):
     """Тип события, выдаваемого `CommandStreamReader`."""
@@ -55,6 +58,8 @@ class EventKind(Enum):
     DEFCHAR = auto()      # 0o110 0o240 — начало загрузки пользовательского знака
     DEFROW = auto()       # 0o240 — начало строки пользовательского знака
     DEFDONE = auto()      # 0o215 — конец загрузки пользовательского знака
+    VUK_BLOCK = auto()    # '/' ВК — начало блока ВУК
+    PAD = auto()          # 0o32 ВК — заполнитель кадра (операции нет)
     END_OF_STREAM = auto()
 
 
@@ -203,11 +208,17 @@ class CommandStreamReader:
             self._emit(EventKind.RU_FONT)
             return True
 
+        # заполнитель кадра: 0o32 ВК (терминал не выполняет операции)
+        if head[:2] == PAD_CMD:
+            self._skip(2)
+            self._emit(EventKind.PAD)
+            return True
+
         # начало блока ВУК: '/' ВК
         if head[:2] == VUK_BLOCK:
             self._skip(2)
             self._state = _State.VUK_HEADER
-            self._emit(EventKind.COMMAND, VUK_BLOCK, vuk=True)
+            self._emit(EventKind.VUK_BLOCK, VUK_BLOCK, vuk=True)
             return True
 
         # загрузка пользовательского знака: 0o110 0o240
@@ -286,7 +297,14 @@ class CommandStreamReader:
                 elif len(tail) < n + 1:
                     return False
                 if payload:
-                    self._emit(EventKind.COMMAND, payload, payload=True)
+                    # Маркер входа в кадр `АР2 'У  '` остался в хвосте
+                    # предыдущего блока — выделяем его из полезной нагрузки.
+                    while payload[:1] == bytes((AR2,)):
+                        self._emit(EventKind.FRAME_BEGIN,
+                                   payload[:4])
+                        payload = payload[4:]
+                    if payload:
+                        self._emit(EventKind.COMMAND, payload, payload=True)
                 self._skip(idx + n)
                 self._state = _State.NORMAL
                 return True

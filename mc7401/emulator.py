@@ -105,6 +105,8 @@ class TerminalEmulator:
                        else CommandParser(xor_code))
         self.on_frame = on_frame
         self.frames = 0
+        #: Число блоков ВУК в потоке (границы выдачи).
+        self.blocks = 0
         #: Статистика.
         self.stats = {'commands': 0, 'unknown': 0, 'chars': 0}
 
@@ -148,6 +150,11 @@ class TerminalEmulator:
             return
         if kind is EventKind.RU_FONT:
             self.state.font = 'RU'
+            return
+        if kind is EventKind.VUK_BLOCK:
+            self.blocks += 1          # блок ВУК — граница выдачи
+            return
+        if kind is EventKind.PAD:
             return
         if kind is EventKind.COMMAND:
             self.execute(self.parser.parse(ev.data))

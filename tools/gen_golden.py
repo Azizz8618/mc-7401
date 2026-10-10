@@ -121,7 +121,7 @@ def generate(source: str, name: str, *, scale: int = 2,
     reader.feed(wire)
     reader.close()
     for ev in reader.pop():
-        if ev.meta.get('vuk'):
+        if ev.kind is EventKind.VUK_BLOCK:
             n = emu.fb.count_set()
             if n > best_pts:
                 best, best_pts = emu.fb.copy(), n
