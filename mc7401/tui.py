@@ -31,6 +31,8 @@ from datetime import datetime
 
 from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
 from .emulator import TerminalEmulator
+from . import startup
+from .config import Config
 from .pen import LightPen
 from .session import Session
 
@@ -217,7 +219,8 @@ class TerminalApp:
     """Диалоговый режим: кадр, масштаб, ввод."""
 
     def __init__(self, driver: Driver, *, mode: str = 'color',
-                 grid: bool = False, intro: str = '') -> None:
+                 grid: bool = False, intro: str = '',
+                 config: Optional[Config] = None) -> None:
         self.driver = driver
         self.emu = TerminalEmulator()
         self.reader = CommandStreamReader()
@@ -234,6 +237,16 @@ class TerminalApp:
         #: Режимы терминала по образцу 15ИЭ-00-013: АВТОНОМНО / С ЭВМ,
         #: SEND, ЭХО, ОЧИСТКА, переключение наборов.
         self.session = Session()
+        #: Настройки из файла конфигурации.
+        self.config = config or Config.default()
+        self.session.mode = self.config.mode
+        self.session.set_charset(self.config.charset)
+        self.session.echo = self.config.echo
+        self.pen.enabled = self.config.pen
+        self.grid = self.config.grid or grid
+        #: Данные получены? до них показывается начальный экран.
+        self._got_data = False
+        self._connect_note = ''
         self.running = True
         self._grid_fb = None
 
@@ -269,6 +282,7 @@ class TerminalApp:
             self._text_log.extend(
                 data.decode('koi8-r', errors='replace'))
             return
+        self._got_data = True
         self.reader.feed(data)
         for ev in self.reader.pop():
             if ev.kind is EventKind.COMMAND:
@@ -306,12 +320,21 @@ class TerminalApp:
             body = self._overlay_grid(body, cols, rows)
         if self.pen.enabled:
             body = self._overlay_pen(body, cols, rows)
+        if not self._got_data:
+            body = startup.build(
+                cols, state=self._link_state(), summary=self.config.summary(),
+                hint=startup.hint_text())
+            body = body.replace('\n', ' \n') if False else body
         out = [HOME, title_line() + '\n', body, '\n']
         out.append(bar(f' {self._title()}', cols) + '\n')
         out.append(bar(self._hint(), cols) + '\n')
         out.append(bar(self._input_row(), cols))
         sys.stdout.write(''.join(out))
         sys.stdout.flush()
+
+    def _link_state(self) -> str:
+        """Строка состояния линии для начального экрана."""
+        return self._connect_note or f'линия {self.driver.name}'
 
     def _title(self) -> str:
         st = self.renderer.status(self.layout()[0], self.layout()[1])
@@ -482,6 +505,9 @@ class TerminalApp:
                     if data:
                         self.feed(data)
                         continue
+                    if not self._got_data:
+                        # Часы на начальном экране идут вживую.
+                        self.draw()
                     key = read_key(timeout=0.08)
                     if key:
                         self.handle_key(key)
@@ -585,8 +611,9 @@ def _no_stream_hint() -> str:
 
 
 def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
-            demo: bool = False, mode: str = 'color',
-            grid: bool = False, pen: bool = False) -> int:
+            demo: bool = False, mode: Optional[str] = None,
+            grid: bool = False, pen: bool = False,
+            config: Optional[Config] = None) -> int:
     """Запустить фронтенд.
 
     Без файла и без `--link` открывается интерактивная сессия с
@@ -594,6 +621,11 @@ def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
     доступна, печатается объяснение и возвращается код 2 — молча
     подменять её эталонной картинкой нельзя, это вводит в заблуждение.
     """
+    cfg = config or Config.default()
+    mode = mode or cfg.display_mode
+    if endpoint is None and path is None and not demo:
+        endpoint = cfg.endpoint
+
     if path is not None:
         # Явно указан файл — обычный разбор без диалога с ЭВМ.
         driver: Driver = FileDriver(path)
@@ -608,9 +640,10 @@ def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
             print(str(exc), file=sys.stderr)
             return 2
 
-    app = TerminalApp(driver, mode=mode, grid=grid)
+    app = TerminalApp(driver, mode=mode, grid=grid, config=cfg)
     if pen:
         app.pen.enabled = True
+    app._connect_note = getattr(driver, 'endpoint', '') or ''
     if demo:
         app.status_extra = 'сценарий нажатий: ЛИН 3 ВЫХ'
     return app.run()

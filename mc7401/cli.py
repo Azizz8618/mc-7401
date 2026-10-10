@@ -71,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help='световое перо: мышь рисует линию (с --tui)')
     ap.add_argument('--demo', action='store_true',
                     help='демонстрация без ЭВМ (сценарий нажатий)')
+    ap.add_argument('--conf', metavar='FILE',
+                    help='файл конфигурации (по умолчанию ищется сам)')
+    ap.add_argument('--init-config', nargs='?', const='-', metavar='FILE',
+                    help='записать образец конфигурации и выйти')
     ap.add_argument('--list-backends', action='store_true',
                     help='показать доступные backend-ы и выйти')
     ap.add_argument('-v', '--verbose', action='count', default=0,
@@ -92,6 +96,20 @@ def setup_logging(verbosity: int) -> None:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose)
+
+    if args.init_config is not None:
+        from .config import Config, user_config_path
+        dest = args.init_config
+        if dest == '-':
+            dest = str(user_config_path())
+        path = Config.default().write(dest)
+        print(f'записан образец конфигурации: {path}')
+        print('правьте значения; файл подхватывается автоматически.')
+        return 0
+
+    from .config import load as load_config
+    cfg = load_config(args.conf)
+
 
     if args.list_backends:
         for name in sorted(BACKENDS):
@@ -130,9 +148,9 @@ def main(argv=None) -> int:
     if interactive:
         from .tui import run_tui
         path = Path(args.input) if args.input not in ('-', None) else None
+        mode = 'mono' if args.dump_ascii else None
         return run_tui(path, endpoint=args.link, demo=args.demo,
-                       mode='mono' if args.dump_ascii else 'color',
-                       pen=args.pen)
+                       mode=mode, pen=args.pen, config=cfg)
 
     if args.link:
         from .link import run_link

@@ -607,3 +607,74 @@ def test_russian_layout_exists_only_in_koi8r():
     assert s.layout == 'phonetic'
     s.set_charset('n2')
     assert s.layout is None
+
+
+# ── файл конфигурации ──────────────────────────────────────────────────────
+
+def test_config_defaults_without_file():
+    """Без файла работают значения по умолчанию."""
+    from mc7401.config import Config
+    c = Config.default()
+    assert c.charset == 'n2'
+    assert c.mode == 'host'
+    assert c.echo is True
+    assert c.endpoint == '127.0.0.1:4202-4223'
+
+
+def test_config_reads_sections(tmp_path):
+    """Секции `[line]`, `[terminal]`, `[display]`, `[keys]` читаются."""
+    from mc7401.config import Config
+    f = tmp_path / 'mc7401.conf'
+    f.write_text(
+        '[line]\nendpoint = 127.0.0.1:4203\n\n'
+        '[terminal]\nmode = local\ncharset = koi8r\necho = false\n'
+        'pen = true\n\n'
+        '[display]\nmode = mono\nscale = 3\ntitle = false\n\n'
+        '[keys]\nL = mode\nq = quit\n', encoding='utf-8')
+    c = Config.load(f)
+    assert c.endpoint == '127.0.0.1:4203'
+    assert c.mode == 'local'
+    assert c.charset == 'koi8r'
+    assert c.echo is False
+    assert c.pen is True
+    assert c.display_mode == 'mono'
+    assert c.scale == 3
+    assert c.title is False
+    assert c.keys == {'L': 'mode', 'q': 'quit'}
+    assert c.key_action('L') == 'mode'
+    assert c.key_action('незадано') is None
+
+
+def test_config_missing_file_is_not_fatal(tmp_path):
+    """Отсутствующий файл — не ошибка, а значения по умолчанию."""
+    from mc7401.config import Config
+    c = Config.load(tmp_path / 'нет.conf')
+    assert c.path is None
+    assert c.charset == 'n2'
+
+
+def test_config_sample_roundtrip(tmp_path):
+    """Записанный образец читается обратно и содержит все секции."""
+    from mc7401.config import Config
+    p = tmp_path / 'mc7401.conf'
+    Config.default().write(p)
+    text = p.read_text(encoding='utf-8')
+    for section in ('[line]', '[terminal]', '[display]', '[keys]'):
+        assert section in text
+    assert Config.load(p).charset == 'n2'
+
+
+def test_startup_screen_mentions_model_and_clock():
+    """Начальный экран: модель, разрешение, время, состояние линии."""
+    from datetime import datetime
+
+    from mc7401 import startup
+    text = startup.build(80, state='ДКС 127.0.0.1:4202',
+                         summary='набор n2, режим host',
+                         hint=startup.hint_text(),
+                         clock=datetime(2026, 10, 10, 12, 34, 56))
+    assert 'МС 7401' in text
+    assert '560×400' in text
+    assert '12:34:56' in text
+    assert 'ДКС 127.0.0.1:4202' in text
+    assert 'q — выход' in text
