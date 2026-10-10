@@ -254,11 +254,19 @@ class CommandStreamReader:
         return True
 
     def _emit_frame_marker(self, rec: bytes) -> None:
+        """Разобрать ESC-запись кадра.
+
+        В потоке встречается и отдельный маркер конца кадра
+        (`АР2 'F‾' ВК`), и объединённая запись
+        (`АР2 'У  ' АР2 'F‾' ВК`) — в последнем случае обе границы
+        кадра приходят одной записью.
+        """
         fn = rec[1:2]
-        if fn == b'F':
+        is_begin = fn != b'F'
+        self._emit(EventKind.FRAME_BEGIN if is_begin
+                   else EventKind.FRAME_END, rec)
+        if is_begin and bytes((AR2,)) + b'F' in rec[1:]:
             self._emit(EventKind.FRAME_END, rec)
-        else:
-            self._emit(EventKind.FRAME_BEGIN, rec)
 
     # ── блок ВУК ─────────────────────────────────────────────────────────────
 

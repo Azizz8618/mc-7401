@@ -21,9 +21,12 @@ compiler.py — транслятор диалекта Паскаль-Монит�
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+log = logging.getLogger('mc7401.pascal')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Нормализация
@@ -51,6 +54,31 @@ _OCTAL_CHAR_RE = re.compile(r'≡([0-7]{1,3})')
 
 def _octal_char(m: re.Match) -> str:
     return chr(int(m.group(1), 8) & 0xFF)
+
+
+#: Исправления дефектов распознавания оригинала.
+#:
+#: Применяются к нормализованному тексту до лексического анализа.
+#: Каждая правка — следы потери символов при OCR и оговорена в JOURNAL.md.
+REPAIRS: tuple[tuple[str, str, str], ...] = (
+    # `ТАКЕ` набирает число: в оригинале потеряно вычитание кода '0'.
+    # Без него `К:=К*10+ОRD(c)` даёт 49, 540, 5400… — число никогда не
+    # попадает в заданный диапазон и программа зацикливается.
+    ('К:=К*10+ОRD(INРUТ↑)', "К:=К*10+ОRD(INРUТ↑)-48",
+     'ТАКЕ: вычитание кода "0"'),
+    ('К:=К*10+ОRD(INР↑)', "К:=К*10+ОRD(INР↑)-48",
+     'ТАКЕ: вычитание кода "0"'),
+)
+
+
+def apply_repairs(text: str) -> tuple[str, list[str]]:
+    """Исправить дефекты распознавания; вернуть текст и список правок."""
+    applied = []
+    for src, dst, note in REPAIRS:
+        if src in text:
+            text = text.replace(src, dst)
+            applied.append(note)
+    return text, applied
 
 
 def preprocess(text: str) -> str:
@@ -91,6 +119,9 @@ def preprocess(text: str) -> str:
     # Буквы Ъ/Ь в исходнике употребляются только в метках экстракодов
     # `СОDЕ`; заменяем их на букву, чтобы не путать с апострофом.
     text = text.replace('Ъ', 'Y').replace('Ь', 'Y')
+    text, applied = apply_repairs(text)
+    if applied:
+        log.debug('применены правки: %s', '; '.join(applied))
     return text
 
 
@@ -218,6 +249,7 @@ BUILTIN_TYPES = {'INT': 'int', 'INTEGER': 'int', 'REAL': 'real',
 class Program:
     name: str = ''
     consts: dict = field(default_factory=dict)
+    nested: list = field(default_factory=list)
     types: dict = field(default_factory=dict)
     vars: dict = field(default_factory=dict)
     procedures: list = field(default_factory=list)
@@ -234,6 +266,7 @@ class Routine:
     result_name: str = ''
     labels: set = field(default_factory=set)
     consts: dict = field(default_factory=dict)
+    nested: list = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -631,9 +664,9 @@ class Parser:
                 r.consts.update(self._local_consts.pop())
                 continue
             if tt.kind == TOK_ID and canon(tt.text) in ('PROCED', 'FUNCTI', 'FUNC'):
-                r.locals['#nested'] = None
-                sub = self.parse_routine()
-                r.locals.setdefault('#procedures', []).append(sub)
+                # Вложенные подпрограммы хранятся отдельно от `VАR`:
+                # `r.locals` перезаписывается таблицей объявлений.
+                r.nested.append(self.parse_routine())
                 continue
             break
         r.locals = scope
@@ -1071,21 +1104,6 @@ class Parser:
             if c == 'NIL':
                 self.i += 1
                 return ('const', None)
-            if self.peek(1).kind == TOK_OP and self.peek(1).text == '[':
-                # множество: [1..5, 7]
-                self.i += 2
-                items = []
-                while not self.at(']'):
-                    lo = self.expression()
-                    if self.accept('..'):
-                        hi = self.expression()
-                        items.append(('range', lo, hi))
-                    else:
-                        items.append(('item', lo))
-                    if not self.accept(','):
-                        break
-                self.expect(']')
-                return ('setlit', items)
             node = self.lvalue()
             if self.peek().kind == TOK_OP and self.peek().text == '(':
                 self.i += 1

@@ -56,6 +56,11 @@ class Emitter:
         self.temp = 0
         #: Порядковый номер подпрограммы — различает `ЕХIТ` (см. `_ExitRoutine`).
         self.rid = 0
+        #: Имена, видимые из вложенных подпрограмм (локальные переменные
+        #: внешних подпрограмм — замыкания, а не глобальные переменные).
+        self.shadow_stack: list[set] = []
+        #: Области видимости внешних подпрограмм (для поиска типов).
+        self.scope_stack: list[dict] = []
         #: Канонические имена всех подпрограмм программы.
         self.known: set[str] = set()
 
@@ -115,6 +120,7 @@ class Emitter:
         self.w('')
         self.w('')
         self.known, self.functions = self._routine_names(prog)
+        self.varparams = self._var_params(prog)
         for r in prog.procedures:
             self.emit_routine(r)
         self.w('')
@@ -122,6 +128,10 @@ class Emitter:
         self.w('def __main__():')
         self.indent = 1
         self.routine = None
+        # Переменные программы, изменяемые в основном цикле, должны быть
+        # глобальными: подпрограммы видят их через `global`.
+        if self.prog.vars:
+            self.w('global ' + ', '.join(_py_name(v) for v in self.prog.vars))
         self.body(prog.body or [], None)
         self.indent = 1
         self.w('return None')
@@ -184,7 +194,14 @@ class Emitter:
             n = 1
             for lo, hi in ty['index']:
                 n *= max(0, hi - lo + 1)
-            return f"['\\0'] * {n}" if n > 0 else '[]'
+            if n <= 0:
+                return '[]'
+            base = self.zero_value(ty['elem'])
+            if ty['elem'].get('kind') in ('int', 'real', 'bool'):
+                return f'[{base}] * {n}'
+            if ty['elem'].get('kind') == 'char':
+                return "[''] * %d" % n
+            return f'[{base} for _ in range({n})]'
         if kind == 'record':
             return '{' + ', '.join(
                 f'{_py_name(k)!r}: {self.zero_value(v, k)}'
@@ -240,7 +257,7 @@ class Emitter:
             names.add(canon(r.name))
             if r.is_function:
                 funcs.add(canon(r.name))
-            for sub in r.locals.get('#procedures', []):
+            for sub in r.nested:
                 collect(sub)
 
         for r in prog.procedures:
@@ -254,6 +271,26 @@ class Emitter:
             'ROUND', 'TRUNC', 'ODD', 'SUCC', 'PRED', 'SEL',
         })
         return names, funcs
+
+    def _var_params(self, prog: Program) -> dict:
+        """Сколько `VАR`-параметров у каждой подпрограммы.
+
+        В Python передача по ссылке отсутствует, поэтому результат
+        таких параметров возвращается подпрограммой и разворачивается
+        на месте вызова.
+        """
+        out: dict[str, int] = {}
+
+        def collect(r: Routine) -> None:
+            n = sum(1 for _n, _t, mode in r.params if mode == 'var')
+            if n:
+                out[canon(r.name)] = n
+            for sub in r.nested:
+                collect(sub)
+
+        for r in prog.procedures:
+            collect(r)
+        return out
 
     def file_object(self, name: str) -> str:
         """Файловая переменная диалекта: `INР` — ввод, `OUTRUT` — вывод."""
@@ -282,12 +319,9 @@ class Emitter:
     def emit_routine(self, r: Routine) -> None:
         base = self.indent
         name = _py_name(r.name)
-        params = []
-        for pname, pty, mode in r.params:
-            if mode == 'var':
-                self.w(f'{_py_name(pname)} = {self.zero_value(pty)}')
-            else:
-                params.append(_py_name(pname))
+        params = [_py_name(pname) for pname, _t, _m in r.params]
+        var_names = [_py_name(pname) for pname, _t, mode in r.params
+                     if mode == 'var']
         self.w(f'def {name}({", ".join(params) if params else ""}):')
         self.indent = base + 1
         # Переменные программы, к которым обращается подпрограмма,
@@ -295,7 +329,13 @@ class Emitter:
         shadow = {pname for pname, _t, _m in r.params}
         shadow |= {k for k in r.locals if not k.startswith('#')}
         shadow |= {raw for raw, _v in r.consts.values()}
-        outer = [_py_name(v) for v in self.prog.vars if v not in shadow]
+        visible = set(shadow)
+        for frame in self.shadow_stack:      # локальные внешних подпрограмм
+            visible |= frame
+        outer = [_py_name(v) for v in self.prog.vars if v not in visible]
+        self.shadow_stack.append(shadow)
+        self.scope_stack.append(
+            {**r.locals, **{p[0]: p[1] for p in r.params}})
         if outer:
             self.w('global ' + ', '.join(outer))
         saved = self.routine
@@ -308,8 +348,8 @@ class Emitter:
             if lname.startswith('#') or lname in param_names:
                 continue
             self.w(f'{_py_name(lname)} = {self.zero_value(lty, lname)}')
-        if r.locals.get('#procedures'):
-            for sub in r.locals['#procedures']:
+        if r.nested:
+            for sub in r.nested:
                 self.w('')
                 self.emit_routine(sub)
         body = list(r.body)
@@ -337,7 +377,7 @@ class Emitter:
             # завершает работу, как при нажатии `К` на терминале.
             self.w(f'return {_py_name(rname)}')
         else:  # обычная подпрограмма
-            if not body and not r.locals.get('#procedures'):
+            if not body and not r.nested:
                 self.w('pass')
             elif not body:
                 self.w('pass')
@@ -350,9 +390,15 @@ class Emitter:
                 self.indent += 1
                 self.w(f'if _e.rid != {self.rid}: raise')
                 self.indent -= 1
+        if var_names:
+            self.w('return (' + ', '.join(var_names) + ')')
         self.routine = saved
         self.indent = base
         self.rid += 1
+        if self.shadow_stack:
+            self.shadow_stack.pop()
+        if self.scope_stack:
+            self.scope_stack.pop()
 
     # ── операторы ────────────────────────────────────────────────────────────
 
@@ -418,7 +464,23 @@ class Emitter:
                 # Метка или имя, потерянное при распознавании оригинала.
                 self.w(f'pass  # нераспознанный вызов {name}')
                 return
-            self.w(self.call_expr(name, args))
+            nvar = self.varparams.get(canon(name), 0)
+            text = self.call_expr(name, args)
+            if not nvar:
+                self.w(text)
+                return
+            # `VАR`-параметры возвращаются подпрограммой и присваиваются
+            # обратно на месте вызова.
+            self.temp += 1
+            tmp = f'_rv{self.temp}'
+            self.w(f'{tmp} = {text}')
+            # `VАR`-параметры занимают последние позиции списка
+            # параметров подпрограммы.
+            targets = [a for a in args[len(args) - nvar:]
+                       if a[0] == 'var']
+            if targets:
+                self.w(', '.join(self.assign_target(t) for t in targets)
+                       + ' = ' + tmp)
         elif kind == 'code':
             self.w(f'_code({st[1]!r})')
         elif kind == 'code_assign':
@@ -570,11 +632,15 @@ class Emitter:
         return _py_name(name)
 
     def lookup_type(self, name: str):
+        """Тип переменной: сначала локальные, затем внешние области."""
         if self.routine is not None and name in self.routine.locals:
             return self.routine.locals[name]
         for pname, pty, mode in (self.routine.params if self.routine else []):
             if pname == name:
                 return pty
+        for scope in reversed(self.scope_stack):      # вложенные подпрограммы
+            if name in scope:
+                return scope[name]
         return self.prog.vars.get(name)
 
     def expr(self, node) -> str:
@@ -598,7 +664,9 @@ class Emitter:
             ty = self.type_of(base)
             for n, idx in enumerate(idxs):
                 bound = self.index_bound(ty, n)
-                off = (bound[0] - 1) if bound else 0
+                # `ARRAY[l..h]` хранится списком с нуля: индекс `l`
+                # соответствует элементу 0.
+                off = bound[0] if bound else 0
                 text = f'{text}[({self.expr(idx)}) - {off}]'
                 ty = self.elem_type(ty, n)
             return text

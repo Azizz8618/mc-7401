@@ -120,7 +120,7 @@ def _set(x):
     if isinstance(x, (list, tuple)):
         out: set = set()
         for item in x:
-            if isinstance(item, (list, tuple)):
+            if isinstance(item, (list, tuple, set, frozenset)):
                 out.update(_set(item))
             elif item:
                 out.add(ord(item) if isinstance(item, str) else item)

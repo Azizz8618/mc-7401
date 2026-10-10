@@ -110,14 +110,24 @@ class TerminalEmulator:
 
     # ── основной вход ────────────────────────────────────────────────────────
 
-    def run(self, stream: bytes) -> Framebuffer:
-        """Выполнить поток байтов и вернуть кадр."""
+    def run(self, stream: bytes, *, collect_frames: bool = False):
+        """Выполнить поток байтов и вернуть кадр.
+
+        При `collect_frames` возвращается список кадров на конец каждого
+        кадра (`АР2 'F‾' ВК`) — так восстанавливается то, что видел
+        оператор: программа очищает экран в начале каждой картины.
+        """
         from .reader import CommandStreamReader
+        frames: list[Framebuffer] = []
         reader = CommandStreamReader()
         reader.feed(stream)
         reader.close()
         for ev in reader.pop():
+            if collect_frames and ev.kind is EventKind.FRAME_END:
+                frames.append(self.fb.copy())
             self.handle_event(ev)
+        if collect_frames:
+            return frames, self.fb
         return self.fb
 
     def feed_events(self, events) -> None:
@@ -213,8 +223,7 @@ class TerminalEmulator:
         if op is Op.LINE_REL:
             if a[1] is None or a[2] is None:
                 return
-            self.line_to(st.x + int(a[1]), st.y + int(a[2]),
-                         absolute=False,
+            self.line_to(int(a[1]), int(a[2]), absolute=False,
                          ltype=a[0] if a[0] is not None else st.line_type)
             return
         if op is Op.RECT:
