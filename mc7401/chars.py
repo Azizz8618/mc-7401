@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
-from .constants import GLYPH_H, GLYPH_W, USER_CHARS
+from .constants import ETX, GLYPH_H, GLYPH_W, USER_CHARS
 
 Row = Sequence[int]
 
@@ -387,6 +387,49 @@ def set_for_code(code: int) -> Optional[str]:
         return 'n2'
     return None
 
+#: Знаки, которыми SIMH/ДКС пользуется вместо типографских.
+INPUT_FALLBACK = {'\u2013': 0x2D, '\u2014': 0x2D, '\u2019': 0x27}
+
+
+def encode_input(text: str, *, set_name: str = DEFAULT_SET,
+                 line_end: bool = False) -> bytes:
+    """Знаки с клавиатуры → байты линии ДКС, как в терминале 15ИЭ.
+
+    Правила взяты из `ie15/ie15emu/charset.py`:
+
+    * латиница, цифры и знаки препинания проходят без изменений;
+    * управляющие коды (`< 0x20`) — тоже, в том числе `ВК`;
+    * русские буквы кладутся в строку `0x60…0x7E` — индекс в `RUS7` плюс
+      `0x60`, регистр сворачивает машина;
+    * `№` — внутренний код `0x9F` (алфавитный бит плюс `0x1F`);
+    * знаки вне семибитного набора заменяются заполнителем `0x7F`;
+    * конец строки на линии ДКС — **ETX (0o003)**: ни `dks_line_char`, ни
+      `RAW` в SIMH не сворачивают `ПР ПС` в `ПР`, как это делает `vt_fix`
+      на линии UTF-8.  Именно поэтому в 15ИЭ конец строки уходит иначе,
+      чем при печати на экран.
+    """
+    out = bytearray()
+    for ch in text:
+        if ch in INPUT_FALLBACK:
+            out.append(INPUT_FALLBACK[ch])
+            continue
+        if ch == '\u2116':                       # №
+            out.append(0x80 | 0x1F)
+            continue
+        up = ch.upper().replace('\u0401', '\u0415')
+        if up in RUS7:
+            out.append(0x60 + RUS7.index(up))
+            continue
+        b = ord(ch)
+        if b < 0x20:
+            out.append(b)
+            continue
+        b &= 0x7F
+        out.append(b if 0x20 <= b < 0x7F else 0x7F)
+    if line_end:
+        out.append(ETX)
+    return bytes(out)
+
 #: Глифы, заменённые типографскими (в ПЗУ повреждены).
 CYR_SUBSTITUTED = frozenset('ЮЪюъ')
 
@@ -616,3 +659,9 @@ def render_text(text: bytes, russian: bool, direction: int, size: int,
         for dx, dy in text_offsets(mat, direction, size):
             pts.append((int(round(ux * n + dx)), int(round(uy * n + dy))))
     return pts
+
+__all__ = ['encode_input', 'glyph_matrix', 'dot_pattern', 'dots_matrix',
+           'display_char', 'apply_set', 'set_for_code', 'koi7_label',
+           'DEFAULT_SET', 'SETS', 'SET_LABELS', 'RUS7', 'USER_TABLE',
+           'FONT_7X8_CYR', 'GLYPHS_LAT', 'GLYPHS_RU', 'CYR_SUBSTITUTED',
+           'DIRECTION_VECTORS']

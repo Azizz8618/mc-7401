@@ -23,7 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .constants import VK
+from . import chars
+from .constants import ETX, VK
 
 MODE_LOCAL = 'local'
 MODE_HOST = 'host'
@@ -84,20 +85,21 @@ class Session:
         буфере и уходит только по SEND.
         """
         if self.mode == MODE_HOST:
-            return ch.encode('koi8-r', errors='replace')
+            return chars.encode_input(ch, set_name=self.charset_set)
         self.buffer.append(ch)
         return b''
 
     def type_line(self, text: str) -> bytes:
         """Обработать целую строку (до `ВК`)."""
         if self.mode == MODE_HOST:
-            return text.encode('koi8-r', errors='replace')
+            return chars.encode_input(text, set_name=self.charset_set)
         self.buffer.extend(text)
         return b''
 
     def pending(self) -> bytes:
         """Что накоплено в автономном режиме (без `ВК`)."""
-        return ''.join(self.buffer).encode('koi8-r', errors='replace')
+        return chars.encode_input(''.join(self.buffer),
+                                    set_name=self.charset_set)
 
     # ── SEND ────────────────────────────────────────────────────────────────
 
@@ -109,7 +111,8 @@ class Session:
         """
         data = self.pending()
         if line_end and data:
-            data += bytes((VK,))
+            # Конец строки на линии ДКС — ETX (см. chars.encode_input)
+            data += bytes((ETX,))
         self.buffer.clear()
         return data
 

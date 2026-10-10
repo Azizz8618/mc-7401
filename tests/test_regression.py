@@ -557,10 +557,12 @@ def test_pen_event_encoding_is_provisional():
 
 def test_host_mode_sends_every_character_immediately():
     """В режиме С ЭВМ каждый знак уходит в линию немедленно."""
+    from mc7401.chars import encode_input
     from mc7401.session import Session
     s = Session()
     assert s.mode == 'host'
-    assert s.type_line('СЕТ') == 'СЕТ'.encode('koi8-r')
+    # Русские буквы идут в строку 0x60…0x7E — по правилам 15ИЭ.
+    assert s.type_line('СЕТ') == encode_input('СЕТ') == b'set'
     assert s.pending() == b''
 
 
@@ -571,10 +573,11 @@ def test_local_mode_buffers_until_send():
     s.toggle_mode()
     assert s.mode == 'local'
     assert s.type_line('ЛИН 3 ') == b''          # в линию не уходит
-    assert s.pending() == 'ЛИН 3 '.encode('koi8-r')
+    assert s.pending() == b'lin 3 '               # КОИ-7, регистр свёрнут
     out = s.send()
-    assert out.endswith(bytes((VK,)))            # SEND добавляет ВК
-    assert 'ЛИН 3'.encode('koi8-r') in out
+    # Конец строки на линии ДКС — ETX, а не ВК (как в 15ИЭ).
+    assert out.endswith(bytes((0o003,)))
+    assert out.startswith(b'lin 3')
     assert s.pending() == b''                    # буфер очищен
 
 
