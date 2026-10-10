@@ -22,6 +22,7 @@ tui.py — интерактивный фронтенд эмулятора МС 7
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -72,8 +73,9 @@ from .reader import CommandStreamReader, EventKind
 from .screen import ScreenRenderer, Viewport
 from .constants import VK
 from .term import (ALT_SCREEN_OFF, ALT_SCREEN_ON, BOLD, CLEAR, ERASE_EOL,
-                   HIDE_CURSOR, HOME, RESET, SHOW_CURSOR, RawTerminal, at, bar,
-                   read_key, terminal_size)
+                   HIDE_CURSOR, HOME, KEY_CLEAR, KEY_CMDSET, KEY_ECHO,
+                   KEY_MODE, KEY_SEND, RESET, SESSION_KEYS, SHOW_CURSOR,
+                   RawTerminal, at, bar, read_key, terminal_size)
 
 log = logging.getLogger('mc7401.tui')
 
@@ -440,6 +442,14 @@ class TerminalApp:
         #: Самый наполненный кадр (программа чистит экран в конце).
         self._best_fb = None
         self._best_n = 0
+        #: История очищенных экранов — на неё возвращает `ЭКРАН↑`.
+        self._history: list = []
+        #: Нажат ли `Ctrl`: служебные клавиши эмулятора — только с ним.
+        self.ctrl = False
+        #: Для какого кадра окно просмотра уже подогнано.
+        self._fitted_for = None
+        #: Протокол графики запрошен, но терминал не ответил.
+        self._gfx_failed = False
         #: Приветствие линии ДКС — видно, какая линия досталась.
         #: Это единственный текст, который приходит не кодами знаков
         #: терминала, а готовой строкой (её выдаёт обвязка стенда),
@@ -613,7 +623,14 @@ class TerminalApp:
         fb = self._visible_fb() if has_fb else None
         if fb is not None and rest > 0:
             vp = self.renderer.vp
-            vp.clamp(fb, cols, rest)
+            # Вписываем кадр в окно, когда он сменился: первый кадр
+            # приходит уже после запуска, и без этого виден только
+            # угол (масштаб остаётся от пустого экрана).
+            if self._fitted_for is not fb:
+                vp.fit(fb, cols, rest)
+                self._fitted_for = fb
+            else:
+                vp.clamp(fb, cols, rest)
             if self.pen.enabled:
                 self.pen.stroke(fb)
             self.renderer.fb = fb
@@ -630,14 +647,19 @@ class TerminalApp:
     # ── графика в окне терминала ────────────────────────────────────────────
 
     def _enable_gfx(self) -> bool:
-        """Включить протокол графики, если терминал его понимает."""
+        """Заказать протокол графики терминала.
+
+        В режиме `auto` запрос отправляется **всегда**, без опроса
+        переменных окружения: поддержка протокола через окружение
+        определяется ненадёжно (нет ни `KITTY_WINDOW_ID`, ни
+        `TERM_PROGRAM` у ряда терминалов), а проверка по ответу терминала
+        точная.  Если ответа не будет, `_probe_gfx` вернёт `False` и
+        показ останется псевдографикой — с явным сообщением.
+        """
         if self.graphics in ('blocks', 'mono'):
             return False
-        from .backends.kitty import KittyGraphics, detect
-        if self.graphics == 'auto' and not detect():
-            return False
+        from .backends.kitty import KittyGraphics
         self.gfx = KittyGraphics(sys.stdout)
-        self.renderer.mode = 'color'
         return True
 
     def _probe_gfx(self, timeout: float = 0.5) -> bool:
@@ -650,23 +672,36 @@ class TerminalApp:
             return False
         sys.stdout.write(self.gfx.request_cell().decode('ascii'))
         sys.stdout.flush()
+        # Ответ читается напрямую: APC начинается с `ESC`, и `read_key`
+        # разобрал бы его как нажатия клавиш.
+        import select
+        buf = b''
         deadline = time.monotonic() + timeout
-        buf = ''
         while time.monotonic() < deadline:
-            key = read_key(timeout=max(0.02, deadline - time.monotonic()))
-            if key is None:
-                continue
-            if key == 'EOF':
+            left = max(0.0, deadline - time.monotonic())
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], left)
+            except Exception:
                 break
-            buf += key
-            if buf.endswith('\x1b\\'):
+            if not ready:
                 break
-        self.gfx.apply_response(buf)
+            chunk = os.read(sys.stdin.fileno(), 256)
+            if not chunk:
+                break
+            buf += chunk
+            if b'\x1b\\' in buf:
+                break
+        self.gfx.apply_response(buf.decode('latin-1'))
         if not self.gfx.active:
             self.gfx = None
+            # Молча переходить на псевдографику нельзя: оператор будет
+            # думать, что так выглядит настоящий терминал.
+            self.message = ('протокол графики не поддержан — показ '
+                            'псевдографикой')
             if self.graphics == 'kitty':
-                self.message = ('протокол графики не поддержан — '
-                                'показ псевдографикой')
+                self._gfx_failed = True
+        else:
+            self.renderer.mode = 'color'
         return bool(self.gfx and self.gfx.active)
 
     def _paint_gfx(self, row: int, cols: int, rows: int) -> int:
@@ -869,11 +904,12 @@ class TerminalApp:
             'ПОСЛ: ' + (self.last_key or ''),
             'ВВОД=' + (self.input_line or ''))
         keys1 = self._row('ВК=Bksp', 'ТАБ=Tab', 'ЗВН=Ctrl-G', 'ПРПС=Enter')
-        keys2 = self._row('ESC=Esc', 'КУРСОР=Стрелки', 'СДВИГ=PageUp/Dn',
-                          'МАСШТАБ=+/−')
-        keys3 = self._row('ВПИСАТЬ=0', 'ЦЕНТР=c', 'ЦВЕТ=m', 'СЕТКА=g')
-        keys4 = self._row('РЕЖИМ=L', 'ПЕРЕДАЧА=S', 'ЭХО=e', 'ОЧИСТКА=x')
-        keys5 = self._row('НАБОР=z', 'ПЕРО=p', 'ВЫХОД=q', '')
+        keys2 = self._row('ESC=Esc', 'КУРСОР=Стрелки', 'ЭКРАН↑=PgUp',
+                          'ЭКРАН↓=PgDn')
+        keys3 = self._row('ОЧИСТКА=F5', 'ЭХО=F6', 'НАБОР=F8', 'СЕТЬ=F9')
+        keys4 = self._row('ПЕРЕДАЧА=F10', 'ВЫХОД=Ctrl-q', '', '')
+        keys5 = self._row('МАСШТАБ=Ctrl-+/-', 'ЦЕНТР=Ctrl-c',
+                          'ЦВЕТ=Ctrl-m', 'СЕТКА=Ctrl-g')
         width = min(cols, self.COLS_N * self.COL + 3 * (self.COLS_N - 1))
         return [state1, state2, state3, '-' * width,
                 keys1, keys2, keys3, keys4, keys5]
@@ -913,14 +949,41 @@ class TerminalApp:
     # ── ввод ────────────────────────────────────────────────────────────────
 
     def handle_key(self, key: str) -> None:
+        """Нажатие клавиши.
+
+        Раскладка как на 15ИЭ: служебные действия терминала висят на
+        **функциональных** клавишах (F5…F10), а буквы свободны — иначе
+        текст не набрать.  Поэтому `x`, `e`, `z`, `L`, `S` уходят на
+        ЭВМ как обычные знаки.
+        """
         vp = self.renderer.vp
         cols, rows = self.layout()
         step = max(8, vp.scale * 8)
 
-        if key in ('^C', 'q', 'Q', 'EOF'):
+        if key in ('^C', 'EOF'):
             self.running = False
             return
-        if key == 'KEY_UP':
+
+        # ── служебные клавиши терминала (клавиатура 15ВВВ-97-006) ──
+        if key == KEY_MODE:                      # F9 — СЕТЬ
+            self.session.toggle_mode()
+            self.message = 'сеть: ' + self.session.panel()
+        elif key == KEY_SEND:                    # F10 — ПЕРЕДАЧА
+            self._send()
+        elif key == KEY_CLEAR:                   # F5 — ОЧИСТКА
+            self._clear_screen()
+        elif key == KEY_ECHO:                    # F6 — ЭХО
+            self.session.toggle_echo()
+            self.message = ('эхо включено' if self.session.echo
+                            else 'эхо выключено — пароль не печатается')
+        elif key == KEY_CMDSET:                  # F8 — НАБОР
+            want = 'koi8r' if self.session.charset_set == 'n2' else 'n2'
+            self.session.set_charset(want)
+            self.emu.state.font = want
+            self.message = 'набор: ' + self.session.panel()
+
+        # ── экран и ввод ──
+        elif key == 'KEY_UP':
             vp.y = min(self.emu.fb.height, vp.y + step)
         elif key == 'KEY_DOWN':
             vp.y = max(0, vp.y - step)
@@ -928,18 +991,72 @@ class TerminalApp:
             vp.x = max(0, vp.x - step)
         elif key == 'KEY_RIGHT':
             vp.x = min(self.emu.fb.width, vp.x + step)
-        elif key == 'KEY_PAGEUP':
-            vp.scale = min(16, vp.scale + 1)
-        elif key == 'KEY_PAGEDOWN':
-            vp.scale = max(1, vp.scale - 1)
-        elif key == '+':
+        elif key == 'KEY_PAGEUP':                # ЭКРАН↑
+            self._scroll_screen(-1)
+        elif key == 'KEY_PAGEDOWN':              # ЭКРАН↓
+            self._scroll_screen(1)
+        elif key == 'KEY_BACKSPACE' or key == '\x7f':
+            self.input_line = self.input_line[:-1]
+        elif key in ('\r', '\n', 'KEY_ENTER'):       # ПРПС
+            self._submit()
+        elif key == 'ESC':
+            self.input_line = ''
+            self.message = 'ввод сброшен'
+
+        # ── служебные клавиши эмулятора: только с `Ctrl` ──
+        # Проверка идёт **до** ввода текста, иначе буква ушла бы в
+        # строку: на настоящем терминале этих клавиш нет, и держать
+        # их на буквах без `Ctrl` нельзя.
+        elif key in self.EMULATOR_KEYS and self.ctrl:
+            self._emulator_key(key, cols, rows)
+
+        # ── мышь: световое перо ──
+        elif key and key.startswith('\x1b[<') and self.pen.enabled:
+            self.pen.feed_mouse(key, cols=cols, rows=rows,
+                                scale=vp.scale, vx=vp.x, vy=vp.y)
+            for ev in self.pen.take_events():
+                self.driver.send_keys(ev.encode().decode('ascii'))
+
+        # ── ввод текста ──
+        elif key and len(key) == 1 and key.isprintable():
+            # Свободный ввод, как на 15ИЭ: в режиме С ЭВМ знак уходит в
+            # линию немедленно, в АВТОНОМНО копится в буфер до ПЕРЕДАЧА.
+            self.input_line += key
+            out = self.session.type_key(key)
+            if out:
+                self._send_raw(out)
+            self.splash = False
+        elif key in self.EMULATOR_KEYS and self.ctrl:
+            # Служебные клавиши самого эмулятора — только с `Ctrl`:
+            # на настоящем терминале их нет, и на буквах без `Ctrl`
+            # они перехватывали бы набор текста.
+            self._emulator_key(key, cols, rows)
+        else:
+            return
+        self.last_key = SESSION_KEYS.get(key, key)[:12]
+
+    #: Служебные клавиши эмулятора (окно просмотра, перо, сетка).
+    #: Это не клавиши терминала: на настоящем терминале их нет.
+    EMULATOR_KEYS = '+-0cmgprq'
+
+    def _emulator_key(self, key: str, cols: int, rows: int) -> None:
+        """Действие эмулятора над окном просмотра (с `Ctrl`)."""
+        vp = self.renderer.vp
+        if key == 'q':
+            self.running = False
+            return
+        if key == '+':
             vp.scale = max(1, vp.scale - 1)
         elif key == '-':
             vp.scale = min(16, vp.scale + 1)
         elif key == '0':
-            vp.fit(self.emu.fb, cols, rows)
+            fb = self._visible_fb()
+            if fb is not None:
+                vp.fit(fb, cols, rows)
         elif key == 'c':
-            vp.center(self.emu.fb, cols, rows)
+            fb = self._visible_fb()
+            if fb is not None:
+                vp.center(fb, cols, rows)
         elif key == 'm':
             self.renderer.mode = ('mono' if self.renderer.mode == 'color'
                                   else 'color')
@@ -950,57 +1067,37 @@ class TerminalApp:
             self.pen._last = None
             self.message = ('перо включено' if self.pen.enabled
                             else 'перо выключено')
-            sys.stdout.write((LightPen.disable_sequence() if not self.pen.enabled
-                              else LightPen.enable_sequence()))
-        elif key and key.startswith('\x1b[<') and self.pen.enabled:
-            self.pen.feed_mouse(key, cols=cols, rows=rows,
-                                scale=vp.scale, vx=vp.x, vy=vp.y)
-            for ev in self.pen.take_events():
-                self.driver.send_keys(ev.encode().decode('ascii'))
+            sys.stdout.write(LightPen.disable_sequence() if not self.pen.enabled
+                              else LightPen.enable_sequence())
         elif key == 'r':
             self.message = 'перерисовано'
-        elif key == 'x':
-            # ОЧИСТКА: в режиме С ЭВМ команда уходит на ЭВМ,
-            # иначе чистим локально.
-            out = self.session.clear_command()
-            if out:
-                self.driver.send_keys(out.decode('latin-1'))
-            else:
-                self.emu.execute(self.emu.parser.parse(b'S\x55'))
-            self.message = 'экран очищен'
-        elif key == 'L':          # режим терминала
-            self.session.toggle_mode()
-            self.message = 'режим: ' + self.session.panel()
-        elif key in ('S', 'KEY_F2'):   # SEND
-            self._send()
-        elif key == 'e':          # ЭХО
-            self.session.toggle_echo()
-            self.message = ('эхо включено' if self.session.echo
-                            else 'эхо выключено — пароль не печатается')
-        elif key == 'z':          # набор: Н2 (КОИ-7) / КОИ-8Р
-            want = 'koi8r' if self.session.charset_set == 'n2' else 'n2'
-            self.session.set_charset(want)
-            self.emu.state.font = want
-            self.message = 'набор: ' + self.session.panel()
-        elif key == 'KEY_BACKSPACE' or key == '\x7f':
-            self.input_line = self.input_line[:-1]
-        elif key == '\r' or key == '\n' or key == 'KEY_ENTER':
-            self._submit()
-        elif key == 'ESC':
-            self.input_line = ''
-            self.message = 'ввод сброшен'
-        elif key and len(key) == 1 and key.isprintable():
-            # Свободный ввод, как на 15ИЭ: в режиме С ЭВМ знак уходит в
-            # линию немедленно, в АВТОНОМНО копится в буфер до ПЕРЕДАЧА.
-            self.input_line += key
-            out = self.session.type_key(key)
-            if out:
-                self._send_raw(out)
-            self.splash = False
+
+    def _scroll_screen(self, direction: int) -> None:
+        """`ЭКРАН↑` / `ЭКРАН↓` — листание окна просмотра, как на 15ИЭ."""
+        vp = self.renderer.vp
+        step = max(8, vp.scale * 8) * 4
+        if direction < 0:
+            vp.y = min(self.emu.fb.height, vp.y + step)
         else:
-            return
-        self.last_key = key if len(key) <= 12 else key[:12]
-        vp.clamp(self.emu.fb, cols, rows)
+            vp.y = max(0, vp.y - step)
+
+    def _clear_screen(self) -> None:
+        """`ОЧИСТКА` (F5): экран — в историю, кадр — в начало.
+
+        Прежний кадр сохраняется: к нему возвращает `ЭКРАН↑`.
+        """
+        shown = self._visible_fb()
+        if shown is not None:
+            self._history.append(shown)
+        out = self.session.clear_command()
+        if out:
+            self._send_raw(out)
+        else:
+            self.emu.execute(self.emu.parser.parse(b'S\x55'))
+        self._best_fb = None
+        self._best_n = 0
+        self.message = 'экран очищен'
+
 
     def _send(self) -> None:
         """SEND: передать накопленное на ЭВМ, буфер очистить."""
@@ -1081,6 +1178,11 @@ class TerminalApp:
                         self.draw()
                     key = read_key(timeout=0.08)
                     if key:
+                        # `Ctrl` держится между нажатиями, как на
+                        # настоящей клавиатуре: нажал, отпустил.
+                        if key == '^H':
+                            self.ctrl = not self.ctrl
+                            continue
                         self.handle_key(key)
         except KeyboardInterrupt:
             pass

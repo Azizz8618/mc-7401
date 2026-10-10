@@ -653,7 +653,12 @@ def _transform(direction: int, size: int):
     # «вверх от строки».  Базовый случай d=0: вперёд = u, вверх = -v.
     def xform(u: int, v: int) -> tuple[float, float]:
         # Точка в «локальной» системе: X вперёд, Y вверх от базовой линии.
-        X = u - size * GLYPH_W / 2.0
+        # Начало строки — левый край знакоместа, поэтому смещение по X
+        # отсчитывается от нуля.  Раньше здесь стояло `u - size * W / 2`,
+        # то есть вычиталась половина знакоместа: при нечётной ширине 7
+        # получались дробные смещения, округление схлопывало столбцы
+        # попарно, и знак выходил зеркальным (см. JOURNAL.md).
+        X = u * size
         Y = size * (GLYPH_H - 1 - v)
         return X * ca - Y * sa, X * sa + Y * ca
     return xform
@@ -678,7 +683,10 @@ def text_offsets(matrix: Sequence[Sequence[int]], direction: int, size: int):
         for u, bit in enumerate(row):
             if not bit:
                 continue
-            dx, dy = xform(u * size, v * size)
+            # Масштабирование выполняет `_transform`; если передать ему
+            # уже умноженные на `size` координаты, при размере знака
+            # больше единицы смещение возведётся в квадрат.
+            dx, dy = xform(u, v)
             pts.append((int(round(dx)), int(round(dy))))
     return pts
 

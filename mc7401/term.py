@@ -109,6 +109,16 @@ def read_key(timeout: Optional[float] = None) -> Optional[str]:
     return _read_key_posix(timeout)
 
 
+#: Служебные клавиши сеанса: имена → то же, что в `keyboard.py` 15ИЭ.
+SESSION_KEYS = {
+    'KEY_CLEAR': 'ОЧИСТКА',
+    'KEY_ECHO': 'ЭХО',
+    'KEY_CMDSET': 'НАБОР',
+    'KEY_MODE': 'СЕТЬ',
+    'KEY_SEND': 'ПЕРЕДАЧА',
+}
+
+
 def _read_key_posix(timeout: Optional[float]) -> Optional[str]:   # pragma: no cover
     import select
     if timeout is not None:
@@ -120,6 +130,8 @@ def _read_key_posix(timeout: Optional[float]) -> Optional[str]:   # pragma: no c
         return 'EOF'
     if ch != '\x1b':
         if ord(ch) < 32:
+            if ch == '\x7f':
+                return 'KEY_BACKSPACE'
             return '^' + chr(ord(ch) + 64)
         return ch
     # Последовательность ESC: читаем следующие байты, если они уже есть.
@@ -141,19 +153,55 @@ def _read_key_posix(timeout: Optional[float]) -> Optional[str]:   # pragma: no c
     return _arrow_name(seq)
 
 
+#: Служебные клавиши 15ВВВ-97-006 — те же, что на 15ИЭ.
+#: Буквы под команды не занимаются: на реальной клавиатуре это
+#: отдельные клавиши, иначе нельзя набрать текст (см. JOURNAL.md).
+KEY_CLEAR = 'KEY_CLEAR'       # F5  — ОЧИСТКА
+KEY_ECHO = 'KEY_ECHO'         # F6  — ЭХО
+KEY_CMDSET = 'KEY_CMDSET'     # F8  — НАБОР
+KEY_MODE = 'KEY_MODE'         # F9  — СЕТЬ: АВТОНОМНО ↔ С ЭВМ
+KEY_SEND = 'KEY_SEND'         # F10 — ПЕРЕДАЧА
+
+#: Номера функциональных клавиш ПК → служебные клавиши 15ВВВ-97-006.
+#: Ключ — число из последовательности `ESC [ <число> ~`.
+SEQ_FUNCTIONAL = {
+    '15': KEY_CLEAR,          # F5 — ОЧИСТКА
+    '17': KEY_ECHO,           # F6 — ЭХО
+    '18': 'KEY_BLINK',        # F7 — УПР.СИМВ (не используется)
+    '19': KEY_CMDSET,         # F8 — НАБОР
+    '20': KEY_MODE,           # F9 — СЕТЬ
+    '21': KEY_SEND,           # F10 — ПЕРЕДАЧА
+}
+
+#: Остальные числовые последовательности `ESC [ <число> ~`.
+SEQ_SPECIAL = {
+    '1': 'KEY_HOME', '2': 'KEY_INSERT', '3': 'KEY_DELETE',
+    '4': 'KEY_END', '5': 'KEY_PAGEUP', '6': 'KEY_PAGEDOWN',
+    '7': 'KEY_HOME', '8': 'KEY_END',
+}
+
+
 def _arrow_name(seq: str) -> str:
     table = {'A': 'KEY_UP', 'B': 'KEY_DOWN', 'C': 'KEY_RIGHT',
-             'D': 'KEY_LEFT', 'H': 'KEY_HOME', 'F': 'KEY_END'}
+             'D': 'KEY_LEFT', 'H': 'KEY_HOME', 'F': 'KEY_END',
+             'Z': 'KEY_BTAB'}
     if seq in table:
         return table[seq]
-    if seq.startswith('5') and seq.endswith('~'):
-        return 'KEY_PAGEUP'
-    if seq.startswith('6') and seq.endswith('~'):
-        return 'KEY_PAGEDOWN'
-    if seq.startswith('1') and seq.endswith('~'):
-        return 'KEY_HOME'
-    if seq.startswith('4') and seq.endswith('~'):
-        return 'KEY_END'
+    if seq.endswith('~') and seq[:-1].isdigit():
+        num = seq[:-1]
+        if num in SEQ_FUNCTIONAL:
+            return SEQ_FUNCTIONAL[num]
+        return SEQ_SPECIAL.get(num, 'ESC')
+    # Модификаторы: `1;5C` — Ctrl+→.
+    if ';' in seq and len(seq) > 2:
+        kind = seq[-1]
+        base = {'A': 'KEY_UP', 'B': 'KEY_DOWN', 'C': 'KEY_RIGHT',
+                'D': 'KEY_LEFT'}.get(kind)
+        if base:
+            return 'KEY_CTRL' + base[3:]
+    if seq in ('OP', 'OQ', 'OR', 'OS'):
+        return {'OP': 'KEY_F1', 'OQ': 'KEY_F2', 'OR': 'KEY_F3',
+                'OS': 'KEY_F4'}[seq]
     return 'ESC'
 
 

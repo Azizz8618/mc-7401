@@ -47,11 +47,20 @@ class Viewport:
         self.y = max(0, min(self.y, max(0, fb.height - span_y)))
 
     def fit(self, fb: Framebuffer, cols: int, rows: int) -> None:
-        """Подогнать масштаб и смещение так, чтобы кадр занял окно."""
-        # По вертикали один знакомест = 2 пикселя.
-        by_x = max(1, fb.width // max(1, cols))
-        by_y = max(1, fb.height // max(1, rows * 2))
-        self.scale = max(1, min(by_x, by_y))
+        """Подогнать масштаб и смещение так, чтобы кадр занял окно.
+
+        Один знакомест закрывает `scale` пикселей по горизонтали и
+        `2 * scale` по вертикали.  Кадр вписывается целиком, когда
+
+            width  <= cols * scale  и  height <= rows * 2 * scale,
+
+        то есть минимальный подходящий масштаб — это **наибольшее** из
+        двух требований.  Раньше здесь стояло наименьшее, и кадр не
+        влезал: в окне оставался его угол, а остальное — пустота.
+        """
+        by_x = -(-fb.width // max(1, cols))          # ceil
+        by_y = -(-fb.height // max(1, rows * 2))
+        self.scale = max(1, max(by_x, by_y))
         self.center(fb, cols, rows)
 
     def center(self, fb: Framebuffer, cols: int, rows: int) -> None:
