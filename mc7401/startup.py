@@ -29,7 +29,7 @@ WELCOME = ('Электроника МС 7401 — растровый графич
 DEFAULT_PICTURE = 'ПТИ'
 
 
-def picture_path(name: str = DEFAULT_PICTURE):
+def picture_path(name: str = DEFAULT_PICTURE, prefer_stream: bool = False):
     """Найти рисунок заставки.
 
     `name` — имя файла без расширения: ищется в `golden/render/` рядом с
@@ -44,13 +44,16 @@ def picture_path(name: str = DEFAULT_PICTURE):
             stem = stem[:-len(suf)]
     roots = [Path(__file__).resolve().parent.parent, Path.cwd(),
              Path.home() / '.local' / 'share' / 'mc7401']
-    for root in roots:
-        for cand in (root / 'golden' / 'render' / (stem + '.png'),
-                     root / 'render' / (stem + '.png'),
-                     root / 'golden' / 'render' / (stem + '.svg'),
-                     root / (stem + '.png')):
-            if cand.exists():
-                return cand
+    names = (('.bin', '.png', '.svg') if prefer_stream
+             else ('.png', '.svg'))
+    for ext in names:
+        for root in roots:
+            for cand in (root / 'golden' / 'render' / (stem + ext),
+                         root / 'golden' / 'streams' / (stem + ext),
+                         root / 'render' / (stem + ext),
+                         root / (stem + ext)):
+                if cand.exists():
+                    return cand
     return None
 
 

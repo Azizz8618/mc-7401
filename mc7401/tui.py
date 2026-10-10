@@ -85,56 +85,128 @@ DEMO_KEYS = 'ЛИН 3 ВЫХ '
 
 
 def _render_picture(path, cols: int, rows: int) -> str:
-    """Показать готовый рисунок как ASCII-арт.
+    """Показать эталонный рисунок как ASCII-арт.
 
-    Рисунок берётся из `golden/render`; PNG читается собственным
-    декодером, SVG разбирается по координатам прямоугольников.
-    Внешние зависимости не нужны.
+    Берётся поток команд (`golden/streams/*.bin`), он же (`*.png`) —
+    если потока рядом нет, PNG разбирается построчно.
     """
     from pathlib import Path
     p = Path(path)
+    if p.suffix.lower() in ('.bin', ''):
+        return _render_stream(p, cols, rows)
     if p.suffix.lower() == '.svg':
         return _render_svg(p, cols, rows)
     return _render_png(p, cols, rows)
 
 
+def _render_stream(bin_path, cols: int, rows: int) -> str:
+    """Отрисовать поток команд и вывести кадр символами.
+
+    Рисунок берётся из самого эталонного потока, а не из картинки:
+    свой же PNG разбирать не нужно и формат не важен.
+    """
+    from .emulator import TerminalEmulator
+    from .framebuffer import Framebuffer
+    from .reader import CommandStreamReader, EventKind
+    emu = TerminalEmulator()
+    reader = CommandStreamReader()
+    reader.feed(Path(bin_path).read_bytes())
+    reader.close()
+    best, best_n = emu.fb.copy(), 0
+    for ev in reader.pop():
+        # Программа очищает экран в конце: берём самую наполненную
+        # картину — ту, что видел оператор.
+        if ev.kind is EventKind.VUK_BLOCK:
+            n = emu.fb.count_set()
+            if n > best_n:
+                best, best_n = emu.fb.copy(), n
+        emu.handle_event(ev)
+    fb = best if best_n else emu.fb
+    sx = max(1, fb.width // max(1, cols))
+    sy = max(1, fb.height // max(1, rows * 2))
+    lines = []
+    for r in range(rows):
+        y = r * sy * 2
+        line = []
+        for c in range(cols):
+            x = c * sx
+            hit = any(fb.get(xx, yy)
+                      for yy in (fb.height - 1 - y, fb.height - 2 - y)
+                      for xx in (x, x + sx - 1))
+            line.append('#' if hit else ' ')
+        lines.append(''.join(line))
+    return '\n'.join(lines)
+
+
 def _render_png(path, cols: int, rows: int) -> str:
+    """ASCII-арт из PNG: строки разворачиваются фильтром PNG не нужно —
+    берём кадр, если PNG получен из нашего же эталонного потока."""
     import zlib
     data = Path(path).read_bytes()
-    pos, idat, w = 8, b'', 0
+    pos, idat, w, h, depth, ctype = 8, b'', 0, 0, 8, 0
     while pos < len(data):
         ln = int.from_bytes(data[pos:pos + 4], 'big')
         typ = data[pos + 4:pos + 8]
         body = data[pos + 8:pos + 8 + ln]
         if typ == b'IHDR':
             w = int.from_bytes(body[0:4], 'big')
+            h = int.from_bytes(body[4:8], 'big')
+            depth, ctype = body[8], body[9]
         elif typ == b'IDAT':
             idat += body
         pos += 12 + ln
-    if not w:
+    if not w or depth != 8:
         return ''
-    # Берём только яркость первого канала, построчно не разворачивая
-    # фильтры: картинка чёрно-зелёная на чёрном, этого достаточно.
+    bpp = {0: 1, 2: 3, 4: 2, 6: 4}.get(ctype, 1)
     try:
         raw = zlib.decompress(idat)
     except zlib.error:
         return ''
-    step = max(1, w // cols)
-    lines = []
-    for r in range(rows):
-        y = r * step
-        base = y * (w + 1)
-        if base >= len(raw):
+    stride = w * bpp
+    prev = bytearray(stride)
+    rows_out = []
+    for y in range(h):
+        off = y * (stride + 1)
+        if off >= len(raw):
             break
-        line = []
+        ft = raw[off]
+        line = bytearray(raw[off + 1:off + 1 + stride])
+        # разворот фильтров PNG (RFC 2083)
+        for i in range(stride):
+            a = line[i - bpp] if i >= bpp else 0
+            b = prev[i]
+            c = prev[i - bpp] if i >= bpp else 0
+            x = line[i]
+            if ft == 1:
+                x += a
+            elif ft == 2:
+                x += b
+            elif ft == 3:
+                x += (a + b) // 2
+            elif ft == 4:
+                pp = a + b - c
+                pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
+                x += a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[i] = x & 0xFF
+        prev = line
+        rows_out.append(line)
+    if not rows_out:
+        return ''
+    sy = max(1, len(rows_out) // max(1, rows))
+    sx = max(1, w // max(1, cols))
+    out = []
+    for r in range(rows):
+        y = r * sy
+        if y >= len(rows_out):
+            break
+        line = rows_out[y]
+        cells = []
         for c in range(cols):
-            x = c * step
-            off = base + 1 + x
-            if off >= len(raw):
-                break
-            line.append('#' if raw[off] > 40 else ' ')
-        lines.append(''.join(line))
-    return '\n'.join(lines)
+            x = c * sx * bpp
+            lum = line[x] if x < stride else 0
+            cells.append('#' if lum > 40 else ' ')
+        out.append(''.join(cells))
+    return '\n'.join(out)
 
 
 def _render_svg(path, cols: int, rows: int) -> str:
@@ -525,14 +597,18 @@ class TerminalApp:
         Рисунок задаётся конфигурацией (`[display] splash`), по умолчанию
         птица.  Закрывается при первом вводе или первом байте от ЭВМ.
         """
-        head = startup.build(
+        rows = self.layout()[1]
+        pic = startup.picture_path(self.config.splash, prefer_stream=True)
+        art = _render_picture(pic, cols, rows - 8) if pic else ''
+        art_lines = art.split('\n') if art else []
+        text = startup.build(
             max(20, cols - 2), state=self._link_state(),
-            summary=self.config.summary(), hint=startup.hint_text())
-        pic = startup.picture_path(self.config.splash)
-        if not pic:
-            return head
-        art = _render_picture(pic, cols, max(3, self.layout()[1]))
-        return f'{art}\n{head}' if art else head
+            summary=self.config.summary(), hint=startup.hint_text()).split('\n')
+        # Заставка должна строго уместиться в отведённые строки, иначе
+        # текст наезжает на подвал.
+        room = rows - len(art_lines)
+        lines = art_lines + text[:max(0, room)]
+        return '\n'.join(lines[:rows])
 
     def _link_state(self) -> str:
         """Строка состояния линии для начального экрана и подвала."""
