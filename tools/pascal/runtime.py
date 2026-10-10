@@ -203,6 +203,10 @@ class PasFile:
         self.name = name
         self.data: list[str] = []
         self.pos = 0
+        #: Живая лента ввода для диалогового режима: если она задана,
+        #: `get()` ждёт символ, как настоящий терминал ждёт клавиши,
+        #: вместо того чтобы вернуть признак конца потока.
+        self.feed = None
 
     @property
     def cur(self) -> Char:
@@ -214,14 +218,18 @@ class PasFile:
     def get(self) -> Char:
         """`GЕТ(f)` — перейти к следующему символу, вернуть прежний.
 
-        За концом входного потока настоящий терминал блокируется на
-        ожидании клавиатуры оператора.  В эмуляции блокировку моделировать
-        нечем, поэтому выдаётся :class:`_InputExhausted`: программа
-        прерывается на том кадре, который был выведен последним.
+        За концом подготовленного входа настоящий терминал блокируется
+        на ожидании клавиатуры оператора.  В диалоговом режиме это
+        моделируется живой лентой `feed`: программа ждёт следующей
+        строки.  Если ленты нет, выдаётся :class:`_InputExhausted` —
+        офлайн-прогон прерывается на последнем выведенном кадре.
         """
         old = self.cur
         if self.pos >= len(self.data):
-            raise _InputExhausted()
+            if self.feed is not None:
+                self.data.extend(self.feed())
+            if self.pos >= len(self.data):
+                raise _InputExhausted()
         self.pos += 1
         return old
 
@@ -633,6 +641,18 @@ def reset() -> None:
     _terminal.byte_count = 0
     _input.data.clear()
     _input.pos = 0
+
+
+def set_live_input(supplier) -> None:
+    """Включить диалоговый режим: `supplier()` отдаёт следующую строку.
+
+    Блокирующий вызов из потока программы; строки приходят с клавиатуры.
+    """
+    _input.feed = supplier
+
+
+def clear_live_input() -> None:
+    _input.feed = None
 
 
 def make_program(source: str, input_text: str = '',

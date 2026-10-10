@@ -1,0 +1,173 @@
+"""
+session.py — режимы работы терминала МС 7401 (по образцу 15ИЭ-00-013).
+
+В терминале «Электроника-15ИЭ» (`ie15/ie15emu/session.py`) три вещи,
+которые воспроизводятся здесь дословно:
+
+* **АВТОНОМНО (LOCAL)** — набор идёт в локальный буфер и сразу на экран,
+  обмена с линией нет;
+* **С ЭВМ (HOST)** — каждый знак немедленно уходит в линию, эхо
+  приходит от ЭВМ;
+* **SEND** — «передать накопленное»: байты буфера уходят в линию, буфер
+  очищается (на клавиатуре 15ВВВ-97-006 это отдельная клавиша SEND).
+
+Из функций терминала воспроизведены также **ЭХО** (вывод набираемого на
+экран — снимается, чтобы не печатать пароли) и **ОЧИСТКА** (команда `S`).
+
+Сеанс не знает о транспорте: он возвращает байты для линии, а отправку
+делает вызывающая сторона.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .constants import VK
+
+MODE_LOCAL = 'local'
+MODE_HOST = 'host'
+
+#: Подписи режимов на панели.
+MODE_LABELS = {MODE_LOCAL: 'АВТОНОМНО', MODE_HOST: 'С ЭВМ'}
+
+
+@dataclass
+class Session:
+    """Состояние сеанса терминала: режим, буфер, эхо, раскладка."""
+
+    mode: str = MODE_HOST
+    #: Накопленный автономный набор; в режиме HOST не растёт.
+    buffer: list[str] = field(default_factory=list)
+    #: Эхо набираемого текста на экране (клавиша «ЭХО»).
+    echo: bool = True
+    #: Русская раскладка (ФОН/ПОЗ) живёт только в наборе Н1 — в Н0 и Н2
+    #: её нет, иначе позиционная таблица съедала бы знаки международной
+    #: строки.  Это тоже из 15ИЭ.
+    layout: Optional[str] = None
+    #: Текущий набор знаков: 'n2' (Н2, КОИ-7) | 'koi8r' (КОИ-8Р).
+    charset_set: str = 'n2'
+
+    def __post_init__(self) -> None:
+        self._check_layout()
+
+    # ── режим ───────────────────────────────────────────────────────────────
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in (MODE_LOCAL, MODE_HOST):
+            raise ValueError(f'неизвестный режим: {mode!r}')
+        # При переходе в HOST накопленное отправляется — иначе набор
+        # «потерялся бы».
+        self.mode = mode
+        self._check_layout()
+
+    def toggle_mode(self) -> str:
+        """Переключить режим; возвращает новый."""
+        if self.mode == MODE_LOCAL:
+            # Перед уходом в С ЭВМ передаём накопленное.
+            pending = self.pending()
+            self.buffer.clear()
+            self.mode = MODE_HOST
+            self._check_layout()
+            self._last_pending = pending
+            return self.mode
+        self.mode = MODE_LOCAL
+        self._check_layout()
+        return self.mode
+
+    # ── набор ───────────────────────────────────────────────────────────────
+
+    def type_key(self, ch: str) -> bytes:
+        """Обработать нажатие; возвращает байты, которые надо послать.
+
+        В режиме HOST знак уходит сразу.  В режиме LOCAL — копится в
+        буфере и уходит только по SEND.
+        """
+        if self.mode == MODE_HOST:
+            return ch.encode('koi8-r', errors='replace')
+        self.buffer.append(ch)
+        return b''
+
+    def type_line(self, text: str) -> bytes:
+        """Обработать целую строку (до `ВК`)."""
+        if self.mode == MODE_HOST:
+            return text.encode('koi8-r', errors='replace')
+        self.buffer.extend(text)
+        return b''
+
+    def pending(self) -> bytes:
+        """Что накоплено в автономном режиме (без `ВК`)."""
+        return ''.join(self.buffer).encode('koi8-r', errors='replace')
+
+    # ── SEND ────────────────────────────────────────────────────────────────
+
+    def send(self, *, line_end: bool = True) -> bytes:
+        """SEND: передать накопленное в линию, буфер очистить.
+
+        `line_end` добавляет `ВК` — программа на стороне ЭВМ ждёт его
+        как конец команды.
+        """
+        data = self.pending()
+        if line_end and data:
+            data += bytes((VK,))
+        self.buffer.clear()
+        return data
+
+    def reset_buffer(self) -> None:
+        self.buffer.clear()
+
+    # ── экран ───────────────────────────────────────────────────────────────
+
+    def clear_command(self) -> bytes:
+        """ОЧИСТКА: команда `S` очистки экрана.
+
+        В режиме LOCAL — только локальная очистка, в HOST — команда
+        уходит на ЭВМ, чтобы экран очистился у источника.
+        """
+        if self.mode == MODE_LOCAL:
+            return b''
+        return b'S' + bytes((VK,))
+
+    def set_echo(self, value: bool) -> bool:
+        self.echo = bool(value)
+        return self.echo
+
+    def toggle_echo(self) -> bool:
+        return self.set_echo(not self.echo)
+
+    # ── набор знаков и раскладка ────────────────────────────────────────────
+
+    def set_charset(self, name: str) -> None:
+        """Переключить набор знаков: `S0` → КОИ-8Р, `S1` → Н2."""
+        from .chars import SETS
+        if name not in SETS:
+            raise ValueError(f'неизвестный набор: {name!r}')
+        self.charset_set = name
+        self._check_layout()
+
+    def _check_layout(self) -> None:
+        """Русская раскладка есть только в русском наборе КОИ-8Р."""
+        if self.charset_set != 'koi8r':
+            self.layout = None
+        elif self.layout is None:
+            self.layout = self.default_layout()
+
+    @staticmethod
+    def default_layout() -> str:
+        return 'phonetic'          # ФОН — по умолчанию, как в 15ИЭ
+
+    # ── панель ──────────────────────────────────────────────────────────────
+
+    def panel(self) -> str:
+        """Сведения для строки состояния."""
+        from .chars import SET_LABELS
+        bits = [MODE_LABELS[self.mode],
+                SET_LABELS.get(self.charset_set, self.charset_set),
+                'эхо' if self.echo else 'эхо выкл']
+        if self.layout:
+            bits.append('ФОН' if self.layout == 'phonetic' else 'ПОЗ')
+        if self.buffer:
+            bits.append(f'ввод {len(self.buffer)}')
+        return ' '.join(bits)
+
+__all__ = ['Session', 'MODE_LOCAL', 'MODE_HOST', 'MODE_LABELS']

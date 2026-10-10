@@ -23,6 +23,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import chars
+#: Набор русских знаков МС 7401 (из двух: Н2/КОИ-7 и КОИ-8Р).
+RUSSIAN_SET = 'koi8r'
+
 from .constants import (
     END,
     LINE_PATTERNS,
@@ -165,7 +168,7 @@ class TerminalEmulator:
                 self.on_frame(self.fb)
             return
         if kind is EventKind.RU_FONT:
-            self.state.font = 'n1'
+            self.state.font = RUSSIAN_SET
             return
         if kind is EventKind.VUK_BLOCK:
             self.blocks += 1          # блок ВУК — граница выдачи
@@ -437,7 +440,7 @@ class TerminalEmulator:
                 direction = _code_int(cmd.args[1])
             except (TypeError, ValueError):
                 direction = 0
-        russian = st.font == 'n1'
+        russian = st.font == RUSSIAN_SET
         # Нулевой размер в потоке означает «мелкий знак», а не отсутствие
         # знака: без этого глифы вырождаются в одну точку.
         size = max(1, size)
@@ -509,7 +512,7 @@ class TerminalEmulator:
                       st.y & 0xFF, (st.y >> 8) & 0x0F,
                       st.line_type & 0x0F,
                       {PEN_OR: 0, PEN_XOR: 1, PEN_ERASE: 2}[st.pen] & 0x0F,
-                      1 if st.font == 'n1' else 0))
+                      1 if st.font == RUSSIAN_SET else 0))
 
     def restore_state(self, blob: bytes) -> None:
         st = self.state
@@ -517,7 +520,7 @@ class TerminalEmulator:
         st.y = blob[2] | (blob[3] & 0x0F) << 8
         st.line_type = blob[4] & 0x0F
         st.pen = (PEN_OR, PEN_XOR, PEN_ERASE)[blob[5] & 0x0F]
-        st.font = 'n1' if blob[6] else chars.DEFAULT_SET
+        st.font = RUSSIAN_SET if blob[6] else chars.DEFAULT_SET
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -27,8 +27,26 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from datetime import datetime
+
+from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
 from .emulator import TerminalEmulator
 from .pen import LightPen
+from .session import Session
+
+#: Название модели терминала — показывается в заголовке.
+MODEL = 'Электроника МС 7401'
+
+#: Линия ДКС, к которой подключается эмулятор по умолчанию.
+#: ЭВМ слушает порты 4202-4223 (`set ttyN dks,raw` в SIMH).
+DEFAULT_ENDPOINT = '127.0.0.1:4202-4223'
+
+
+def title_line() -> str:
+    """Заголовок: модель терминала, разрешение, время."""
+    now = datetime.now().strftime('%d.%m.%Y %H:%M:%S')
+    return (f'  {MODEL}  {SCREEN_WIDTH}×{SCREEN_HEIGHT}  '
+            f'{now}')
 from .reader import CommandStreamReader, EventKind
 from .screen import ScreenRenderer, Viewport
 from .term import (ALT_SCREEN_OFF, ALT_SCREEN_ON, BOLD, CLEAR, HIDE_CURSOR,
@@ -211,13 +229,45 @@ class TerminalApp:
         self.status_extra = ''
         self.input_line = ''
         self.message = ''
+        #: Накопленный текст, присланный ЭВМ (приглашения ОС Диспак).
+        self._text_log: list[str] = []
+        #: Режимы терминала по образцу 15ИЭ-00-013: АВТОНОМНО / С ЭВМ,
+        #: SEND, ЭХО, ОЧИСТКА, переключение наборов.
+        self.session = Session()
         self.running = True
         self._grid_fb = None
 
     # ── приём данных ────────────────────────────────────────────────────────
 
+    #: Буквы команд терминала в начале записи.  Запись, начинающаяся с
+    #: одной из них, — операция графики; всё остальное — текст.
+    COMMAND_LETTERS = b'J01245789]}>*3+KS/'
+
+    @classmethod
+    def is_command_stream(cls, data: bytes) -> bool:
+        """Похоже ли это на поток команд терминала, а не на текст ОС.
+
+        Признаки: маркер кадра `АР2` или начало блока ВУК `'/' ВК`,
+        либо запись, начинающаяся с буквы команды.  Сообщения ОС Диспак
+        («ЭВМ-3», приглашения) под это не подходят и идут как текст.
+        """
+        from .constants import AR2, VK
+        if bytes((AR2,)) + b'F' in data:
+            return True
+        if b'/' + bytes((VK,)) in data:
+            return True
+        for rec in data.split(bytes((VK,))):
+            if rec[:1] in (bytes((c,)) for c in cls.COMMAND_LETTERS):
+                return True
+        return False
+
     def feed(self, data: bytes) -> None:
+        """Принять данные: графику — в кадр, текст — в строку сообщений."""
         if not data:
+            return
+        if not self.is_command_stream(data):
+            self._text_log.extend(
+                data.decode('koi8-r', errors='replace'))
             return
         self.reader.feed(data)
         for ev in self.reader.pop():
@@ -226,12 +276,23 @@ class TerminalApp:
             else:
                 self.emu.handle_event(ev)
 
+    def _clean_text(self) -> str:
+        """Текст ОС без управляющих последовательностей, в одну строку."""
+        out = ''.join(self._text_log)
+        out = ''.join(ch for ch in out
+                      if ch.isprintable() or ch in ' \t')
+        return ' '.join(out.split())
+
     # ── рисование ───────────────────────────────────────────────────────────
 
     def layout(self) -> tuple[int, int]:
-        """Столбцы и строки под изображение: одна строка уходит на панель."""
+        """Столбцы и строки под изображение.
+
+        Сверху — заголовок с моделью и временем, снизу — три строки
+        панели: состояние, подсказка и строка ввода.
+        """
         cols, rows = terminal_size()
-        return cols, max(3, rows - 3)
+        return cols, max(3, rows - 5)
 
     def draw(self) -> None:
         cols, rows = self.layout()
@@ -245,7 +306,7 @@ class TerminalApp:
             body = self._overlay_grid(body, cols, rows)
         if self.pen.enabled:
             body = self._overlay_pen(body, cols, rows)
-        out = [HOME, body, '\n']
+        out = [HOME, title_line() + '\n', body, '\n']
         out.append(bar(f' {self._title()}', cols) + '\n')
         out.append(bar(self._hint(), cols) + '\n')
         out.append(bar(self._input_row(), cols))
@@ -254,14 +315,20 @@ class TerminalApp:
 
     def _title(self) -> str:
         st = self.renderer.status(self.layout()[0], self.layout()[1])
-        parts = [f'МС 7401 — {self.driver.name}', st, self.status_extra]
+        parts = [f'МС 7401 — {self.driver.name}', self.session.panel(),
+                 st, self.status_extra]
         return ' | '.join(p for p in parts if p)
 
     def _hint(self) -> str:
+        """Строка подсказок; если ЭВМ прислала текст — он важнее."""
+        text = self._clean_text()
+        if text:
+            return f'ЭВМ: {text[-200:]}'
         if self.message:
             return self.message
-        return ('↑↓←→ сдвиг  + - масштаб  0 вписать  c центр  m цвет  '
-                'g сетка  p перо  x очистить  q выход')
+        return ('L режим  S передать  e эхо  x очистить  z набор  '
+                '↑↓←→ сдвиг  + - масштаб  0 вписать  c центр  '
+                'm цвет  g сетка  p перо  q выход')
 
     def _input_row(self) -> str:
         return f' ВВОД: {self.input_line}▏'
@@ -341,8 +408,28 @@ class TerminalApp:
         elif key == 'r':
             self.message = 'перерисовано'
         elif key == 'x':
-            self.emu.execute(self.emu.parser.parse(b'S\x55'))
+            # ОЧИСТКА: в режиме С ЭВМ команда уходит на ЭВМ,
+            # иначе чистим локально.
+            out = self.session.clear_command()
+            if out:
+                self.driver.send_keys(out.decode('latin-1'))
+            else:
+                self.emu.execute(self.emu.parser.parse(b'S\x55'))
             self.message = 'экран очищен'
+        elif key == 'L':          # режим терминала
+            self.session.toggle_mode()
+            self.message = 'режим: ' + self.session.panel()
+        elif key in ('S', 'KEY_F2'):   # SEND
+            self._send()
+        elif key == 'e':          # ЭХО
+            self.session.toggle_echo()
+            self.message = ('эхо включено' if self.session.echo
+                            else 'эхо выключено — пароль не печатается')
+        elif key == 'z':          # набор: Н2 (КОИ-7) / КОИ-8Р
+            want = 'koi8r' if self.session.charset_set == 'n2' else 'n2'
+            self.session.set_charset(want)
+            self.emu.state.font = want
+            self.message = 'набор: ' + self.session.panel()
         elif key == 'KEY_BACKSPACE' or key == '\x7f':
             self.input_line = self.input_line[:-1]
         elif key == '\r' or key == '\n' or key == 'KEY_ENTER':
@@ -355,6 +442,21 @@ class TerminalApp:
         else:
             return
         vp.clamp(self.emu.fb, cols, rows)
+
+    def _send(self) -> None:
+        """SEND: передать накопленное на ЭВМ, буфер очистить."""
+        text = self.input_line
+        self.input_line = ''
+        if not text and not self.session.buffer:
+            self.message = 'нечего отправлять'
+            return
+        if text:
+            self.session.type_line(text)
+        out = self.session.send()
+        self.session.reset_buffer()
+        if out:
+            self.driver.send_keys(out.decode('latin-1'))
+            self.message = f'отправлено {len(out)} Б'
 
     def _submit(self) -> None:
         text = self.input_line
@@ -485,22 +587,26 @@ def _no_stream_hint() -> str:
 def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
             demo: bool = False, mode: str = 'color',
             grid: bool = False, pen: bool = False) -> int:
-    if endpoint:
+    """Запустить фронтенд.
+
+    Без файла и без `--link` открывается интерактивная сессия с
+    БЭСМ-6 по каналу ДКС (порты 4202-4223).  Если ни одна линия не
+    доступна, печатается объяснение и возвращается код 2 — молча
+    подменять её эталонной картинкой нельзя, это вводит в заблуждение.
+    """
+    if path is not None:
+        # Явно указан файл — обычный разбор без диалога с ЭВМ.
+        driver: Driver = FileDriver(path)
+    elif demo:
+        p = _default_stream()
+        driver = ScriptedDriver(p) if p else BuiltinDriver()
+    else:
+        # По умолчанию — интерактивная сессия с БЭСМ-6 по каналу ДКС.
         try:
-            driver: Driver = LiveDriver(endpoint)
+            driver = LiveDriver(endpoint or DEFAULT_ENDPOINT)
         except LinkRefused as exc:
             print(str(exc), file=sys.stderr)
             return 2
-    elif demo or path is None:
-        p = path or _default_stream()
-        if p is None:
-            # Ни исходников, ни эталонных потоков рядом — показываем
-            # встроенную пробу, чтобы терминал всегда был на что посмотреть.
-            driver = BuiltinDriver()
-        else:
-            driver = ScriptedDriver(p)
-    else:
-        driver = FileDriver(path)
 
     app = TerminalApp(driver, mode=mode, grid=grid)
     if pen:

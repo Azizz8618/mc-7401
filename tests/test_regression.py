@@ -141,41 +141,39 @@ def test_text_command_draws_glyphs():
 
 # ── дефект 25: спецкоды шрифта доходят до эмулятора ─────────────────────────
 
-def test_s0_switches_to_set_n1():
-    """`S0` (0o160) переключает набор знаков на Н1 (русский).
+def test_s0_switches_to_koi8r():
+    """`S0` (0o160) включает русский набор КОИ-8Р.
 
-    Модель наборов Н0/Н1/Н2 взята из терминала 15ИЭ; у МС7401 коды
-    `S0`/`S1` играют ту же роль, что и в VT-52 переключение набора.
+    Наборов у МС7401 два: Н2 (КОИ-7, VT-52) и КОИ-8Р.  `S0` — русский,
+    `S1` — возврат к международному Н2.  Так их использует `ТЕКФАЙ`
+    в `graf.pas`: перед русскими знаками посылается `S0`.
     """
     emu = run(stream('J1', '4 10 300', b'9\x01', ';\x00 ' + chr(S0) + 'АБВ'))
-    assert emu.state.font == 'n1'
+    assert emu.state.font == 'koi8r'
+
+
+def test_s1_returns_to_default_set():
+    """`S1` (0o161) возвращает набор по умолчанию — Н2 (КОИ-7)."""
+    from mc7401.constants import S0, S1
+    emu = run(stream('J1', '4 10 300', b'9\x01',
+                     ';\x00 ' + chr(S0) + chr(S1) + 'АБВ'))
+    assert emu.state.font == 'n2'
 
 
 def test_default_charset_set_is_n2():
-    """По умолчанию включён Н2 — набор команд VT-52, как в терминале 15ИЭ."""
-    from mc7401.chars import DEFAULT_SET
+    """По умолчанию включён Н2 (КОИ-7) — набор команд VT-52."""
+    from mc7401.chars import DEFAULT_SET, SETS
     assert DEFAULT_SET == 'n2'
+    assert SETS == ('n2', 'koi8r')
     assert TerminalEmulator().state.font == 'n2'
 
 
-def test_charset_sets_match_15ie_semantics():
-    """Н0/Н1/Н2 повторяют правила эмулятора 15ИЭ.
-
-    Н0 — ASCII с заменами ISO 646 (0x24 «¤», 0x5E «¬»);
-    Н1 — русские верх (0x40…0x5E) и низ (0x60…0x7E);
-    Н2 — международная строка без замен, кириллица кодами ЭВМ
-    0x00…0x1E, 0x1F — «№».
-    """
-    from mc7401.chars import display_char
-    assert display_char(0x24, 'n0') == '¤'
-    assert display_char(0x5E, 'n0') == '¬'
-    assert display_char(0x24, 'n2') == '$'
-    assert display_char(0x5E, 'n2') == '^'
-    assert display_char(0x10, 'n1') == 'П'
-    assert display_char(0x70, 'n1') == 'п'
-    assert display_char(0x1F, 'n1') == 'Ъ'
-    assert display_char(0x1F, 'n2') == '№'
-    assert display_char(0x41, 'n1') == 'А'   # латинская строка занята Н1
+def test_default_charset_set_is_n2():
+    """По умолчанию включён Н2 (КОИ-7) — набор команд VT-52."""
+    from mc7401.chars import DEFAULT_SET, SETS
+    assert DEFAULT_SET == 'n2'
+    assert SETS == ('n2', 'koi8r')
+    assert TerminalEmulator().state.font == 'n2'
 
 
 def test_russian_glyph_differs_from_latin():
@@ -553,3 +551,59 @@ def test_pen_event_encoding_is_provisional():
     ev = PenEvent(200, 300, True)
     assert ev.encode() == b'\x1b[1;200;300M'
     assert 'PROVISIONAL' in __import__('mc7401.pen', fromlist=['x']).__doc__
+
+
+# ── режимы терминала по образцу 15ИЭ-00-013 ────────────────────────────────
+
+def test_host_mode_sends_every_character_immediately():
+    """В режиме С ЭВМ каждый знак уходит в линию немедленно."""
+    from mc7401.session import Session
+    s = Session()
+    assert s.mode == 'host'
+    assert s.type_line('СЕТ') == 'СЕТ'.encode('koi8-r')
+    assert s.pending() == b''
+
+
+def test_local_mode_buffers_until_send():
+    """В режиме АВТОНОМНО набор копится, SEND передаёт накопленное."""
+    from mc7401.session import Session
+    s = Session()
+    s.toggle_mode()
+    assert s.mode == 'local'
+    assert s.type_line('ЛИН 3 ') == b''          # в линию не уходит
+    assert s.pending() == 'ЛИН 3 '.encode('koi8-r')
+    out = s.send()
+    assert out.endswith(bytes((VK,)))            # SEND добавляет ВК
+    assert 'ЛИН 3'.encode('koi8-r') in out
+    assert s.pending() == b''                    # буфер очищен
+
+
+def test_clear_command_goes_to_computer_only_in_host_mode():
+    """ОЧИСТКА: в HOST команда `S` уходит на ЭВМ, в LOCAL — локально."""
+    from mc7401.session import Session
+    s = Session()
+    assert s.clear_command() == b'S' + bytes((VK,))
+    s.toggle_mode()
+    assert s.clear_command() == b''
+
+
+def test_echo_toggles():
+    """Клавиша ЭХО: снята — набираемое не печатается."""
+    from mc7401.session import Session
+    s = Session()
+    assert s.echo is True
+    assert s.toggle_echo() is False
+    assert 'эхо выкл' in s.panel()
+    assert s.toggle_echo() is True
+
+
+def test_russian_layout_exists_only_in_koi8r():
+    """Русская раскладка живёт только в русском наборе — как в 15ИЭ."""
+    from mc7401.session import Session
+    s = Session()
+    assert s.charset_set == 'n2'
+    assert s.layout is None
+    s.set_charset('koi8r')
+    assert s.layout == 'phonetic'
+    s.set_charset('n2')
+    assert s.layout is None
