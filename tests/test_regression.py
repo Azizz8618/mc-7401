@@ -141,10 +141,41 @@ def test_text_command_draws_glyphs():
 
 # ── дефект 25: спецкоды шрифта доходят до эмулятора ─────────────────────────
 
-def test_s0_switches_to_russian_font():
-    """`S0` (0o160) переключает шрифт на русский."""
+def test_s0_switches_to_set_n1():
+    """`S0` (0o160) переключает набор знаков на Н1 (русский).
+
+    Модель наборов Н0/Н1/Н2 взята из терминала 15ИЭ; у МС7401 коды
+    `S0`/`S1` играют ту же роль, что и в VT-52 переключение набора.
+    """
     emu = run(stream('J1', '4 10 300', b'9\x01', ';\x00 ' + chr(S0) + 'АБВ'))
-    assert emu.state.font == 'RU'
+    assert emu.state.font == 'n1'
+
+
+def test_default_charset_set_is_n2():
+    """По умолчанию включён Н2 — набор команд VT-52, как в терминале 15ИЭ."""
+    from mc7401.chars import DEFAULT_SET
+    assert DEFAULT_SET == 'n2'
+    assert TerminalEmulator().state.font == 'n2'
+
+
+def test_charset_sets_match_15ie_semantics():
+    """Н0/Н1/Н2 повторяют правила эмулятора 15ИЭ.
+
+    Н0 — ASCII с заменами ISO 646 (0x24 «¤», 0x5E «¬»);
+    Н1 — русские верх (0x40…0x5E) и низ (0x60…0x7E);
+    Н2 — международная строка без замен, кириллица кодами ЭВМ
+    0x00…0x1E, 0x1F — «№».
+    """
+    from mc7401.chars import display_char
+    assert display_char(0x24, 'n0') == '¤'
+    assert display_char(0x5E, 'n0') == '¬'
+    assert display_char(0x24, 'n2') == '$'
+    assert display_char(0x5E, 'n2') == '^'
+    assert display_char(0x10, 'n1') == 'П'
+    assert display_char(0x70, 'n1') == 'п'
+    assert display_char(0x1F, 'n1') == 'Ъ'
+    assert display_char(0x1F, 'n2') == '№'
+    assert display_char(0x41, 'n1') == 'А'   # латинская строка занята Н1
 
 
 def test_russian_glyph_differs_from_latin():
@@ -451,3 +482,74 @@ def test_completion_scripts_are_valid():
         r = subprocess.run(['bash', '-n', str(root / script)],
                            capture_output=True)
         assert r.returncode == 0, r.stderr.decode()
+
+
+# ── фронтенд: экран, перо, терминал ────────────────────────────────────────
+
+def test_viewport_maps_terminal_cells_to_pixels():
+    """Ячейка терминала → пиксель кадра; Y переворачивается."""
+    from mc7401.screen import ScreenRenderer, Viewport
+    fb = Framebuffer()
+    fb.point(100, 50)
+    # моно-режим: один знак на знакомест, без escape-последовательностей
+    r = ScreenRenderer(fb, mode='mono', vp=Viewport(scale=1, x=0, y=0))
+    # Пиксель Y=50 стоит на 399-50=349 сверху; знакомест закрывает два
+    # пикселя по вертикали, поэтому строка вывода 349//2 = 174.
+    lines = r.render(560, 400).split('\n')
+    assert len(lines) == 400
+    assert lines[174][100] != ' '
+
+
+def test_viewport_fit_and_clamp():
+    """`fit` вписывает кадр в окно, `clamp` не выпускает за границы."""
+    from mc7401.screen import Viewport
+    fb = Framebuffer()
+    vp = Viewport()
+    vp.fit(fb, 80, 24)
+    assert vp.scale >= 1
+    vp.x, vp.y = -50, -50
+    vp.clamp(fb, 80, 24)
+    assert vp.x == 0 and vp.y == 0
+
+
+def test_renderer_produces_two_pixels_per_cell():
+    """Один знакомест закрывает два пикселя по вертикали."""
+    from mc7401.screen import ScreenRenderer, Viewport
+    fb = Framebuffer()
+    fb.hline(0, 559, 399)          # верхняя строка кадра
+    r = ScreenRenderer(fb, vp=Viewport(scale=1, x=0, y=0))
+    body = r.render(60, 4)
+    assert body.split('\n')[0].strip()
+
+
+def test_pen_maps_mouse_and_draws_stroke():
+    """Мышь работает как световое перо: нажатие и протяжка рисуют линию."""
+    from mc7401.pen import LightPen
+    pen = LightPen()
+    pen.feed_mouse('\x1b[<0;20;10M', cols=80, rows=24)
+    assert not pen.down
+    pen.stroke(pen.fb)
+    pen.feed_mouse('\x1b[<1;30;10M', cols=80, rows=24)
+    assert pen.down
+    pen.feed_mouse('\x1b[<32;60;10M', cols=80, rows=24)
+    assert pen.down, 'протяжка сохраняет состояние пера'
+    assert pen.stroke(pen.fb)
+    assert pen.fb.count_set() > 0
+    pen.feed_mouse('\x1b[<0;60;10m', cols=80, rows=24)
+    assert not pen.down
+
+
+def test_pen_coordinates_follow_viewport():
+    """Смещение окна сдвигает перо согласованно с картинкой."""
+    from mc7401.pen import LightPen
+    a = LightPen().feed_mouse('\x1b[<0;10;5M', cols=80, rows=24, scale=1, vx=0, vy=0)
+    b = LightPen().feed_mouse('\x1b[<0;10;5M', cols=80, rows=24, scale=1, vx=100, vy=50)
+    assert b[0] - a[0] == 100
+
+
+def test_pen_event_encoding_is_provisional():
+    """Событие пера кодируется для линии связи (кодирование provisional)."""
+    from mc7401.pen import PenEvent
+    ev = PenEvent(200, 300, True)
+    assert ev.encode() == b'\x1b[1;200;300M'
+    assert 'PROVISIONAL' in __import__('mc7401.pen', fromlist=['x']).__doc__

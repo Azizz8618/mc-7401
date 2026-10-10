@@ -31,6 +31,8 @@ from .constants import (
     PEN_ERASE,
     PEN_OR,
     PEN_XOR,
+    S0,
+    S1,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
 )
@@ -80,7 +82,9 @@ class TerminalState:
     y: int = 0
     pen: str = PEN_OR
     line_type: int = 1
-    font: str = 'LAT'                 # 'LAT' | 'RU'
+    #: Набор знаков: 'n0' | 'n1' | 'n2'; по умолчанию Н2 (VT-52),
+    #: как в терминале 15ИЭ.  `S0` включает Н1, `S1` — Н2.
+    font: str = chars.DEFAULT_SET
     text_size: int = 0
     text_direction: int = 0
     mode: str = 'TEXT'                # 'TEXT' | 'GRAPHICS'
@@ -161,7 +165,7 @@ class TerminalEmulator:
                 self.on_frame(self.fb)
             return
         if kind is EventKind.RU_FONT:
-            self.state.font = 'RU'
+            self.state.font = 'n1'
             return
         if kind is EventKind.VUK_BLOCK:
             self.blocks += 1          # блок ВУК — граница выдачи
@@ -280,7 +284,7 @@ class TerminalEmulator:
         st.x = st.y = 0
         st.pen = PEN_OR
         st.line_type = 1
-        st.font = 'LAT'
+        st.font = chars.DEFAULT_SET
         st.text_size = 0
         st.text_direction = 0
         st.mode = 'GRAPHICS'
@@ -433,7 +437,7 @@ class TerminalEmulator:
                 direction = _code_int(cmd.args[1])
             except (TypeError, ValueError):
                 direction = 0
-        russian = st.font == 'RU'
+        russian = st.font == 'n1'
         # Нулевой размер в потоке означает «мелкий знак», а не отсутствие
         # знака: без этого глифы вырождаются в одну точку.
         size = max(1, size)
@@ -453,18 +457,16 @@ class TerminalEmulator:
         st.pen = pen_saved
 
     def _prepare_payload(self, payload: bytes, russian: bool) -> list[int]:
-        """Разобрать байты строки: S0/S1 переключают шрифт, 0o240 — пропуск."""
+        """Разобрать байты строки: S0/S1 переключают набор знаков, 0o240 — пропуск."""
         out: list[int] = []
         for b in payload:
             if b == END:                        # признак конца текста
                 break
-            if b == 0o160:                     # S0 — русский шрифт
-                self.state.font = 'RU'
-                russian = True
-                continue
-            if b == 0o161:                     # S1 — латинский шрифт
-                self.state.font = 'LAT'
-                russian = False
+            if b in (S0, S1):                   # S0 — набор Н1, S1 — Н2
+                name = chars.set_for_code(b)
+                if name is not None:
+                    self.state.font = name
+                    russian = (name == 'n1')
                 continue
             if b in (0o124, 0o125, 0o33):       # служебные
                 continue
@@ -507,7 +509,7 @@ class TerminalEmulator:
                       st.y & 0xFF, (st.y >> 8) & 0x0F,
                       st.line_type & 0x0F,
                       {PEN_OR: 0, PEN_XOR: 1, PEN_ERASE: 2}[st.pen] & 0x0F,
-                      1 if st.font == 'RU' else 0))
+                      1 if st.font == 'n1' else 0))
 
     def restore_state(self, blob: bytes) -> None:
         st = self.state
@@ -515,7 +517,7 @@ class TerminalEmulator:
         st.y = blob[2] | (blob[3] & 0x0F) << 8
         st.line_type = blob[4] & 0x0F
         st.pen = (PEN_OR, PEN_XOR, PEN_ERASE)[blob[5] & 0x0F]
-        st.font = 'RU' if blob[6] else 'LAT'
+        st.font = 'n1' if blob[6] else chars.DEFAULT_SET
 
 
 # ─────────────────────────────────────────────────────────────────────────────

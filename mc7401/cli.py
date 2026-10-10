@@ -34,8 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
   python -m mc7401 --listen 127.0.0.1:4202 --png кадр.png
   cat поток.bin | python -m mc7401 - --dump-ascii
 ''')
-    ap.add_argument('input', nargs='?', default='-',
-                    help="файл с потоком команд или '-' для stdin")
+    ap.add_argument('input', nargs='?', default=None,
+                    help="файл с потоком команд или '-' для stdin; "
+                         "без файла запускается интерактивный режим")
     ap.add_argument('-b', '--backend', default='png',
                     choices=sorted(BACKENDS), help="способ вывода")
     ap.add_argument('-o', '--output', default='mc7401.png',
@@ -64,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help='слушать порт и обслуживать ЭВМ (обратный режим)')
     ap.add_argument('--link-timeout', type=float, default=0.0,
                     help='таймаут линии ДКС, с (0 — 10 с)')
+    ap.add_argument('--tui', action='store_true',
+                    help='интерактивный режим (включён по умолчанию)')
+    ap.add_argument('--pen', action='store_true',
+                    help='световое перо: мышь рисует линию (с --tui)')
+    ap.add_argument('--demo', action='store_true',
+                    help='демонстрация без ЭВМ (сценарий нажатий)')
     ap.add_argument('--list-backends', action='store_true',
                     help='показать доступные backend-ы и выйти')
     ap.add_argument('-v', '--verbose', action='count', default=0,
@@ -98,6 +105,23 @@ def main(argv=None) -> int:
                             output=args.output, scale=args.scale,
                             timeout=args.link_timeout,
                             verbose=args.verbose)
+
+    # Интерактивный режим — по умолчанию: без файла на входе открываем
+    # диалог с терминалом, а не читаем пустой stdin.
+    # Интерактивный режим — по умолчанию.  Без файла на входе и при
+    # терминале на stdin открываем диалог с терминалом; любой явно
+    # заданный параметр вывода отключает его.
+    action_flags = (args.link or args.listen or args.dump_ascii or args.stats
+                    or args.png or args.frames or args.list_backends)
+    interactive = args.tui or (
+        args.input is None and not action_flags and sys.stdin.isatty())
+
+    if interactive:
+        from .tui import run_tui
+        path = Path(args.input) if args.input not in ('-', None) else None
+        return run_tui(path, endpoint=args.link, demo=args.demo,
+                       mode='mono' if args.dump_ascii else 'color',
+                       pen=args.pen)
 
     if args.link:
         from .link import run_link
