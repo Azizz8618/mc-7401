@@ -58,8 +58,9 @@ def cell_pixels(fb: Framebuffer, col: int, y0: int) -> int:
 # ── раскладка ─────────────────────────────────────────────────────────────
 
 def test_cols_matches_frame_width():
+    """Полоса служебных строк — по ширине кадра, в знакоместах СИМ."""
     assert chrome.cols() * CELL_W == SCREEN_WIDTH
-    assert chrome.cols() == 35
+    assert chrome.cols() == 70
 
 
 def test_status_line_fits_narrow_strip():
