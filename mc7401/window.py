@@ -225,6 +225,7 @@ class TerminalWindow:
         # заново на каждое изменение размера.
         canvas.bind('<Configure>', self._on_resize)
         canvas.bind('<Button-1>', self._on_click)
+        canvas.bind('<Motion>', self._on_motion)
         canvas.bind('<B1-Motion>', self._on_drag)
         canvas.bind('<ButtonRelease-1>', self._on_release)
         canvas.bind('<Button-2>', self._on_middle)
@@ -381,7 +382,10 @@ class TerminalWindow:
     def _pen_at(self, event) -> tuple[int, int]:
         """Координаты пера в системе кадра (Y вверх) по событию Tk."""
         fx, _, scale = self._frame_geometry()
-        x = int((event.x - fx) / scale) if scale else 0
+        # `round`, а не `int`: масштаб дробный, и отсечение вниз сдвигало
+        # перо на пиксель влево и вверх от той точки, на которую указал
+        # пользователь.
+        x = round((event.x - fx) / scale) if scale else 0
         x = max(0, min(self.emu.fb.width - 1, x))
         return x, self.emu.fb.height - 1 - self._frame_row_img(event.y)
 
@@ -409,7 +413,7 @@ class TerminalWindow:
         Указатель вне кадра прижимается к ближайшему его краю.
         """
         _, fy, scale = self._frame_geometry()
-        row = int((y - fy) / scale) if scale else 0
+        row = round((y - fy) / scale) if scale else 0
         return max(0, min(row, SCREEN_HEIGHT - 1))
 
     def _on_click(self, event) -> None:
@@ -418,7 +422,7 @@ class TerminalWindow:
             self._pen_down(event, button=1)
             return
         fx, _, scale = self._frame_geometry()
-        col = max(0, int((event.x - fx) / scale) // CELL_W) if scale else 0
+        col = max(0, round((event.x - fx) / scale) // CELL_W) if scale else 0
         row = self._frame_row_img(event.y) // CELL_H
         if self._in_chrome(event.y):
             self.last_key = 'ПОДВАЛ'          # клик не по кадру
@@ -451,6 +455,26 @@ class TerminalWindow:
         self.last_key = 'ПЕРО'
         self._touch_frame()
         self.paint()
+
+    def _on_motion(self, event) -> None:
+        """Указатель идёт без нажатия — перекрестье пера идёт за ним.
+
+        Пера не видно на кадре, пока не нажата кнопка (см.
+        `shown_frame`), а без этого оператор не знает, куда попадёт
+        штрих.  Перерисовка только при смене знакоместа: движение мыши
+        идёт чаще, чем кадр.
+        """
+        if not self.pen.enabled:
+            return
+        x, y = self._pen_at(event)
+        # Координата уточняется всегда — перекрестье показывает пиксель,
+        # а не знакоместо; перерисовка только при смене знакоместа, иначе
+        # движение мыши перерисовывало бы кадр чаще, чем он меняется.
+        cell = (x // CELL_W, y // CELL_H)
+        moved = cell != (self.pen.x // CELL_W, self.pen.y // CELL_H)
+        self.pen.x, self.pen.y = x, y
+        if moved:
+            self.paint()
 
     def _on_drag(self, event) -> None:
         """Протяжка с нажатой кнопкой — штрих пера (если перо включено)."""
@@ -518,10 +542,20 @@ class TerminalWindow:
                                    self._hist_at + direction))
 
     def shown_frame(self):
-        """Кадр, который сейчас на экране: из истории или текущий."""
-        if self._hist_at is not None and self._history:
-            return self._history[self._hist_at]
-        return self.best if self.best_n else self.emu.fb
+        """Кадр, который сейчас на экране: из истории или текущий.
+
+        С перами поверх — копия кадра с перекрестьем: перекрестье рисуется
+        при выводе и в память кадра не попадает, иначе оно затиралось бы
+        следующей перерисовкой программы.
+        """
+        base = (self._history[self._hist_at]
+                if self._hist_at is not None and self._history
+                else (self.best if self.best_n else self.emu.fb))
+        if not self.pen.enabled:
+            return base
+        view = base.copy()
+        self.pen.crosshair(view)
+        return view
 
     # ── ввод ────────────────────────────────────────────────────────────────
 

@@ -703,6 +703,149 @@ def test_window_click_above_frame_clamps_to_top(monkeypatch):
     assert 0 <= win.console.col < window.SCREEN_WIDTH // CELL_W
 
 
+# ── световое перо (F2) ──────────────────────────────────────────────────────
+
+def pen_window(monkeypatch, size=(1200, 900)):
+    """Окно с включённым пером и чистым кадром."""
+    win = make_window(monkeypatch, size=size)
+    win.pen.enabled = True
+    win.emu.fb.clear()
+    win.best, win.best_n = None, 0
+    return win
+
+
+def screen_of(win, fx, fy, scale, x, y):
+    """Точка кадра → точка окна, в которую указывает пользователь.
+
+    Берётся **центр** пикселя: пиксель кадра `x` на экране занимает
+    полосу `[x * scale, (x + 1) * scale)`, и только её середина
+    соответствует именно этому пикселю после обратного перевода.
+    """
+    return (fx + int((x + 0.5) * scale),
+            fy + int((399 - y + 0.5) * scale))
+
+
+def test_pen_maps_pointer_to_frame_pixel(monkeypatch):
+    """Перо попадает в ту точку кадра, на которую указал пользователь.
+
+    Координаты окна переводятся в кадр через геометрию кадра: масштаб
+    дробный, кадр прижат к левому краю и стоит под строкой состояния —
+    всё это обязано учитываться, иначе перо рисует мимо.
+    """
+    win = pen_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    for x, y in ((0, 0), (1, 1), (280, 200), (559, 399), (100, 350)):
+        ex, ey = screen_of(win, fx, fy, scale, x, y)
+        assert win._pen_at(FakeClick(ex, ey)) == (x, y), (x, y)
+
+
+def test_pen_draws_stroke_where_pointer_went(monkeypatch):
+    """Штрих пера ложится вдоль пути указателя."""
+    win = pen_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    start, end = (20, 380), (400, 30)
+    win._pen_down(FakeClick(*screen_of(win, fx, fy, scale, *start)), button=1)
+    win._on_drag(FakeClick(*screen_of(win, fx, fy, scale, *end)))
+    win._on_release()
+    lit = [(x, y) for y in range(400) for x in range(560)
+           if win.emu.fb.get(x, y)]
+    assert lit, 'штрих не нарисован'
+    assert min(p[0] for p in lit) <= 20 and max(p[0] for p in lit) >= 400
+    assert min(p[1] for p in lit) <= 30 and max(p[1] for p in lit) >= 380
+    # Штрих идёт по диагонали, а не по краю кадра.
+    mid = [p for p in lit if 180 < p[0] < 240]
+    assert any(180 < p[1] < 220 for p in mid), 'штрих пошёл не по диагонали'
+
+
+def test_pen_stroke_follows_window_resize(monkeypatch):
+    """После растяжения окна перо попадает туда же по кадру."""
+    win = pen_window(monkeypatch, size=(600, 500))
+    fx, fy, scale = win._frame_geometry()
+    ex, ey = screen_of(win, fx, fy, scale, 123, 321)
+    assert win._pen_at(FakeClick(ex, ey)) == (123, 321)
+    win._canvas._w, win._canvas._h = 1600, 1200
+    fx, fy, scale = win._frame_geometry()
+    ex, ey = screen_of(win, fx, fy, scale, 123, 321)
+    assert win._pen_at(FakeClick(ex, ey)) == (123, 321), \
+        'после растяжения окна перо уехало'
+
+
+def test_pen_is_visible_on_frame(monkeypatch):
+    """Перо видно на кадре: без перекрестья его не видно, куда попадёт."""
+    win = pen_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    win._pen_at(FakeClick(*screen_of(win, fx, fy, scale, 300, 200)))
+    win.pen.x, win.pen.y = 300, 200
+    assert not win.emu.fb.count_set(), 'перекрестье не должно попадать в память'
+    shown = win.shown_frame()
+    assert shown.count_set() > 0, 'перекрестье не нарисовано при выводе'
+    # Выключенное перо кадр не трогает.
+    win.pen.enabled = False
+    assert win.shown_frame().count_set() == 0
+
+
+def test_pen_crosshair_follows_pointer(monkeypatch):
+    """Перекрестье идёт за указателем без нажатой кнопки."""
+    win = pen_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    win.pen.x, win.pen.y = 10, 10
+    win._on_motion(FakeClick(*screen_of(win, fx, fy, scale, 400, 300)))
+    assert (win.pen.x, win.pen.y) == (400, 300), \
+        'перекрестье осталось на месте прежнего штриха'
+    # Движение внутри того же знакоместа перерисовку не требует.
+    win._on_motion(FakeClick(*screen_of(win, fx, fy, scale, 401, 301)))
+    assert (win.pen.x, win.pen.y) == (401, 301)
+
+
+def test_pen_tools_cycle_with_f3(monkeypatch):
+    """F3 перебирает инструменты пера по кругу."""
+    win = make_window(monkeypatch)
+    win._on_key(FakeEvent('F3', ''))
+    assert win.pen_tool == 'точка'
+    win._on_key(FakeEvent('F3', ''))
+    assert win.pen_tool == 'стирание'
+    win._on_key(FakeEvent('F3', ''))
+    assert win.pen_tool == 'инверсия'
+    win._on_key(FakeEvent('F3', ''))
+    assert win.pen_tool == 'штрих'
+
+
+def test_pen_f2_toggles_and_reports(monkeypatch):
+    """F2 включает и выключает перо, и это видно в подвале."""
+    win = make_window(monkeypatch)
+    assert not win.pen.enabled
+    win._on_key(FakeEvent('F2', ''))
+    assert win.pen.enabled
+    assert 'ПЕРО' in win.status().pen_tool or win.status().pen
+    win._on_key(FakeEvent('F2', ''))
+    assert not win.pen.enabled
+
+
+def test_right_and_middle_buttons_erase(monkeypatch):
+    """Правая и средняя кнопки — стирающее перо, как `*` у терминала."""
+    win = pen_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    x, y = 300, 200
+    win.emu.fb.hline(0, 559, y)
+    assert win.emu.fb.count_set() == 560
+    win._on_right(FakeClick(*screen_of(win, fx, fy, scale, x, y)))
+    assert win.emu.fb.count_set() < 560, 'правая кнопка должна стирать'
+    win._on_middle(FakeClick(*screen_of(win, fx, fy, scale, x, y)))
+    assert win.emu.fb.count_set() < 560, 'средняя кнопка должна стирать'
+
+
+def test_click_without_pen_moves_text_cursor(monkeypatch):
+    """Без пера левая кнопка ставит текстовый курсор, а не рисует."""
+    win = make_window(monkeypatch)
+    win.emu.fb.clear()
+    win.best, win.best_n = None, 0
+    fx, fy, scale = win._frame_geometry()
+    # `y` кадра считается вверх, а строки консоли — сверху вниз.
+    win._on_click(FakeClick(*screen_of(win, fx, fy, scale, 8, 399)))
+    assert win.emu.fb.count_set() == 0, 'курсор не должен рисовать'
+    assert (win.console.col, win.console.row) == (8 // CELL_W, 0)
+
+
 def test_window_backspace_erases_glyph(monkeypatch):
     """ВК стирает знакомёст слева от курсора."""
     win = make_window(monkeypatch)
