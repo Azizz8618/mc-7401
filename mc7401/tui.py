@@ -505,14 +505,10 @@ class TerminalApp:
         self._body_offset = 0
         #: Протокол графики запрошен, но терминал не ответил.
         self._gfx_failed = False
-        #: Приветствие линии ДКС — видно, какая линия досталась.
-        #: Это единственный текст, который приходит не кодами знаков
-        #: терминала, а готовой строкой (её выдаёт обвязка стенда),
-        #: поэтому держим его отдельно.
-        self.greeting_text = ''
-        if getattr(driver, 'greeting', b''):
-            self.greeting_text = driver.greeting.decode(
-                'utf-8', errors='replace')
+        # Приветствие линии на экран не выводится: это служебный
+        # заголовок соединения, а не ответ ОС Диспак.  Оно целиком уходит
+        # в `DKSLink.greeting`, откуда его читает разбор для строки
+        # состояния (`ДКС`, `ЭВМ=`, `ТЕРМ=`).
         #: Данные получены? до них показывается начальный экран.
         self._got_data = False
         #: Последняя нажатая клавиша — строка «ПОСЛ:» подвала.
@@ -857,8 +853,7 @@ class TerminalApp:
         иначе вместо «ЭВМ-3,Т017» будет нечитаемая мешанина.
         """
         from . import chars
-        out: list = [ln.rstrip() for ln in self.greeting_text.splitlines()
-                     if ln.strip()]
+        out: list = []
         cur: list = []
         for piece in self._decode_bytes(self._raw_text):
             if isinstance(piece, str):

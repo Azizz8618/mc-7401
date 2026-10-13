@@ -243,8 +243,67 @@ BANNER_MACHINE = re.compile(r'(?:ЭВМ|БЭСМ|ЕС)\s*-?\s*(\d+)', re.IGNOREC
 #: Режим линии: `Encoding is …`.
 BANNER_MODE = (('raw', 'RAW'), ('utf-?8', 'UNICODE'),
                ('koi-?7', 'JCUKEN'), ('jcuken', 'JCUKEN'))
-#: Маркер линии ДКС в баннере.
-BANNER_DKS = re.compile(r'CONNECTED\s+TO\s+DKS', re.IGNORECASE)
+#: Кириллические омоглифы латинских букв: знакогенератор показывает на
+#: месте латинской `N` кириллическую «Н», и наоборот — различить их по
+#: одному байту нельзя.
+_HOMOGLYPH_OF = {'A': 'А', 'B': 'В', 'C': 'С', 'E': 'Е', 'H': 'Н',
+                 'K': 'К', 'M': 'М', 'O': 'О', 'P': 'Р', 'T': 'Т',
+                 'X': 'Х', 'Y': 'У', 'd': 'Д'}
+
+
+def _lookalikes(ch: str) -> str:
+    """Какие знаки терминала могут стоять на месте латинской буквы.
+
+    Линия ДКС в режиме `raw` шлёт латиницу **как есть**, а знакогенератор
+    читает коды `0x60…0x7E` как кириллицу (`chars.display_dks`): строчная
+    `c` приходит кодом 0x63 и показывается как «Ц», `o` — как «О», `n` —
+    как «Н».  Заглавная `C` остаётся латинской (код 0x43).  Поэтому на
+    месте латинской буквы терминал может показать и её саму (в любом
+    регистре), и кириллическую подмену из строки `chars.RUS7`.
+    """
+    out = set()
+    upper = ch.upper()
+    if len(upper) == 1 and upper.isascii() and upper.isalpha():
+        out.update((ch, upper, upper.lower()))
+        look = _HOMOGLYPH_OF.get(upper)
+        if look:
+            out.add(look)
+        code = ord(ch)
+        if 0x60 <= code < 0x7E:            # строка кириллицы знакогенератора
+            out.add(chars.RUS7[code - 0x60])
+    return ''.join(sorted(out))
+
+
+def _tolerant(pattern: str) -> str:
+    """Образец, допускающий кириллические подмены вместо латинских.
+
+    Свёртка «кириллица → латиница» для этого не годится: `Н` — это и
+    латинская `N`, и кириллическая `H`, и по одному знаку их не различить.
+    Поэтому каждая буква заменяется классом «эта буква, её регистры и все
+    знаки, которые терминал рисует на её месте», и образец принимает
+    любое из прочтений.  Escape-последовательности (`\\s`) переносятся
+    как есть.
+    """
+    out = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == '\\' and i + 1 < len(pattern):
+            out.append(pattern[i:i + 2])
+            i += 2
+            continue
+        if ch.isascii() and ch.isalpha():
+            out.append('[' + _lookalikes(ch) + ']')
+        else:
+            out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+#: Маркер линии ДКС в баннере.  Терпим к омоглифам: линия шлёт приветствие
+#: кодами КОИ-7 и переводит латиницу в заглавные, так что на экране это
+#: «CОNNЕCTED TO DKS».
+BANNER_DKS = re.compile(_tolerant(r'Connected\s+to\s+DKS'), re.IGNORECASE)
 
 
 @dataclass
@@ -287,10 +346,72 @@ def banner_text(data: bytes) -> str:
     return ''.join(out)
 
 
-#: Омоглифы знакогенератора: кириллица, которой на экране читается
-#: латинская буква.  Нужна, чтобы найти английские маркеры в баннере,
-#: пришедшем кодами КОИ-7.
-_HOMOGLYPHS = str.maketrans('АВЕКМНОРСТУХ', 'ABEKMHOPCTYX')
+#: Больше этого приветствие не растёт: за такой длиной это уже не
+#: заголовок соединения, а вывод ОС, и его надо показать терминалу.
+BANNER_MAX = 2048
+
+#: Начала служебных строк приветствия (по эталону 15ИЭ `BANNER_HEADS`).
+#: По ним баннер отличается от вывода ОС: если первая же строка не
+#: похожа на приветствие, данные идут в терминал как есть.
+BANNER_HEADS = ('connected', 'encoding', 'wru', 'prompt', 'from',
+                'sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat',
+                'tty device', 'break to')
+#: Те же начала, но терпимые к омоглифам: образцы, а не строки.
+_BANNER_HEADS_RE = tuple(re.compile(_tolerant(h), re.IGNORECASE)
+                         for h in BANNER_HEADS)
+
+
+def is_banner_line(text: str) -> bool:
+    """Похожа ли строка на строку приветствия линии."""
+    return any(r.match(text.strip()) for r in _BANNER_HEADS_RE)
+
+
+def banner_tail(buf: bytes) -> tuple[bytes, str]:
+    """Разделить накопленное на приветствие и хвост: `(хвост, судьба)`.
+
+    Судьба: ``'wait'`` — приветствие ещё идёт, ``'end'`` — кончилось,
+    ``'text'`` — это не приветствие вовсе, и всё накопленное идёт в
+    терминал.
+
+    Конец приветствия — строка с маркером ДКС либо пустая строка, за
+    которой идёт **не** служебная строка: на стенде приветствие разделено
+    пустыми строками внутри («Connected to the … line 3», пусто,
+    «Encoding is RAW»), и пустая строка сама по себе ни о чём не
+    говорит.  Первая не-служебная строка означает, что приветствия не
+    было вовсе.
+
+    Строки читаются как знаки терминала (`banner_text`), а образцы терпимы
+    к кириллическим подменам латиницы (`_tolerant`).
+    """
+    seen = False
+    lines: list[tuple[int, int]] = []          # (начало, конец) строк
+    i = 0
+    while True:
+        j = buf.find(b'\n', i)
+        lines.append((i, len(buf) if j < 0 else j + 1))
+        if j < 0:
+            break
+        i = j + 1
+
+    for n, (start, stop) in enumerate(lines):
+        text = banner_text(buf[start:stop]).strip()
+        if not text:
+            continue
+        if BANNER_DKS.search(text):
+            return buf[stop:], 'end'           # маркер ДКС — конец
+        if not is_banner_line(text):
+            return buf, 'text'                 # это вывод ОС
+        seen = True
+        # Пустая строка перед следующей служебной — разделитель внутри
+        # приветствия; перед выводом ОС — конец приветствия.
+        for m in range(n + 1, len(lines)):
+            nxt = banner_text(buf[lines[m][0]:lines[m][1]]).strip()
+            if not nxt:
+                continue
+            if not is_banner_line(nxt):
+                return buf[lines[m][0]:], 'end'
+            break
+    return buf, 'wait'
 
 
 def parse_greeting(data: bytes) -> LineInfo:
@@ -312,9 +433,7 @@ def parse_greeting(data: bytes) -> LineInfo:
         texts.append(data.decode('utf-8'))
     except UnicodeDecodeError:
         pass
-    koi7 = banner_text(data)
-    texts.append(koi7.translate(_HOMOGLYPHS))
-    texts.append(koi7)
+    texts.append(banner_text(data))
 
     for text in texts:
         if BANNER_DKS.search(text.upper()):
@@ -430,27 +549,35 @@ class DKSLink:
         if not data:
             return b''
         out = self._iac.feed(data) if self.strip_iac else data
-        self._grow_banner(out)
-        return out
+        return self._take_banner(out)
 
-    def _grow_banner(self, data: bytes) -> None:
-        """Дописать пришедшее в баннер и переразобрать его.
+    def _take_banner(self, data: bytes) -> bytes:
+        """Отделить приветствие линии от текста терминала.
 
-        Баннер приходит несколькими пакетами, а маркер «Connected to
-        DKS» — последней строкой: разбирать только первый пакет нельзя,
-        иначе линия ДКС объявлялась обычным tty телетайпа.  Баннер
-        считается законченным, когда за непустой строкой идёт пустая,
-        — как в эталоне 15ИЭ.
+        Приветствие — служебный заголовок соединения, а не вывод
+        терминала: на кадре ему не место, иначе верхние ряды занимает
+        «Connected to DKS» вместо ответа ОС Диспак.  Оно уходит целиком в
+        `greeting`, откуда его читает `parse_greeting` для строки
+        состояния, а терминал получает только то, что пришло после.
+
+        Баннер кончается пустой строкой после непустой либо строкой
+        «Connected to DKS» — на стенде за ней пустой строки не бывает.
+        Если приветствие так и не кончилось (это уже болтливость линии,
+        а не заголовок), данные отдаются терминалу как есть, чтобы не
+        потерять вывод ОС.
         """
-        if not self._banner_open or not data:
-            return
+        if not self._banner_open:
+            return data
         self.greeting += data
-        body = self.greeting.lstrip(b'\r\n \t').replace(b'\r', b'\n')
-        if b'\n\n' in body:              # за непустой строкой идёт пустая
-            self._banner_open = False
+        tail, fate = banner_tail(self.greeting)
         info = parse_greeting(self.greeting)
         if info.kind or info.terminal or info.wire:
             self.info = info
+        if fate == 'wait' and len(self.greeting) < BANNER_MAX:
+            return b''
+        self._banner_open = False
+        self.greeting = b''            # разобрано, больше не нужно
+        return tail if fate == 'end' else data
 
     def close(self) -> None:
         if self.sock is not None:

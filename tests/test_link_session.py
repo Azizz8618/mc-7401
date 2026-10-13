@@ -152,13 +152,17 @@ def koi7(text: str) -> bytes:
     """Текст → коды КОИ-7, как их шлёт линия ДКС в режиме `raw`.
 
     Русские буквы берутся из строки `0x60…0x7E` знакогенератора в
-    порядке `chars.RUS7` (регистронезависимо), латиница — свои коды.
+    порядке `chars.RUS7` (регистронезависимо), латиница — свои коды, но
+    **заглавными**: линия переводит латиницу в верхний регистр, и строчные
+    коды на самом деле оказываются русскими знаками.
     """
     out = bytearray()
     for ch in text:
         ru = chars.RUS7.find(ch.upper())
         if ru >= 0:
             out.append(0x60 + ru)
+        elif ch.isalpha() and ch.isascii():
+            out.append(ord(ch.upper()))
         else:
             out.append(ord(ch))
     return bytes(out)
@@ -194,7 +198,7 @@ def test_link_keeps_parsing_banner_arriving_in_pieces():
     """
     link = DKSLink(host='h', ports='4202')
     link.sock = FakeConn([b''])
-    link.greeting = koi7('ENCODING IS RAW\r\nTTY DEVICE, LINE 3\r\n\r\n')
+    link.greeting = koi7('ENCODING IS RAW\r\nTTY DEVICE, LINE 3\r\n')
     link.info = parse_greeting(link.greeting)
     assert link.info.kind != 'ДКС'
 
@@ -205,13 +209,73 @@ def test_link_keeps_parsing_banner_arriving_in_pieces():
     assert link.info.wire == 'RAW'
 
 
-def test_link_stops_parsing_banner_after_it_ends():
-    """Данные ОС после баннера не переразбираются как баннер."""
+def test_banner_never_reaches_the_frame():
+    """Приветствие линии не попадает на кадр терминала.
+
+    «Connected to DKS» — служебный заголовок соединения, а не вывод
+    терминала: на кадре он занимал верхние ряды вместо ответа ОС Диспак.
+    Он уходит в `greeting` (оттуда его читает разбор для строки
+    состояния), а терминал получает только то, что после.
+    """
     link = DKSLink(host='h', ports='4202')
-    link._grow_banner(koi7('ENCODING IS RAW\r\nTTY DEVICE, LINE 3\r\n\r\n'))
+    link.sock = FakeConn([koi7('ENCODING IS RAW\r\n'
+                               'TTY DEVICE, LINE 3\r\n'
+                               'Connected to DKS\r\n')])
+    assert link.recv() == b'', 'приветствие не должно доходить до терминала'
+    assert link.info.kind == 'ДКС', 'но должно разбираться для строки состояния'
+
+    # Дальше идёт уже вывод ОС — он терминалу и принадлежит.
+    prompt = b'\x1b' + 'ЭВМ-3,Т020'.encode('utf-8') + b'\r\n'
+    link.sock = FakeConn([prompt])
+    assert link.recv() == prompt, 'вывод ОС должен доходить целиком'
+
+
+def test_banner_lookalikes_are_still_banner():
+    """Маркер ДКС приходит омоглифами — он всё равно конец приветствия.
+
+    Линия шлёт коды КОИ-7, и часть букв «Connected to DKS» приходит
+    кириллическими знаками, читающимися так же: «CОNNЕCTED TO DKS».
+    Строка не начинается ни с одного признанного начала, и без свёртки
+    омоглифов приветствие ушло бы в терминал целиком.
+    """
+    link = DKSLink(host='h', ports='4202')
+    # «CОNNЕCTED TO DKS» — О и Е кириллические, остальное латинское.
+    look = 'CОNNЕCTED TO DKS'
+    link.sock = FakeConn([koi7(look + '\r\n')])
+    assert link.recv() == b'', 'приветствие с омоглифами не должно попасть в кадр'
+
+
+def test_os_output_without_banner_is_not_swallowed():
+    """Если приветствия нет, данные ОС идут в терминал сразу.
+
+    Баннер отбрасывается по его собственным строкам, а не «пока не
+    кончится»: иначе линия без приветствия молчала бы до лимита.
+    """
+    link = DKSLink(host='h', ports='4202')
+    link.sock = FakeConn([DRAW])
+    assert link.recv() == DRAW
+
+
+def test_banner_with_blank_line_is_taken():
+    """Приветствие, кончающееся пустой строкой, снимается целиком."""
+    link = DKSLink(host='h', ports='4202')
+    link.sock = FakeConn([koi7('Connected to the tty\r\n\r\nЭВМ-3,Т020\r\n')])
+    assert link.recv() == koi7('ЭВМ-3,Т020\r\n')
+
+
+def test_link_stops_parsing_banner_after_it_ends():
+    """Данные ОС после баннера идут в терминал, а не в приветствие.
+
+    Пустая строка сама по себе приветствие не завершает — на стенде оно
+    разделено пустыми строками внутри.  Завершает его первая строка, которая
+    не похожа на служебную: это уже вывод ОС.
+    """
+    link = DKSLink(host='h', ports='4202')
+    link._take_banner(koi7('ENCODING IS RAW\r\nTTY DEVICE, LINE 3\r\n\r\n'))
+    assert link._banner_open, 'пустая строка внутри приветствия не кончает его'
+    link._take_banner(koi7('ЭВМ-3,Т020\r\n'))
     assert not link._banner_open
-    link._grow_banner(koi7('Connected to DKS\r\n'))
-    assert link._banner_open is False
+    assert link._take_banner(b'hello') == b'hello'
 
 
 def test_empty_banner_gives_nothing():
