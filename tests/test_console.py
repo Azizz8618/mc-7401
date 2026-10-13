@@ -237,3 +237,34 @@ def test_erase_cell_clears_only_cell():
     con.goto(0, 0)
     con.erase_cell()
     assert fb.count_set() == 0
+
+
+# ── разбор кадра обратно в текст ────────────────────────────────────────────
+
+def test_read_row_knows_every_sign_of_the_rom():
+    """Разбор знает все знаки ПЗУ, а не только буквы и цифры.
+
+    Раньше список знаков для разбора был выписан руками и знал 60 знаков
+    из 96: `*`, `#`, `=`, `%` в него не попали, и на снимке экрана они
+    выходили пробелами — то есть разбор терял ровно те знаки, ради
+    которых его и делают.
+    """
+    from mc7401.console import ALPHABET, glyph_art
+
+    for ch in '*#=%!@^~&?_|/\\<>[]{}':
+        assert glyph_art(ch) is not None, f'нет растра для {ch!r}'
+        assert ch in ALPHABET, f'{ch!r} не разбирается'
+
+
+def test_read_row_round_trip_for_signs_and_letters():
+    """Знак, нарисованный в кадре, читается обратно тем же знаком."""
+    from mc7401.console import CELL_H, ROWS, Console, read_row
+    from mc7401.framebuffer import Framebuffer
+
+    text = '*#=%!@^~ АбВгДд 123 Zz Яя'
+    fb = Framebuffer()
+    con = Console(fb)
+    for ch in text:
+        con.put_char(ch)
+    got = read_row(fb, (ROWS - 1) * CELL_H)
+    assert got[:len(text)] == text, f'прочитано {got[:len(text)]!r}'

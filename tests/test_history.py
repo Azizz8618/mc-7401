@@ -260,7 +260,7 @@ def test_wheel_returns_to_the_frame(monkeypatch):
 
 def test_footer_shows_where_the_window_is(monkeypatch):
     """Ячейка `ИСТ=` пуста у живого кадра и `-N` при листании назад."""
-    from mc7401.panel import Status, state_rows
+    from mc7401.panel import EMPTY, Status, state_rows
 
     def ist(value: str) -> str:
         cells = state_rows(Status(history=value))
@@ -268,8 +268,9 @@ def test_footer_shows_where_the_window_is(monkeypatch):
         assert label[1] == 'label'
         return val[0]
 
-    assert ist('') == '—', 'у живого кадра ИСТ должен быть пуст'
+    assert ist('') == EMPTY, 'у живого кадра ИСТ должен быть пуст'
     assert ist('-137') == '-137'
+    assert '-' in EMPTY, 'у пустой ячейки должен быть знак-заполнитель'
 
     win = make_window(monkeypatch)
     fill(win.console, 80)

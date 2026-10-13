@@ -47,6 +47,13 @@ MIN_COLW = 12
 #: Черта, отбивающая состояния от легенды.
 RULE = '\x00rule'
 
+#: Знак пустого значения в подвале.  Именно дефис, а не тире: в ПЗУ
+#: знакогенератора СИМ (`chars.glyph_matrix`, дамп КР556РТ5) тире нет, и
+#: ячейка с ним рисовалась пустой — в подвале не хватало знака там, где
+#: ничего и не должно быть, и это выглядело как обрыв ячейки.  Проверка
+#: «у подвала нет знаков без растра» — `tests/test_sym.py`.
+EMPTY = '-'
+
 
 @dataclass(frozen=True)
 class Plan:
@@ -139,7 +146,7 @@ class Status:
     #: Имя набора знаков: `'n2'` | `'koi8r'`.
     charset: str = 'n2'
     #: Строка состояния линии: имя источника или `адрес:порт`.
-    line: str = '—'
+    line: str = EMPTY
     #: Тип линии из баннера: «ДКС» или «КВУ».  **Не выдумывается**: если
     #: баннер не разобран, строка состояния показывает «ПРОВЕРЬ ЛИНИЮ!»,
     #: а не «КВУ» — иначе линия ДКС выглядит как телетайп.
@@ -237,7 +244,7 @@ def status_line(st: Status, *, now: Optional[datetime] = None,
 
 
 def _short(text: str, limit: int = 24) -> str:
-    text = text or '—'
+    text = text or EMPTY
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
@@ -272,7 +279,7 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
         cell('РЖМ=', 'СЭВМ' if st.mode == 'host' else 'АВТО',
              'on' if st.mode == 'host' else 'local'),
         cell('НАБ=', 'КОИ8' if st.charset == 'koi8r' else 'Н2'),
-        cell('ЛИН=', (st.link_kind or 'НЕТ') if st.banner else '—',
+        cell('ЛИН=', (st.link_kind or 'НЕТ') if st.banner else EMPTY,
              'state' if st.banner else 'err'),
         cell('ЭХО=', 'ВКЛ' if st.echo else 'ВЫКЛ',
              'on' if st.echo else 'off'),
@@ -282,20 +289,20 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
         cell('ПЕРО=', PEN_MODES.get(st.pen_mode, 'РИС') if st.pen else 'ВЫК',
              'on' if st.pen else 'off'),
         cell('ИНСТ=', PEN_TOOLS.get(st.pen_tool, st.pen_tool)
-             if st.pen and not st.pen_mode else '—'),
-        cell('ОТМ=', str(st.undo) if st.undo else ('—' if st.undo_ready
+             if st.pen and not st.pen_mode else EMPTY),
+        cell('ОТМ=', str(st.undo) if st.undo else (EMPTY if st.undo_ready
                                                  else 'НЕТ'),
              'on' if st.undo else 'off'),
         # Масштаб выводится из размера окна и бывает дробным, поэтому
         # без префикса «1:» — иначе ячейка подвала обрезает значение.
         cell('МАШ=', f'{float(st.scale):.1f}'.rstrip('0').rstrip('.')),
-        cell('БУФ=', str(st.buffer) if st.buffer else '—'),
+        cell('БУФ=', str(st.buffer) if st.buffer else EMPTY),
         # Положение окна в истории выдачи.  Пока кадр живой, ячейка пустая
         # («—»): листание назад — редкое состояние, а лишняя метка в
         # подвале стоила бы ряда.  Когда окно отошло назад, видно, что
         # перед глазами не текущий кадр, иначе выдача с ЭВМ выглядит как
         # зависшая.
-        cell('ИСТ=', st.history or '—', 'on' if st.history else 'off'),
+        cell('ИСТ=', st.history or EMPTY, 'on' if st.history else 'off'),
         # ПОСЛ — широкая ячейка: значение («≡144 'd'», «УПР-q») длиннее
         # любой колонки, и раньше метка и значение слипались в одно
         # слово — знака «=» не было, а лимит считался от ширины колонки,
