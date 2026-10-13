@@ -1,5 +1,5 @@
 """
-pen.py — световое перо и его эмуляция мышью.
+pen.py — световое перо, его эмуляция мышью и функции рисования.
 
 Световое перо — указатель, которым оператор работает прямо по экрану
 graphic-дисплея: нажатие даёт событие в координатах кадра. На реальном
@@ -13,6 +13,20 @@ graphic-дисплея: нажатие даёт событие в координ
 связи. Кодирование на линии задаётся здесь и помечено как
 `PROVISIONAL` — в имеющихся источниках его нет.
 
+ФУНКЦИИ РИСОВАНИЯ (инструменты пера, клавиша F3 перебирает по кругу).
+Смысл каждого взят из системы команд самого МС 7401: у терминала есть
+перо рисующее (`+`), инвертирующее (`≠`) и стирающее (`*`), а графика
+строится командами `4`/`5` (перемещение) и `7`/`8` (линия):
+
+    штрих      рисующее перо: протяжка с нажатой кнопкой ведёт линию —
+               как команда `7`, но от руки;
+    стирание   стирающее перо: то же, но вычитанием (`*`);
+    точка      одиночная точка в точке нажатия (`>` с радиусом 0);
+    инверсия   инвертирующее перо: точка переключается (`≠`).
+
+Инструменты перебираются по F3, показываются в подвале («ПЕРО=ВКЛ штрих»)
+и запоминаются в сеансе, а не живут во временной переменной фронтенда.
+
     >>> pen = LightPen()
     >>> pen.move_cell(40, 12, cols=80, rows=24)
     (200, 200)
@@ -24,6 +38,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .constants import PEN_ERASE, PEN_OR, PEN_XOR
 from .framebuffer import Framebuffer
 
 #: Последовательность SGR-мыши: `\x1b[<b;x;ym` / `\x1b[<b;x;yM`.
@@ -33,6 +48,19 @@ _MOUSE_RE = re.compile(r'^\x1b\[<(\d+);(\d+);(\d+)([Mm])$')
 #: Кодирование события пера на линии связи. ПРОВИЗОРИАЛЬНОЕ: в
 #: источниках не найдено; заменяется, как только появится описание.
 PEN_PREFIX = '\x1b['
+
+#: Инструменты пера: подпись в подвале → (клавиша терминала, рисует штрих).
+#: `PEN_ERASE` и `PEN_XOR` — те же перо, что и у команд `*` и `≠`.
+TOOLS: dict[str, tuple[str, bool]] = {
+    'штрих': (PEN_OR, True),
+    'стирание': (PEN_ERASE, True),
+    'точка': (PEN_OR, False),
+    'инверсия': (PEN_XOR, True),
+}
+#: Порядок перебора клавишей F3.
+TOOL_ORDER = ('штрих', 'точка', 'стирание', 'инверсия')
+#: Инструмент по умолчанию.
+DEFAULT_TOOL = TOOL_ORDER[0]
 
 
 @dataclass
@@ -72,6 +100,22 @@ class LightPen:
         #: заполняется вручную.
         self.events: list[PenEvent] = []
         self.enabled = False
+        #: Инструмент рисования — см. `TOOLS`, перебирается клавишей F3.
+        self.tool = DEFAULT_TOOL
+
+    # ── инструмент ──────────────────────────────────────────────────────────
+
+    @property
+    def pen_kind(self) -> str:
+        """Перо терминала, которым рисует выбранный инструмент."""
+        return TOOLS.get(self.tool, (PEN_OR, True))[0]
+
+    def next_tool(self) -> str:
+        """Перебрать инструмент по кругу; вернуть новый."""
+        i = TOOL_ORDER.index(self.tool) \
+            if self.tool in TOOL_ORDER else -1
+        self.tool = TOOL_ORDER[(i + 1) % len(TOOL_ORDER)]
+        return self.tool
 
     # ── включение / выключение ──────────────────────────────────────────────
 
@@ -145,23 +189,51 @@ class LightPen:
     # ── рисование ───────────────────────────────────────────────────────────
 
     def stroke(self, fb: Framebuffer) -> bool:
-        """Продлить штрих от предыдущей позиции к текущей.
+        """Отразить положение пера на кадре выбранным инструментом.
 
-        Так работает перо на векторном экране: при протяжке с нажатой
-        кнопкой рисуется непрерывная линия.
+        Вызывается на каждой перерисовке, поэтому инструмент обязан быть
+        идемпотентным относительно `_last`: без нажатой кнопки штрих не
+        продлевается (только запоминается точка отрыва), с нажатой —
+        рисуется линия от предыдущей позиции к текущей.  Инструмент
+        «точка» вместо линии ставит одиночную точку.
         """
-        if not self.down or self._last is None:
+        kind, draws_line = TOOLS.get(self.tool, (PEN_OR, True))
+        if not self.down:
             self._last = (self.x, self.y)
             return False
+        if self._last is None:
+            self._last = (self.x, self.y)
         x0, y0 = self._last
         dx, dy = self.x - x0, self.y - y0
         steps = max(abs(dx), abs(dy))
+        if not draws_line:
+            fb.apply(self.x, self.y, kind)
+            self._last = (self.x, self.y)
+            return True
         if steps == 0:
             return False
         for i in range(1, steps + 1):
-            fb.point(x0 + round(dx * i / steps), y0 + round(dy * i / steps))
+            fb.apply(x0 + round(dx * i / steps), y0 + round(dy * i / steps),
+                     kind)
         self._last = (self.x, self.y)
         return True
+
+    def dot(self, fb: Framebuffer, *, pen: Optional[str] = None) -> None:
+        """Одиночная точка пером `pen` (по умолчанию — инструментом)."""
+        fb.apply(self.x, self.y, pen or self.pen_kind)
+
+    def line_to(self, fb: Framebuffer, x: int, y: int,
+                *, pen: Optional[str] = None) -> None:
+        """Провести линию от текущей точки пера к `(x, y)` — команда `7`."""
+        kind = pen or self.pen_kind
+        x0, y0 = self.x, self.y
+        steps = max(abs(x - x0), abs(y - y0))
+        for i in range(steps + 1):
+            fb.apply(x0 + round((x - x0) * i / max(1, steps)),
+                     y0 + round((y - y0) * i / max(1, steps)), kind)
+        self.x = max(0, min(self.fb.width - 1, x))
+        self.y = max(0, min(self.fb.height - 1, y))
+        self._last = (self.x, self.y)
 
     def crosshair(self, fb: Framebuffer, size: int = 6) -> None:
         """Нарисовать перекрестье в текущей точке (обзор поверх картинки)."""
@@ -173,4 +245,5 @@ class LightPen:
             fb.point(self.x, self.y + size + 1)
 
 
-__all__ = ['PenEvent', 'LightPen', 'PEN_PREFIX']
+__all__ = ['PenEvent', 'LightPen', 'PEN_PREFIX', 'TOOLS', 'TOOL_ORDER',
+           'DEFAULT_TOOL']

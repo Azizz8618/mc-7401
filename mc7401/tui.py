@@ -23,28 +23,33 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
+import zlib
 from pathlib import Path
 from typing import Callable, Optional
 
-from datetime import datetime
-
-from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
 from .emulator import TerminalEmulator
+from . import panel
 from . import startup
 from .config import Config
 from .pen import LightPen
+from .link import EchoStrip
 from .session import MODE_HOST, Session
 
-#: Название модели терминала — показывается в заголовке.
-#: Гид-символ ОС Диспак (ETX): после подключения к линии ДКС
-#: его надо передать, иначе приглашения «ЭВМ-3,ТNNN» не будет.
-ETX = 0o003
-#: Символ конца строки, который посылается терминалом по линии ДКС.
-#: Именно он инициирует сеанс: после `LF` ОС Диспак отвечает
-#: приглашением «ЭВМ-3,ТNNN» (проверено на линии 4203).
+# ── коды линии ДКС ──────────────────────────────────────────────────────────
+# По эталону 15ИЭ (`ie15emu/charset.py::to_line`, ветка dks) и живой
+# машине: `dks_line_char` завершает строку по **ПР (CR)**, а ETX для
+# линии — просто знак (команда с ETX не выполняется).
+
+#: Возврат каретки (ПР): им ОС Диспак завершает строку ввода; после
+#: пустой строки (ПРПС) ОС отвечает приглашением «ЭВМ-3,ТNNN».
+CR = 0o015
+#: Перевод строки (ПС); пара ПР ПС сворачивается в один ПР.
 LF = 0o012
+#: Гид-символ ОС Диспак (ETX) — для линии ДКС просто знак.
+ETX = 0o003
 
 #: Приветствие, которое выдаёт линия ДКС при подключении терминала
 #: (её выдаёт обвязка стенда — самой ОС Диспак это не свойственно):
@@ -53,23 +58,16 @@ GREETING_EN = 'Connected to the'
 
 #: Конец строки, который терминал передаёт на ЭВМ.  Переопределяется
 #: настройкой `[line] eol`.
-DEFAULT_EOL = ETX
-#: Возврат каретки — им ОС Диспак и терминалы отделяют строку.
-CR = 0o015
-
-MODEL = 'Электроника МС 7401'
+DEFAULT_EOL = CR
 
 #: Линия ДКС, к которой подключается эмулятор по умолчанию.
 #: ЭВМ слушает порты 4202-4223 (`set ttyN dks,raw` в SIMH).
 DEFAULT_ENDPOINT = '127.0.0.1:4202-4223'
 
 
-def title_line() -> str:
-    """Заголовок: модель терминала, разрешение, время."""
-    now = datetime.now().strftime('%d.%m.%Y %H:%M:%S')
-    return (f'  {MODEL}  {SCREEN_WIDTH}×{SCREEN_HEIGHT}  '
-            f'{now}')
 from .reader import CommandStreamReader, EventKind
+from .console import GLYPH_SCALE, set_glyph_scale
+from .panel import Diagnostics, Status
 from .screen import ScreenRenderer, Viewport
 from .constants import VK
 from .term import (ALT_SCREEN_OFF, ALT_SCREEN_ON, BOLD, CLEAR, ERASE_EOL,
@@ -301,6 +299,16 @@ class LiveDriver(Driver):
 
     name = 'ДКС'
 
+    #: Задержка перед первым запросом приглашения ОС: Э-60
+    #: регистрируется ОС не сразу и ранние строки проглатывает
+    #: (эталон 15ИЭ: `agent.py` — `drain()`, затем `key("KEY_ENTER")`,
+    #: «Э-60 регистрируется ОС не сразу» — `session.py`).
+    PROMPT_DELAY = 1.5
+    #: Повторы запроса приглашения, если ответа нет.
+    PROMPT_TRIES = 5
+    #: Пауза между повторами, с.
+    PROMPT_RETRY = 3.0
+
     def __init__(self, endpoint: str) -> None:
         from .link import DKSLink, LinkError, spec_hint, split_endpoint
         host, ports = split_endpoint(endpoint)
@@ -315,14 +323,15 @@ class LiveDriver(Driver):
         # Приветствие линии показываем в окне: по нему видно, какая
         # линия досталась и в каком режиме она работает.
         self.greeting = self.link.greeting
-        # Символ конца строки: после подключения его нужно передать,
-        # иначе ОС Диспак не отвечает приглашением «ЭВМ-3,ТNNN».
-        # Гид `ETX` посылаем тоже — так поступает
-        # `simh/BESM6/scripts/dks_tty.py`.
-        try:
-            self.link.send(bytes((LF, ETX)))
-        except OSError:
-            pass
+        #: Эхо линии: Э-60 всегда эхит отданные знаки — срезаем свой
+        #: эхо-ответ из потока (иначе набранное показывается дважды,
+        #: а пароль виден в эхе машины).
+        self._echo = EchoStrip()
+        #: Запрос приглашения ОС (ПРПС): повторяется, пока машина
+        #: не ответит.
+        self._prompt_at = time.monotonic() + self.PROMPT_DELAY
+        self._prompt_tries = 0
+        self._prompted = False
 
     def _diagnose(self, exc: Exception) -> str:
         """Человекочитаемое объяснение, почему линия не открылась."""
@@ -358,12 +367,41 @@ class LiveDriver(Driver):
 
     def poll(self, timeout: float) -> bytes:
         try:
-            return self.link.recv()
+            data = self.link.recv(timeout=timeout)
         except (TimeoutError, OSError):
-            return b''
+            data = b''
+        data = self._echo.strip(data)
+        # Ответом считается любой приход данных после нашего запроса
+        # (баннер линии приходит до него и в счёт не идёт).
+        if data and self._prompt_tries:
+            self._prompted = True
+        if not self._prompted:
+            # Запрос приглашения живёт здесь же: recv на тихой линии
+            # отбрасывается таймаутом, и без этого до него не дошло бы.
+            self._request_prompt()
+        return data
+
+    def _request_prompt(self) -> None:
+        """Запросить приглашение ОС — ПРПС (пустая строка), как в 15ИЭ.
+
+        ОС Диспак отвечает на ПРПС приглашением «ЭВМ-3,ТNNN»; так же
+        поступает эталон (`ie15emu/agent.py`: `key("KEY_ENTER")`).
+        Э-60 регистрируется ОС не сразу и ранние строки проглатывает
+        (`ie15emu/session.py`), поэтому запрос повторяется с паузой,
+        пока машина не ответит.  Если ответа так и нет — оператор
+        жмёт ПРПС (Enter) сам.
+        """
+        now = time.monotonic()
+        if self._prompt_tries >= self.PROMPT_TRIES or now < self._prompt_at:
+            return
+        self._prompt_tries += 1
+        self._prompt_at = now + self.PROMPT_RETRY
+        self.send_keys('\r')                 # ПРПС = ПР = конец строки
 
     def send_keys(self, text: str) -> None:
-        self.link.send(text.encode('koi8-r', errors='replace'))
+        data = text.encode('koi8-r', errors='replace')
+        self._echo.sent(data)
+        self.link.send(data)
 
     def close(self) -> None:
         self.link.close()
@@ -438,7 +476,19 @@ class TerminalApp:
         self.grid = self.config.grid or grid
         self.graphics = self.config.graphics or graphics
         self.eol = getattr(self.config, 'eol', DEFAULT_EOL)
+        #: Размер знака текстового слоя кадра — `[terminal] glyph`.
+        set_glyph_scale(getattr(self.config, 'glyph', GLYPH_SCALE))
+        #: Диагностика — журнал сообщений, последнее идёт под подвалом.
+        self.diag = Diagnostics()
+        #: Ряды-легенды подвала (`[terminal] help`, как `--no-help` в 15ИЭ).
+        self.show_help = getattr(self.config, 'help', True)
         self._splash_fb_cache = None
+        #: ASCII-арт заставки — по ключу (картинка, высота); иначе он
+        #: разбирался заново из потока команд на каждом кадре.
+        self._splash_key = None
+        self._splash_art: list = []
+        #: Подпись выгруженной картинки (кэш протокола графики).
+        self._gfx_key = None
         #: Самый наполненный кадр (программа чистит экран в конце).
         self._best_fb = None
         self._best_n = 0
@@ -446,8 +496,13 @@ class TerminalApp:
         self._history: list = []
         #: Нажат ли `Ctrl`: служебные клавиши эмулятора — только с ним.
         self.ctrl = False
-        #: Для какого кадра окно просмотра уже подогнано.
+        #: Для какого кадра и при какой геометрии окна подгонка уже
+        #: выполнена: `(кадр, (столбцы, ряды))`.  Смена любой части означает,
+        #: что параметры окна изменились и кадр надо вписать заново.
         self._fitted_for = None
+        #: Сколько рядов окна над кадром (заголовок и текст ЭВМ): ряды
+        #: мыши приходят от верха окна, а перо считает их от кадра.
+        self._body_offset = 0
         #: Протокол графики запрошен, но терминал не ответил.
         self._gfx_failed = False
         #: Приветствие линии ДКС — видно, какая линия досталась.
@@ -462,6 +517,9 @@ class TerminalApp:
         self._got_data = False
         #: Последняя нажатая клавиша — строка «ПОСЛ:» подвала.
         self.last_key = ''
+        #: Эхо набираемого: то, что ввёл оператор, видно на экране
+        #: (клавиша ЭХО снимает вывод — чтобы не печатать пароли).
+        self.echo_buf = ''
         #: Заставка закрыта ли? по умолчанию показывается.
         self.splash = True
         self._connect_note = ''
@@ -531,11 +589,22 @@ class TerminalApp:
         на новую строку и прокручивает экран.
         """
         cols, trows = terminal_size()
-        n = self.PANEL_ROWS + (1 if self.config.title else 0)
+        n = self.panel_rows(cols) + (1 if self.config.title else 0)
         return cols, max(1, trows - n)
 
-    #: Подвал: три строки состояния, черта и пять справочных рядов.
-    PANEL_ROWS = 9
+    #: Минимальное число рядов подвала — когда легенда убрана.
+    PANEL_ROWS = 5
+
+    def panel_rows(self, cols: int) -> int:
+        """Сколько рядов займёт подвал в окне шириной `cols`.
+
+        Высота подвала зависит от ширины окна: ячейки раскладываются по
+        плану `panel`, и в узком окне их в ряд помещается меньше.  Раньше
+        здесь стояла константа «9 рядов» — в узком окне подвал уезжал за
+        нижнюю кромку, а в широком оставлял пустоту.
+        """
+        rows = panel.footer(self.status(), width=cols, help_=self.show_help)
+        return len(rows) + (1 if self.diag.last else 0)
 
     def draw(self) -> None:
         """Вывести кадр целиком: каждый ряд — на своё место.
@@ -550,12 +619,17 @@ class TerminalApp:
         out = [HIDE_CURSOR]
         row = 1
         if self.config.title:
-            out.append(at(row) + ERASE_EOL + title_line())
+            # Строка состояния линии — как на 15ИЭ: тип линии, ЭВМ,
+            # терминал, канал, режим, время.  Без баннера линии в ней
+            # горит «ПРОВЕРЬ ЛИНИЮ!».
+            out.append(at(row) + ERASE_EOL + self._status_line(cols))
             row += 1
         # Графика протоколом терминала занимает свои строки, текст идёт
         # под ней — то и другое в одном окне.
         gfx_h = self._paint_gfx(row - 1, cols, rows)
         if gfx_h:
+            # Кадр протоколом kitty идёт первым же рядом под заголовком.
+            self._body_offset = 0
             for blank in range(gfx_h):
                 out.append(at(row) + ERASE_EOL)
                 row += 1
@@ -623,12 +697,15 @@ class TerminalApp:
         fb = self._visible_fb() if has_fb else None
         if fb is not None and rest > 0:
             vp = self.renderer.vp
-            # Вписываем кадр в окно, когда он сменился: первый кадр
-            # приходит уже после запуска, и без этого виден только
-            # угол (масштаб остаётся от пустого экрана).
-            if self._fitted_for is not fb:
+            # Вписываем кадр в окно, когда он сменился или изменились
+            # параметры окна (размер терминала, число рядов под подвалом):
+            # первый кадр приходит уже после запуска, и без этого виден
+            # только угол (масштаб остаётся от пустого экрана).  Кадр
+            # встаёт в верхний левый угол — как на 15ИЭ, а не по центру.
+            geom = (cols, rest)
+            if self._fitted_for != (fb, geom):
                 vp.fit(fb, cols, rest)
-                self._fitted_for = fb
+                self._fitted_for = (fb, geom)
             else:
                 vp.clamp(fb, cols, rest)
             if self.pen.enabled:
@@ -639,6 +716,9 @@ class TerminalApp:
                 body = self._overlay_grid(body, cols, rest)
             if self.pen.enabled:
                 body = self._overlay_pen(body, cols, rest)
+            # Кадр начинается после текстовых строк — запоминаем, сколько
+            # их, чтобы пересчитывать ряды мыши от начала кадра.
+            self._body_offset = len(lines)
             lines.extend(body.split('\n'))
         while len(lines) < rows:
             lines.append('')
@@ -692,6 +772,16 @@ class TerminalApp:
             if b'\x1b\\' in buf:
                 break
         self.gfx.apply_response(buf.decode('latin-1'))
+        # Нажатия, попавшие в окно пробы, не должны теряться: всё, что не
+        # ответ протокола графики, возвращается в буфер ввода.
+        import re as _re
+        spans = _re.findall(rb'\x1b_G.*?\x1b\\', buf, _re.DOTALL)
+        rest = buf
+        for span in spans:
+            rest = rest.replace(span, b'')
+        if rest:
+            from .term import push_input
+            push_input(rest)
         if not self.gfx.active:
             self.gfx = None
             # Молча переходить на псевдографику нельзя: оператор будет
@@ -708,7 +798,10 @@ class TerminalApp:
         """Показать кадр протоколом графики терминала.
 
         Возвращает число занятых знакомест по вертикали; под ними остаются
-        строки для текста — графика и текст видны в одном окне.
+        строки для текста — графика и текст видны в одном окне.  Картинка
+        выгружается только при изменении кадра или геометрии: кодирование
+        PNG и передача APC — самое дорогое в отрисовке, и без кэша набор
+        клавиш был очень медленным.
         """
         if self.gfx is None or not self.gfx.active:
             return 0
@@ -726,8 +819,12 @@ class TerminalApp:
         height = min(need_rows, rows)
         if height < 1:
             return 0
-        self.gfx.blit(fb, row=row, col=0, cols=need_cols, rows=height,
-                      force=True)
+        key = (zlib.crc32(bytes(fb._bits)), row, cols, rows,
+               need_cols, height)
+        if key != self._gfx_key:
+            self.gfx.blit(fb, row=row, col=0, cols=need_cols, rows=height,
+                          force=True)
+            self._gfx_key = key
         return height
 
     def _display_fb(self):
@@ -778,7 +875,11 @@ class TerminalApp:
             cur.append(chars.display_dks(code))
         if cur:
             out.append(''.join(cur))
-        return [ln.rstrip() for ln in out if ln.strip()]
+        out = [ln.rstrip() for ln in out if ln.strip()]
+        # Эхо оператора: набранное видно на экране, пустые строки
+        # сохраняются — это переводы строки.
+        out += [ln.rstrip() for ln in self.echo_buf.splitlines()]
+        return out
 
     def _decode_bytes(self, data) -> list:
         """Разделить поток на куски: готовый текст и коды знаков.
@@ -849,7 +950,12 @@ class TerminalApp:
         lines = body.split('\n')
         vp = self.renderer.vp
         col = (self.pen.x - vp.x) // vp.scale
-        row = (self.pen.y - vp.y) // (vp.scale * 2)
+        # `pen.y` — координата кадра «Y вверх», `vp.y` — смещение сверху:
+        # Y переворачивается, как в `screen.py`, иначе перо зеркалилось
+        # по вертикали.
+        fb = self.renderer.fb
+        height = fb.height if fb is not None else self.emu.fb.height
+        row = (height - 1 - self.pen.y - vp.y) // (vp.scale * 2)
         if 0 <= row < len(lines) and 0 <= col < cols:
             ch = lines[row][col]
             if ch not in ('', ' '):
@@ -872,49 +978,78 @@ class TerminalApp:
 
     # ── подвал (как в 15ИЭ-00-013) ──────────────────────────────────
 
-    #: Ширина колонки подвала: 4��олонки по 17 знаков и разделители
-    #: « | » — разделители стоят на одних позициях во всех рядах.
-    COL = 17
+    def status(self) -> Status:
+        """Состояние для строки состояния и подвала.
 
-    def _row(self, *fields) -> str:
-        return ' | '.join(f.ljust(self.COL) for f in fields).rstrip()
+        Тот же `Status`, что у графического окна: набор ячеек один,
+        различается только вывод (здесь — escape-последовательности).
+        """
+        ses = self.session
+        shown = self._visible_fb()
+        line, channel, banner, kind, machine, terminal, wire = \
+            self._line_info()
+        return Status(
+            mode=ses.mode,
+            charset=ses.charset_set,
+            line=line,
+            link_kind=kind,
+            banner=banner,
+            machine=machine,
+            terminal=terminal,
+            wire=wire,
+            channel=channel,
+            echo=ses.echo,
+            pen=self.pen.enabled,
+            pen_tool=self.pen.tool,
+            buffer=len(ses.buffer),
+            grid=self.grid,
+            scale=self.renderer.vp.scale,
+            points=shown.count_set() if shown else 0,
+            last_key=self.last_key,
+            input_line=self.input_line,
+            cursor='0,0',
+            graphics=('протокол' if self.gfx and self.gfx.active
+                      else 'псевдографика'),
+        )
+
+    def _line_info(self):
+        """Строка линии, канал, баннер, тип линии, ЭВМ, терминал, режим."""
+        link = getattr(self.driver, 'link', None)
+        info = getattr(link, 'info', None)
+        kind = info.kind if info else ''
+        machine = info.machine if info else 0
+        terminal = info.terminal if info else 0
+        wire = info.wire if info else ''
+        banner = bool(info.seen) if info else False
+        greeting = getattr(self.driver, 'greeting', b'')
+        banner = banner or bool(greeting)
+        port = getattr(link, 'port', None)
+        return (self._link_state(), str(port) if port else '', banner,
+                kind, machine, terminal, wire)
+
+    def _status_line(self, cols: int) -> str:
+        """Верхняя строка состояния линии — над кадром, вне его.
+
+        Ячейки из `panel`, как в подвале и как на 15ИЭ; при нехватке
+        места строка обрезается по ширине окна.
+        """
+        cells = panel.status_line(self.status())
+        text, _ = panel.render_spans(cells)
+        return text[:cols] if len(text) > cols else text
 
     def _service_panel(self, cols: int) -> list:
-        """Сегмент состояния, черта и справочные ряды — как в 15ИЭ."""
-        from .chars import SET_LABELS
-        ses = self.session
-        host = ses.mode == 'host'
-        lay = ('ВЫКЛ' if not ses.layout else
-               ('ФОН' if ses.layout == 'phonetic' else 'ПОЗ'))
-        buf = str(len(ses.buffer)) if ses.buffer else 'ПУСТО'
-        state1 = self._row(
-            'РЕЖИМ=' + ('С ЭВМ' if host else 'АВТОНОМНО'),
-            'НАБОР=' + SET_LABELS.get(ses.charset_set, ses.charset_set),
-            'ЛИНИЯ=' + self._link_state().upper()[:self.COL],
-            'РАСК=' + lay)
-        state2 = self._row(
-            'ЭХО=' + ('ВКЛ' if ses.echo else 'ВЫКЛ'),
-            'ПЕРО=' + ('ВКЛ' if self.pen.enabled else 'ВЫКЛ'),
-            'БУФЕР=' + buf,
-            'СЕТКА=' + ('ВКЛ' if self.grid else 'ВЫКЛ'))
-        shown = self._visible_fb()
-        state3 = self._row(
-            'МАСШТАБ=1:' + str(self.renderer.vp.scale),
-            'ТОЧЕК=' + str(shown.count_set() if shown else 0),
-            'ПОСЛ: ' + (self.last_key or ''),
-            'ВВОД=' + (self.input_line or ''))
-        keys1 = self._row('ВК=Bksp', 'ТАБ=Tab', 'ЗВН=Ctrl-G', 'ПРПС=Enter')
-        keys2 = self._row('ESC=Esc', 'КУРСОР=Стрелки', 'ЭКРАН↑=PgUp',
-                          'ЭКРАН↓=PgDn')
-        keys3 = self._row('ОЧИСТКА=F5', 'ЭХО=F6', 'НАБОР=F8', 'СЕТЬ=F9')
-        keys4 = self._row('ПЕРЕДАЧА=F10', 'ВЫХОД=Ctrl-q', '', '')
-        keys5 = self._row('МАСШТАБ=Ctrl-+/-', 'ЦЕНТР=Ctrl-c',
-                          'ЦВЕТ=Ctrl-m', 'СЕТКА=Ctrl-g')
-        width = min(cols, self.COLS_N * self.COL + 3 * (self.COLS_N - 1))
-        return [state1, state2, state3, '-' * width,
-                keys1, keys2, keys3, keys4, keys5]
-
-    COLS_N = 4
+        """Подвал: состояния, черта и легенда — оформление `panel`."""
+        pl = panel.plan(cols)
+        st = self.status()
+        rows = panel.footer(st, width=cols, help_=self.show_help)
+        lines = [panel.render_ansi(row, pl.width) for row in rows]
+        # Последнее диагностическое сообщение — под подвалом: в окне оно
+        # идёт полосой по кадру (`strip.DiagStrip`).
+        if self.diag.last:
+            lines.append(panel.render_ansi(
+                [panel.mk((self.diag.last_stamp + ' ', 'diag'),
+                          (self.diag.last, 'diag'))], pl.width))
+        return lines
 
     def _splash_lines(self, cols: int, rows: int) -> list:
         """Заставка: рисунок из эталонного потока и приветственный текст.
@@ -923,13 +1058,22 @@ class TerminalApp:
         птица.  Закрывается при первом вводе или первом байте от ЭВМ.
         Возвращает ровно `rows` строк: заставка не должна залезать на
         подвал.
+
+        Рисунок **кэшируется**: он разбирается из потока команд заново на
+        каждый кадр, а это десятки тысяч команд и полсекунды работы —
+        при открытом окне ввод с клавиатуры заметно отставал.  Ключ —
+        картинка и геометрия окна; при перерисовке окна ключ меняется и
+        рисунок строится заново.
         """
         pic = startup.picture_path(self.config.splash, prefer_stream=True)
-        # Под рисунком — восемь строк приветствия и подсказок.
         art_h = max(0, min(rows - 8, int(rows * 0.6)))
-        art_lines = (_render_picture(pic, cols, art_h).split('\n')
-                     if pic and art_h else [])
-        art_lines = art_lines[:art_h] + [''] * max(0, art_h - len(art_lines))
+        key = (str(pic) if pic else '', art_h)
+        if key != self._splash_key:
+            art = (_render_picture(pic, cols, art_h).split('\n')
+                   if pic and art_h else [])
+            self._splash_art = art[:art_h] + [''] * max(0, art_h - len(art))
+            self._splash_key = key
+        art_lines = list(self._splash_art)
         text = startup.build(
             max(20, cols - 2), state=self._link_state(),
             summary=self.config.summary(), hint=startup.hint_text()).split('\n')
@@ -960,6 +1104,22 @@ class TerminalApp:
         cols, rows = self.layout()
         step = max(8, vp.scale * 8)
 
+        # ── канонические формы нажатий ──
+        # `term.read_key` отдаёт имена (`'\r'`, `'KEY_BACKSPACE'`), здесь
+        # принимаются и каретные обозначения — формы не должны расходиться.
+        if key in ('^M', '^J'):
+            key = '\r'                     # ВК/ПС в каретной нотации
+        elif key in ('^H', '\x08', '\x7f'):
+            key = 'KEY_BACKSPACE'          # Backspace, а не переключатель Ctrl
+        elif key == '^]':
+            # УПР: `Ctrl` держится между нажатиями, как на настоящей
+            # клавиатуре.  Своя комбинация: Backspace удаляет знак.
+            self.ctrl = not self.ctrl
+            self.message = ('Ctrl удерживается' if self.ctrl
+                            else 'Ctrl отпущен')
+            self.last_key = 'УПР'
+            return
+
         if key in ('^C', 'EOF'):
             self.running = False
             return
@@ -983,20 +1143,27 @@ class TerminalApp:
             self.message = 'набор: ' + self.session.panel()
 
         # ── экран и ввод ──
-        elif key == 'KEY_UP':
+        # Стрелка указывает, куда движется кадр: `vp.x`/`vp.y` — смещение
+        # видимой области слева/сверху, поэтому кадр вправо — это `x` вниз,
+        # кадр вверх — это `y` вверх.  Раньше ←/→ шли в обратную сторону
+        # относительно ↑/↓.
+        elif key == 'KEY_UP':                    # кадр вверх
             vp.y = min(self.emu.fb.height, vp.y + step)
-        elif key == 'KEY_DOWN':
+        elif key == 'KEY_DOWN':                  # кадр вниз
             vp.y = max(0, vp.y - step)
-        elif key == 'KEY_LEFT':
-            vp.x = max(0, vp.x - step)
-        elif key == 'KEY_RIGHT':
+        elif key == 'KEY_LEFT':                  # кадр влево
             vp.x = min(self.emu.fb.width, vp.x + step)
+        elif key == 'KEY_RIGHT':                 # кадр вправо
+            vp.x = max(0, vp.x - step)
         elif key == 'KEY_PAGEUP':                # ЭКРАН↑
             self._scroll_screen(-1)
         elif key == 'KEY_PAGEDOWN':              # ЭКРАН↓
             self._scroll_screen(1)
         elif key == 'KEY_BACKSPACE' or key == '\x7f':
             self.input_line = self.input_line[:-1]
+            if self.session.echo and self.echo_buf \
+                    and not self.echo_buf.endswith('\n'):
+                self.echo_buf = self.echo_buf[:-1]
         elif key in ('\r', '\n', 'KEY_ENTER'):       # ПРПС
             self._submit()
         elif key == 'ESC':
@@ -1012,28 +1179,63 @@ class TerminalApp:
 
         # ── мышь: световое перо ──
         elif key and key.startswith('\x1b[<') and self.pen.enabled:
-            self.pen.feed_mouse(key, cols=cols, rows=rows,
-                                scale=vp.scale, vx=vp.x, vy=vp.y)
+            self.pen.feed_mouse(self._mouse_for_frame(key), cols=cols,
+                                rows=rows, scale=vp.scale, vx=vp.x, vy=vp.y)
             for ev in self.pen.take_events():
                 self.driver.send_keys(ev.encode().decode('ascii'))
+
+        # ── сочетания Ctrl-буква ──
+        # Настоящие сочетания приходят управляющим кодом (`'^Q'` — это
+        # Ctrl-q): действие выполняется сразу, без удержания `Ctrl`.
+        elif len(key) == 2 and key.startswith('^') and key[1].isalpha():
+            self._emulator_key(key[1].lower(), cols, rows)
 
         # ── ввод текста ──
         elif key and len(key) == 1 and key.isprintable():
             # Свободный ввод, как на 15ИЭ: в режиме С ЭВМ знак уходит в
             # линию немедленно, в АВТОНОМНО копится в буфер до ПЕРЕДАЧА.
             self.input_line += key
+            if self.session.echo:
+                self.echo_buf += key      # ЭХО: набранное видно на экране
             out = self.session.type_key(key)
             if out:
                 self._send_raw(out)
             self.splash = False
-        elif key in self.EMULATOR_KEYS and self.ctrl:
-            # Служебные клавиши самого эмулятора — только с `Ctrl`:
-            # на настоящем терминале их нет, и на буквах без `Ctrl`
-            # они перехватывали бы набор текста.
-            self._emulator_key(key, cols, rows)
         else:
             return
-        self.last_key = SESSION_KEYS.get(key, key)[:12]
+        self.last_key = self._last_label(key)
+
+    def _last_label(self, key: str) -> str:
+        """«ПОСЛ:» — код выданного знака и сам знак (`≡144 'd'`).
+
+        Код — восьмеричный КОИ-8Р (`≡NNN`, как в описании терминала);
+        для служебных клавиш показывается их имя.
+        """
+        if len(key) == 1 and key.isprintable():
+            code = key.encode('koi8-r', errors='replace')[0]
+            return f'≡{code:o} {key!r}'
+        return SESSION_KEYS.get(key, key)[:12]
+
+    #: SGR-последовательность мыши: `\x1b[<b;x;yM` / `\x1b[<b;x;ym`.
+    _MOUSE_RE = re.compile(r'^(\x1b\[<)(\d+);(\d+);(\d+)([Mm])$')
+
+    def _mouse_for_frame(self, key: str) -> str:
+        """Пересчитать ряд мыши: от верха окна → от начала кадра.
+
+        `feed_mouse` считает, что кадр начинается с первого ряда, а в
+        окне он ниже заголовка и текстовых строк ЭВМ.  Без поправки перо
+        попадало не туда, куда указал пользователь.
+        """
+        m = self._MOUSE_RE.match(key)
+        if not m:
+            return key
+        head, b, col, row, tail = m.groups()
+        row = max(1, int(row) - self._frame_row_offset())
+        return f'{head}{b};{col};{row}{tail}'
+
+    def _frame_row_offset(self) -> int:
+        """Сколько рядов окна над кадром: заголовок и текст ЭВМ."""
+        return (1 if self.config.title else 0) + self._body_offset
 
     #: Служебные клавиши эмулятора (окно просмотра, перо, сетка).
     #: Это не клавиши терминала: на настоящем терминале их нет.
@@ -1130,6 +1332,8 @@ class TerminalApp:
         """
         text = self.input_line
         self.input_line = ''
+        if self.session.echo:
+            self.echo_buf += '\n'         # ПЕРЕВОД СТРОКИ: строка на экране
         if not text and self.session.mode == MODE_HOST:
             # Пустая строка — тоже команда (например, пустой ввод в ОС).
             self._send_raw(bytes((self.eol,)))
@@ -1164,26 +1368,33 @@ class TerminalApp:
         self._enable_gfx()
         sys.stdout.write(ALT_SCREEN_ON + CLEAR + HIDE_CURSOR
                          + LightPen.enable_sequence())
+        # Экран перерисовывается только по изменению: полная отрисовка на
+        # каждом обороте делала приём клавиш очень медленным.
+        dirty = True
+        clock_at = 0.0
         try:
             with RawTerminal():
                 self._probe_gfx()
                 while self.running:
-                    self.draw()
+                    if dirty:
+                        self.draw()
+                        dirty = False
                     data = self.driver.poll(0.05)
                     if data:
                         self.feed(data)
+                        dirty = True
                         continue
-                    if not self._got_data:
-                        # Часы на начальном экране идут вживую.
-                        self.draw()
                     key = read_key(timeout=0.08)
                     if key:
-                        # `Ctrl` держится между нажатиями, как на
-                        # настоящей клавиатуре: нажал, отпустил.
-                        if key == '^H':
-                            self.ctrl = not self.ctrl
-                            continue
                         self.handle_key(key)
+                        dirty = True
+                    elif not self._got_data:
+                        # Часы на начальном экране идут вживую — раз в
+                        # секунду, а не на каждом обороте.
+                        now = time.monotonic()
+                        if now - clock_at >= 1.0:
+                            clock_at = now
+                            dirty = True
         except KeyboardInterrupt:
             pass
         finally:

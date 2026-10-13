@@ -100,13 +100,34 @@ class RawTerminal:
 def read_key(timeout: Optional[float] = None) -> Optional[str]:
     """Прочитать одно нажатие.
 
-    Возвращает: обычный символ, `'KEY_UP'`/`'KEY_DOWN'`/`'KEY_LEFT'`/
-    `'KEY_RIGHT'`/`'KEY_PAGEUP'`/`'KEY_PAGEDOWN'`/`'KEY_HOME'`/`'KEY_END'`,
-    управляющие сочетания `'^C'`, `'ESC'`, либо `None` по таймауту.
+    Возвращает канонические формы, которые понимает `tui.handle_key`:
+    обычный символ, `'\r'`/`'\n'` (ВК/ПС), `'KEY_BACKSPACE'`,
+    `'KEY_UP'`/`'KEY_DOWN'`/`'KEY_LEFT'`/`'KEY_RIGHT'`/`'KEY_PAGEUP'`/
+    `'KEY_PAGEDOWN'`/`'KEY_HOME'`/`'KEY_END'`/`'KEY_F1'`…`'KEY_F4'`,
+    управляющие сочетания `'^C'`, последовательность мыши
+    (`'\x1b[<…'` — световое перо), `'ESC'`, либо `None` по таймауту.
     """
     if IS_WINDOWS:
         return _read_key_windows(timeout)
     return _read_key_posix(timeout)
+
+
+def _plain_name(ch: str) -> str:
+    """Каноническое имя нажатия без escape-последовательности.
+
+    `ВК`/`ПС` возвращаются как есть (`'\r'`/`'\n'`), Backspace — именем
+    `'KEY_BACKSPACE'` (и `0x7F`, и `0x08` — на Windows это он же), остальные
+    управляющие символы — каретной нотацией `'^X'`.  Раньше `0x08` давал
+    `'^H'`, и `tui.py` принимал его за переключатель `Ctrl`, а не за
+    удаление знака.
+    """
+    if ch in ('\r', '\n'):
+        return ch
+    if ch in ('\x08', '\x7f'):
+        return 'KEY_BACKSPACE'
+    if ord(ch) < 32:
+        return '^' + chr(ord(ch) + 64)
+    return ch
 
 
 #: Служебные клавиши сеанса: имена → то же, что в `keyboard.py` 15ИЭ.
@@ -119,38 +140,106 @@ SESSION_KEYS = {
 }
 
 
-def _read_key_posix(timeout: Optional[float]) -> Optional[str]:   # pragma: no cover
+#: Набранные байты, ещё не разобранные в нажатия.
+#:
+#: `sys.stdin.read(1)` делать нельзя: TextIO читает с опережением, и
+#: `select` перестаёт видеть остаток escape-последовательности — стрелки
+#: и функциональные клавиши обрывались посреди записи («клавиши не
+#: работают»).  Байты читаются одной операцией (`read1`) и разбираются
+#: из собственного буфера.
+_KEY_BYTES = bytearray()
+
+
+def push_input(data: bytes) -> None:
+    """Вернуть неразобранные байты в буфер ввода.
+
+    Нужно для служебных читателей (протокол графики): они читают вход
+    напрямую, и нажатия, попавшие в окно чтения, иначе бы потерялись.
+    """
+    if data:
+        _KEY_BYTES[:0] = data
+
+
+def _fill_keys(timeout: Optional[float]) -> bool:
+    """Дочитать байты ввода в буфер; False — данных нет (таймаут)."""
     import select
-    if timeout is not None:
-        ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        if not ready:
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        return False
+    buf = getattr(sys.stdin, 'buffer', None)
+    if buf is not None and hasattr(buf, 'read1'):
+        chunk = buf.read1(256)            # одна операция, без read-ahead
+    else:
+        data = sys.stdin.read(1)          # подменённый поток (тесты)
+        chunk = data.encode('utf-8') if data else b''
+    if not chunk:
+        return False
+    _KEY_BYTES.extend(chunk)
+    return True
+
+
+def _take_char() -> Optional[str]:
+    """Достать один символ из буфера (UTF-8 может быть многобайтовым)."""
+    while _KEY_BYTES:
+        b = _KEY_BYTES[0]
+        if b < 0x80:
+            del _KEY_BYTES[0]
+            return chr(b)
+        n = 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+        if len(_KEY_BYTES) < n:
             return None
-    ch = sys.stdin.read(1)
-    if not ch:
-        return 'EOF'
+        raw = bytes(_KEY_BYTES[:n])
+        del _KEY_BYTES[:n]
+        try:
+            return raw.decode('utf-8')
+        except UnicodeDecodeError:        # pragma: no cover
+            return '?'
+    return None
+
+
+def _read_key_posix(timeout: Optional[float]) -> Optional[str]:   # pragma: no cover
+    if not _KEY_BYTES and not _fill_keys(timeout):
+        return None
+    ch = _take_char()
+    if ch is None:                        # оборванный многобайтовый символ
+        if not _fill_keys(0.02):
+            return None
+        ch = _take_char()
+        if ch is None:
+            return None
     if ch != '\x1b':
-        if ord(ch) < 32:
-            if ch == '\x7f':
-                return 'KEY_BACKSPACE'
-            return '^' + chr(ord(ch) + 64)
-        return ch
-    # Последовательность ESC: читаем следующие байты, если они уже есть.
-    import select as _s
-    nxt = _s.select([sys.stdin], [], [], 0.02)[0]
-    if not nxt:
+        return _plain_name(ch)
+    # Последовательность ESC: добираем из буфера — остаток мог прийти
+    # тем же чтением, и повторный `select` его уже не видит.
+    if not _KEY_BYTES and not _fill_keys(0.02):
         return 'ESC'
-    code = sys.stdin.read(1)
-    if code != '[' and code != 'O':
+    code = _take_char()
+    if code not in ('[', 'O'):
         return 'ESC'
-    seq = ''
+    # `seq` — полная последовательность: `OP` (F1), `[A` (↑), `[15~` (F5).
+    # Раньше префикс `O`/`[` съедался, и F1…F4 приходили как `P`…`S`.
+    seq = code
+    mouse = False
     while True:
-        if not _s.select([sys.stdin], [], [], 0.02)[0]:
+        if not _KEY_BYTES and not _fill_keys(0.02):
             break
-        c = sys.stdin.read(1)
+        c = _take_char()
+        if c is None:
+            break
         seq += c
+        if mouse:
+            if c in 'Mm':                # конец SGR-мыши
+                break
+            continue
+        if c == '<' and code == '[' and seq == '[<':
+            # SGR-мышь `\x1b[<b;x;yM|m` — возвращается целиком: это
+            # световое перо (см. `pen.py`), разбирать её как нажатие нельзя.
+            mouse = True
+            continue
         if c.isalpha() or c == '~':
             break
-    return _arrow_name(seq)
+    # Мышь возвращается целиком, с `ESC`; остальное — имя клавиши.
+    return ('\x1b' + seq) if mouse else _arrow_name(seq)
 
 
 #: Служебные клавиши 15ВВВ-97-006 — те же, что на 15ИЭ.
@@ -182,6 +271,17 @@ SEQ_SPECIAL = {
 
 
 def _arrow_name(seq: str) -> str:
+    """Имя клавиши по escape-последовательности (без `ESC`).
+
+    Последовательность приходит с префиксом `ESC [` (`'[A'` — ↑) или
+    `ESC O` (`'OP'` — F1), но принимается и без него (`'15~'`).
+    """
+    # F1…F4 — `ESC O P`…`ESC O S`: полная последовательность, с префиксом.
+    if seq in ('OP', 'OQ', 'OR', 'OS'):
+        return {'OP': 'KEY_F1', 'OQ': 'KEY_F2', 'OR': 'KEY_F3',
+                'OS': 'KEY_F4'}[seq]
+    if seq[:1] in ('[', 'O'):
+        seq = seq[1:]
     table = {'A': 'KEY_UP', 'B': 'KEY_DOWN', 'C': 'KEY_RIGHT',
              'D': 'KEY_LEFT', 'H': 'KEY_HOME', 'F': 'KEY_END',
              'Z': 'KEY_BTAB'}
@@ -199,9 +299,6 @@ def _arrow_name(seq: str) -> str:
                 'D': 'KEY_LEFT'}.get(kind)
         if base:
             return 'KEY_CTRL' + base[3:]
-    if seq in ('OP', 'OQ', 'OR', 'OS'):
-        return {'OP': 'KEY_F1', 'OQ': 'KEY_F2', 'OR': 'KEY_F3',
-                'OS': 'KEY_F4'}[seq]
     return 'ESC'
 
 
@@ -218,10 +315,12 @@ def _read_key_windows(timeout: Optional[float]) -> Optional[str]:  # pragma: no 
                     'H': 'KEY_UP', 'P': 'KEY_DOWN', 'M': 'KEY_RIGHT',
                     'K': 'KEY_LEFT', 'I': 'KEY_PAGEUP', 'Q': 'KEY_PAGEDOWN',
                     'G': 'KEY_HOME', 'O': 'KEY_END',
+                    ';': 'KEY_F1', '<': 'KEY_F2', '=': 'KEY_F3',
+                    '>': 'KEY_F4',
                 }.get(code, 'ESC')
-            if ord(ch) < 32:
-                return '^' + chr(ord(ch) + 64)
-            return ch
+            # Backspace на Windows даёт `0x08` — это удаление знака,
+            # а не каретная нотация `'^H'` (см. `_plain_name`).
+            return _plain_name(ch)
         if deadline is not None and time.monotonic() > deadline:
             return None
         time.sleep(0.01)

@@ -66,9 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--link-timeout', type=float, default=0.0,
                     help='таймаут линии ДКС, с (0 — 10 с)')
     ap.add_argument('--gui', '--window', action='store_true', dest='gui',
-                    help='графическое окно: кадр 560×400 вместе с текстом')
+                    help='графическое окно: кадр 560×400 вместе с текстом '
+                         '(по умолчанию без файла)')
     ap.add_argument('--tui', action='store_true',
-                    help='интерактивный режим (включён по умолчанию)')
+                    help='текстовый интерфейс в консоли (TUI)')
     ap.add_argument('--pen', action='store_true',
                     help='световое перо: мышь рисует линию (с --tui)')
     ap.add_argument('--graphics', choices=('auto', 'kitty', 'blocks', 'mono'),
@@ -100,6 +101,18 @@ def setup_logging(verbosity: int) -> None:
     logging.basicConfig(level=level, format='%(levelname)s: %(message)s')
 
 
+def _gui_usable() -> bool:
+    """Доступно ли графическое окно: есть tkinter и дисплей."""
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose)
@@ -114,14 +127,8 @@ def main(argv=None) -> int:
         print('правьте значения; файл подхватывается автоматически.')
         return 0
 
-    if args.gui:
-        from .window import run_window
-        return run_window(endpoint=args.link, scale=max(1, args.scale // 2),
-                          demo=args.demo)
-
     from .config import load as load_config
     cfg = load_config(args.conf)
-
 
     if args.list_backends:
         for name in sorted(BACKENDS):
@@ -141,8 +148,9 @@ def main(argv=None) -> int:
     # заданный параметр вывода отключает его.
     action_flags = (args.link or args.listen or args.dump_ascii or args.stats
                     or args.png or args.frames or args.list_backends)
-    interactive = args.tui or (
-        args.input is None and not action_flags and sys.stdin.isatty())
+    interactive = (args.gui or args.tui
+                   or (args.input is None and not action_flags
+                       and sys.stdin.isatty()))
 
     # `--link` без указания выходного файла тоже открывает окно: иначе
     # связь с ЭВМ выглядит как команда, которая «ничего не делает».
@@ -151,6 +159,17 @@ def main(argv=None) -> int:
         interactive = True
 
     if interactive:
+        # По умолчанию — графическое окно (полноценный графический
+        # терминал); `--tui` выбирает текстовый интерфейс.  Без графики
+        # (нет tkinter или дисплея) откатываемся на TUI.
+        if not args.tui and _gui_usable():
+            from .window import run_window
+            code = run_window(endpoint=args.link, scale=max(1, args.scale),
+                              demo=args.demo, config=cfg)
+            if code != 3:                 # 3 — графика недоступна
+                return code
+            print('графическое окно недоступно — текстовый режим',
+                  file=sys.stderr)
         from .tui import run_tui
         path = Path(args.input) if args.input not in ('-', None) else None
         mode = 'mono' if args.dump_ascii else None

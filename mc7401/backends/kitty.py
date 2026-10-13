@@ -18,8 +18,9 @@ Apple Terminal и ряд других.  В этом окне кадр заним
 
     \\e_G<ключи>;<данные>\\e\\
 
-Данные режутся на куски по 4096 байт; управляющие ключи несут только
-последний кусок.  Кадр кодируется PNG и передаётся base64.
+Данные режутся на куски по 4096 байт; полный набор ключей несёт первый
+кусок, продолжения помечены `m=1`, последний — `m=0`.  Кадр кодируется
+PNG и передаётся base64.
 
 Проверить в терминале: `printf '\\e_Ga=T,t=f,i=99,s=1,v=1,f=100;%s\\e\\\\' \\
     "$(base64 -w0 tiny.png)"` — если появился цветной квадрат, протокол
@@ -74,15 +75,29 @@ def _apc(keys: str, payload: bytes = b'') -> str:
 
 
 def _apc_stream(keys: str, payload: bytes) -> str:
-    """APC с данными, разбитыми на куски (управляющие — в последнем)."""
+    """APC с данными, разбитыми на куски.
+
+    По спецификации kitty: полный набор ключей несёт **первый** кусок,
+    все куски, кроме последнего, помечены `m=1` («есть продолжение»),
+    последний — `m=0`.  Раньше ключи клались в последний кусок без `m`,
+    и изображения больше 4 КБ никогда не отображались.
+    """
     data = base64.b64encode(payload).decode('ascii')
     if len(data) <= MAX_CHUNK:
         return _apc(keys, payload)
-    parts = [f'{APC_HEAD}{chunk}{APC_TAIL}'
-             for chunk in (data[i:i + MAX_CHUNK]
-                           for i in range(0, len(data), MAX_CHUNK))]
-    # Куски без ключей идут подряд, ключи — на последнем.
-    return ''.join(parts[:-1]) + f'{APC_HEAD}{keys};{parts[-1][len(APC_HEAD):]}'
+    chunks = [data[i:i + MAX_CHUNK]
+              for i in range(0, len(data), MAX_CHUNK)]
+    last = len(chunks) - 1
+    parts: list[str] = []
+    for n, chunk in enumerate(chunks):
+        if n == 0:
+            head = f'{keys},m=1' if keys else 'm=1'   # ключи — в первом
+        elif n == last:
+            head = 'm=0'                # последний кусок
+        else:
+            head = 'm=1'
+        parts.append(f'{APC_HEAD}{head};{chunk}{APC_TAIL}')
+    return ''.join(parts)
 
 
 def parse_response(text: str) -> Optional[dict]:
@@ -106,9 +121,18 @@ def parse_response(text: str) -> Optional[dict]:
     out: dict = {}
     for part in (first, keys):
         for item in part.split(','):
+            item = item.strip()
+            if not item:
+                continue
             if '=' in item:
                 k, _, v = item.partition('=')
                 out[k.strip()] = v.strip()
+            elif item == 'OK':
+                out['OK'] = ''
+            else:
+                # Ошибка приходит токеном без `=`: `i=31;ENOTSUP`,
+                # `i=31;ENOENT:…`.  Раньше такие токены отбрасывались.
+                out.setdefault('error', item)
     if not out:
         return None
     out['_payload'] = payload
@@ -135,20 +159,24 @@ class KittyGraphics:
                 f'{APC_TAIL}').encode('ascii')
 
     def apply_response(self, text: str) -> bool:
-        """Разобрать ответ; `True`, если протокол работает."""
+        """Разобрать ответ; `True`, если протокол работает.
+
+        Ошибки (`ENOTSUP`, `ENOENT:…`) и ответы без размера клетки
+        возвращают `False`: раньше `apply_response('\x1b_Gi=31;ENOTSUP\x1b\\')`
+        отвечал `True`, и несуществующая графика считалась включённой.
+        """
         resp = parse_response(text)
-        if not resp:
-            return False
-        if resp.get('ENOENT') or resp.get('ENOTSUP'):
+        if not resp or resp.get('error'):
             return False
         try:
             w = int(resp.get('c', 0))
             h = int(resp.get('r', 0))
         except ValueError:
             return False
-        if w > 0 and h > 0:
-            self.cell = (w, h)
-            self.active = True
+        if w <= 0 or h <= 0:
+            return False
+        self.cell = (w, h)
+        self.active = True
         return True
 
     # ── геометрия ───────────────────────────────────────────────────────────
@@ -172,9 +200,14 @@ class KittyGraphics:
         """Показать кадр `fb` в прямоугольнике знакомест.
 
         `row`, `col` — левый верхний угол в знакоместах (с нуля), `cols`,
-        `rows` — размер прямоугольника.  Кадр пересылается, только если он
-        изменился: по линии ДКС идут мегабайты, лишних пересылок быть
-        не должно.
+        `rows` — размер прямоугольника размещения (ключи `c`/`r`).
+        Кадр пересылается, только если он изменился: по линии ДКС идут
+        мегабайты, лишних пересылок быть не должно.
+
+        По спецификации kitty `x,y,w,h` — прямоугольник **исходного**
+        изображения (кадр передаётся целиком: `x=y=0`), а место на экране
+        задаёт позиция курсора перед APC.  `X,Y` — смещение внутри клетки
+        (меньше её размера).
         """
         if not self.active:
             return False
@@ -182,10 +215,19 @@ class KittyGraphics:
         payload = PNGBackend(fb, scale=zoom).to_png_bytes()
         if not force and payload == self._sent:
             return True
-        keys = (f'a=T,f=100,t=d,i={self.id},x={col},y={row},'
-                + (f'c={cols},r={rows},' if cols and rows else '')
-                + 'p=2,q=2')
-        self.out.write(_apc_stream(keys, payload))
+        img_w, img_h = fb.width * zoom, fb.height * zoom
+        cw, ch = self.cell
+        # Кадр центруется в сетке клеток: остаток меньше клетки — это
+        # и есть смещение `X,Y` внутри клетки.
+        x_off = ((img_w + cw - 1) // cw * cw - img_w) // 2
+        y_off = ((img_h + ch - 1) // ch * ch - img_h) // 2
+        keys = (f'a=T,f=100,t=d,i={self.id},x=0,y=0,w={img_w},h={img_h}'
+                + (f',X={x_off},Y={y_off}' if x_off or y_off else '')
+                + (f',c={cols},r={rows}' if cols and rows else '')
+                + ',p=2,q=2')
+        # Картинка ложится туда, где стоит курсор (позиция — с нуля).
+        self.out.write(f'\x1b[{row + 1};{col + 1}H'
+                       + _apc_stream(keys, payload))
         self.out.flush()
         self._sent = payload
         return True

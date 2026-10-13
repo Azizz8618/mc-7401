@@ -22,8 +22,11 @@ from pathlib import Path
 
 
 def main() -> int:
+    # Исходное расположение: корень репозитория (работает и по ссылке).
+    # Если файл скопирован в PATH (установка), пакет берётся из
+    # установленного — site-packages.
     root = Path(__file__).resolve().parent.parent
-    if str(root) not in sys.path:
+    if (root / 'mc7401' / '__init__.py').is_file() and str(root) not in sys.path:
         sys.path.insert(0, str(root))
     from mc7401.cli import main as cli_main
     return cli_main()

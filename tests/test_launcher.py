@@ -36,7 +36,27 @@ def test_launcher_runs_from_any_directory(tmp_path):
 
 
 def test_short_command_starts_interactive_mode(monkeypatch):
-    """`mc7401` без аргументов открывает интерактивный режим (TUI)."""
+    """`mc7401` без аргументов открывает графическое окно терминала."""
+    import io
+    sys.path.insert(0, str(ROOT))
+    from mc7401 import cli, window
+
+    called = {}
+
+    def fake_run_window(*a, **kw):
+        called['args'] = (a, kw)
+        return 0
+
+    monkeypatch.setattr(window, 'run_window', fake_run_window)
+    monkeypatch.setattr(cli, '_gui_usable', lambda: True)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO())
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    assert cli.main([]) == 0
+    assert 'args' in called                 # графическое окно открыто
+
+
+def test_tui_flag_selects_text_mode(monkeypatch):
+    """`--tui` открывает текстовый интерфейс, а не окно."""
     import io
     sys.path.insert(0, str(ROOT))
     from mc7401 import cli, tui
@@ -50,8 +70,8 @@ def test_short_command_starts_interactive_mode(monkeypatch):
     monkeypatch.setattr(tui, 'run_tui', fake_run_tui)
     monkeypatch.setattr(sys, 'stdin', io.StringIO())
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
-    assert cli.main([]) == 0
-    assert 'args' in called                 # диалог с терминалом открыт
+    assert cli.main(['--tui']) == 0
+    assert 'args' in called                 # текстовый диалог открыт
 
 
 def test_short_command_help_mentions_interactive():

@@ -68,8 +68,12 @@ if (Test-Path $exe) {
 @"
 
 Готово. Запуск (из любого каталога):
-  $Venv\Scripts\mc7401.exe поток.bin -o кадр.png
+  $Venv\Scripts\mc7401.exe                       интерактивный режим
+  $Venv\Scripts\mc7401.exe поток.bin -o кадр.png отрисовать поток команд
   $Venv\Scripts\mc.exe        поток.bin -o кадр.png
+
+Без установки: python tools\mc7401 --help
+(один исполняемый файл tools/mc7401 запускает пакет из репозитория).
 
 Чтобы не набирать полный путь, добавьте в PATH:
   `$env:PATH += ";$Venv\Scripts"

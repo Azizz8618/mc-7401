@@ -5,7 +5,7 @@ parser.py — синтаксический разбор команд терми�
 определяющего действие.  Параметры разделены пробелом `П1` и заданы
 десятично, без знака (`Х:0`), либо как символ (`СНР(МСШ)`).
 
-    J0 ВК                 текстовый режим
+    J0 ВК                 (упразднён) принимается и игнорируется
     J1 ВК                 графический режим
     0 C ВК                установить перо C          (C = '0'|'1'|'2')
     1 T ВК                установить тип линии T     (T = '0'…'7')
@@ -43,8 +43,8 @@ class Op(Enum):
     """Код операции терминала."""
 
     # управление режимом
-    TEXT_MODE = auto()        # J0
     GRAPHICS_MODE = auto()    # J1
+    NOOP = auto()             # J0 — текстовый режим упразднён, запись игнорируется
     SET_PEN = auto()          # 0 C
     SET_LINE_TYPE = auto()    # 1 T
     FRAME_END = auto()        # 2
@@ -85,6 +85,10 @@ class Command:
     raw: bytes = b''
     #: Человекочитаемое имя.
     name: str = ''
+    #: Строка набора (`СИМВОЛЫ`): каждый байт — код знака как есть,
+    #: без обработки `S0`/`S1`/`END` (иначе в таблице нет `p`/`q` —
+    #: их коды совпадают с переключателями шрифта).
+    literal: bool = False
 
     def __repr__(self) -> str:  # pragma: no cover
         return (f'Command({self.op.name} {self.name!r} '
@@ -93,8 +97,8 @@ class Command:
 
 #: Мнемоника для каждой операции (для отчётов и отладки).
 OP_NAME = {
-    Op.TEXT_MODE: 'J0',
     Op.GRAPHICS_MODE: 'J1',
+    Op.NOOP: 'J0',
     Op.SET_PEN: '0',
     Op.SET_LINE_TYPE: '1',
     Op.FRAME_END: '2',
@@ -149,14 +153,18 @@ class CommandParser:
 
         # ── команды без параметров
         if body == b'J0':
-            return Command(Op.TEXT_MODE, raw=rec, name='J0')
+            # Текстовый режим упразднён: терминал всегда графический,
+            # запись `J0` принимается и игнорируется.
+            return Command(Op.NOOP, raw=rec, name='J0')
         if body == b'J1':
             return Command(Op.GRAPHICS_MODE, raw=rec, name='J1')
         if body == b'2':
             return Command(Op.FRAME_END, raw=rec, name='2')
         if body == b'3':
             return Command(Op.UPDATE_END, raw=rec, name='3')
-        if body == b'K':
+        if body == b'K' or body == bytes((0xEB,)):
+            # Сброс: в `graf.pas` команда записана кириллической `К`,
+            # которая в КОИ-8 идёт байтом 0xEB.
             return Command(Op.RESET, raw=rec, name='K')
         if body == b'S':
             return Command(Op.CLEAR, raw=rec, name='S')
@@ -164,6 +172,13 @@ class CommandParser:
             return Command(Op.PEN_OR, raw=rec, name='+')
         if body == bytes((self.xor_code,)):
             return Command(Op.PEN_XOR, raw=rec, name='≠')
+
+        # ── данные текста: `;O П1 <строка>` (ТЕКФАЙ) либо `; П1 <строка>`
+        # (СТРОКИ).  Разбираются до общего среза `П1`, иначе у формы
+        # СТРОКИ разделитель съедал бы первый байт строки (код `S0`), и
+        # русский текст выводился латинскими знаками.
+        if fn == ord(';'):
+            return self._parse_text_data(rec, rest)
 
         # ── команды с параметрами, первый символ — код функции
         if rest[:1] == bytes((P1,)):
@@ -207,9 +222,6 @@ class CommandParser:
         if fn == ord('9'):
             return self._parse_text(rec, rest)
 
-        if fn == ord(';'):
-            return self._parse_text_data(rec, rest)
-
         if fn == ord(':'):
             # `9 : N` — установка размера текста (процедура `СТРОКИ`:
             # `WRIТЕ('91', ВК, ':0 ', ВК, '; ')`).  Размер действует до
@@ -229,18 +241,26 @@ class CommandParser:
     # ── текст ────────────────────────────────────────────────────────────────
 
     def _parse_text_data(self, rec: bytes, rest: bytes) -> Command:
-        """Разобрать запись данных текста `;O` П1 <строка> ВК.
+        """Разобрать запись данных текста.
 
-        Программа выводит размер и данные двумя записями
+        Две формы (обе пишутся после записи `9 S`):
+
+        * `;O` П1 <строка> ВК — `ТЕКФАЙ`: направление `O` задано явно;
+        * `;` П1 <строка> ВК — `СТРОКИ`: направления нет, сразу строка.
+
+        Программа выводит размер и данные отдельными записями
         (`WRIТЕ('9', СНР(МСШ), ВК, ';', СНР(ОРН), П1)`), поэтому размер
-        берётся из предыдущей записи `9 S`, а `rest` содержит ориентацию
-        и саму строку.
+        берётся из предыдущей записи `9 S`.
         """
-        orient = rest[:1]
-        payload = rest[1:]
-        # Разделитель параметров — пробел; он часть заголовка.
-        if payload[:1] == bytes((P1,)):
-            payload = payload[1:]
+        if rest[:1] == bytes((P1,)):
+            # Форма `СТРОКИ`: после `;` сразу разделитель и строка.
+            orient, payload = b'\x00', rest[1:]
+        else:
+            # Форма `ТЕКФАЙ`: направление и разделитель перед строкой.
+            orient = rest[:1]
+            payload = rest[1:]
+            if payload[:1] == bytes((P1,)):
+                payload = payload[1:]
         return Command(Op.TEXT, args=[self.text_size, orient],
                        payload=payload, raw=rec, name='9')
 

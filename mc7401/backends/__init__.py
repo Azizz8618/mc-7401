@@ -35,9 +35,13 @@ BG = (0x08, 0x14, 0x0C)      # тёмный фон
 # ─────────────────────────────────────────────────────────────────────────────
 
 def framebuffer_pixels(fb: Framebuffer, fg=FG, bg=BG) -> Iterable[tuple]:
-    """Строки пикселей сверху вниз (как на экране, Y вверх)."""
+    """Строки пикселей сверху вниз (как на экране, Y вверх).
+
+    Строка хранения 0 — верх экрана (см. `Framebuffer._index`), поэтому
+    идём по строкам хранения в прямом порядке.
+    """
     w, h = fb.width, fb.height
-    for row in range(h - 1, -1, -1):
+    for row in range(h):
         line = []
         base = row * (w // 8)
         for byte in range(w // 8):
@@ -50,7 +54,7 @@ def framebuffer_pixels(fb: Framebuffer, fg=FG, bg=BG) -> Iterable[tuple]:
 def framebuffer_rows(fb: Framebuffer) -> Iterable[str]:
     """Строки кадра сверху вниз символами `#` и `.` (для отладки)."""
     w, h = fb.width, fb.height
-    for row in range(h - 1, -1, -1):
+    for row in range(h):
         base = row * (w // 8)
         out = []
         for byte in range(w // 8):
@@ -91,7 +95,7 @@ class SVGBackend:
         fb = self.fb
         stride = fb.width // 8
         for row in range(fb.height):
-            y = fb.height - 1 - row          # экранная Y (снизу вверх)
+            y = row                      # SVG: Y вниз, строка 0 — верх кадра
             base = row * stride
             run_start = None
             for byte in range(stride):
@@ -194,7 +198,7 @@ class TkBackend:
         canvas.pack()
         fb = self.fb
         for row in range(fb.height):
-            y = (fb.height - 1 - row) * self.scale
+            y = row * self.scale         # строка 0 — верх кадра
             base = row * (fb.width // 8)
             for byte in range(fb.width // 8):
                 b = fb._bits[base + byte]
@@ -256,7 +260,7 @@ class PygameBackend:
                     for bit in range(8):
                         if b & (1 << (7 - bit)):
                             x = byte * 8 + bit
-                            y = fb.height - 1 - row
+                            y = row      # строка 0 — верх кадра
                             surface.set_at((x, y), self.fg)
             screen.blit(pygame.transform.scale(surface, (w, h)), (0, 0))
             pygame.display.flip()

@@ -325,12 +325,47 @@ class Emitter:
 
     def emit_routine(self, r: Routine) -> None:
         base = self.indent
+        # Переменные подпрограммы статичны (Паскаль БЭСМ-6/Эльбрус):
+        # они сохраняются между вызовами.  У верхнеуровневых подпрограмм
+        # значения живут в замыкании фабрики `_static_<имя>`, а не в теле
+        # функции (иначе каждое присваивание в начале тела обнуляло бы
+        # накопленное состояние — см. `СИМВОЛЫ(МСШ)`, где `ШГ:=30` от
+        # первого прохода нужен второму).  Рекурсивных подпрограмм в
+        # `graf.pas` нет, поэтому статичность безопасна.  Локальные имена
+        # вложенных подпрограмм не выносятся: они могут совпадать с
+        # именами объёмлющей подпрограммы (`ПТ.К` и `ПТИЦА.К`), а их
+        # инициализация при каждом вызове эквивалентна статичности (все
+        # такие переменные присваиваются до чтения).
+        top = not self.shadow_stack
         name = _py_name(r.name)
         params = [_py_name(pname) for pname, _t, _m in r.params]
         var_names = [_py_name(pname) for pname, _t, mode in r.params
                      if mode == 'var']
+        # Параметры не инициализируются: они приходят из вызова.
+        param_names = {pname for pname, _pty, _mode in r.params}
+        hoisted: list[tuple[str, str]] = []
+        if top:
+            for lname, lty in r.locals.items():
+                if lname.startswith('#') or lname in param_names:
+                    continue
+                hoisted.append((_py_name(lname), self.zero_value(lty, lname)))
+            if r.is_function:
+                rname = self.result_variable(r)
+                rtype = self.resolve(r.result_type or {'kind': 'alfa'})
+                if rname not in r.locals and rname not in param_names:
+                    hoisted.append(
+                        (_py_name(rname), self.zero_value(rtype, rname)))
+        if hoisted:
+            self.w(f'def _static_{name}():')
+            self.indent = base + 1
+            for pname, zero in hoisted:
+                self.w(f'{pname} = {zero}')
+            def_indent = base + 1
+            self.indent = def_indent
+        else:
+            def_indent = base
         self.w(f'def {name}({", ".join(params) if params else ""}):')
-        self.indent = base + 1
+        self.indent = def_indent + 1
         # Переменные программы, к которым обращается подпрограмма,
         # объявляются глобальными (в Паскале — обычные переменные).
         shadow = {pname for pname, _t, _m in r.params}
@@ -355,18 +390,21 @@ class Emitter:
             {**r.locals, **{p[0]: p[1] for p in r.params}})
         if outer:
             self.w('global ' + ', '.join(outer))
-        if enclosing:
-            self.w('nonlocal ' + ', '.join(_py_name(v) for v in enclosing))
+        nonlocal_names = [_py_name(v) for v in enclosing]
+        nonlocal_names += [pname for pname, _zero in hoisted]
+        if nonlocal_names:
+            self.w('nonlocal ' + ', '.join(nonlocal_names))
         saved = self.routine
         self.routine = r
         for _c, (raw, value) in r.consts.items():
             self.w(f'{_const_name(raw)} = {self.const_value(value)}')
-        # Параметры не инициализируются: они приходят из вызова.
-        param_names = {pname for pname, _pty, _mode in r.params}
-        for lname, lty in r.locals.items():
-            if lname.startswith('#') or lname in param_names:
-                continue
-            self.w(f'{_py_name(lname)} = {self.zero_value(lty, lname)}')
+        if not top:
+            # Локальные вложенных подпрограмм инициализируются при
+            # каждом вызове (см. комментарий в начале метода).
+            for lname, lty in r.locals.items():
+                if lname.startswith('#') or lname in param_names:
+                    continue
+                self.w(f'{_py_name(lname)} = {self.zero_value(lty, lname)}')
         if r.nested:
             for sub in r.nested:
                 self.w('')
@@ -375,7 +413,8 @@ class Emitter:
         if r.is_function:
             rname = self.result_variable(r)
             rtype = self.resolve(r.result_type or {'kind': 'alfa'})
-            if rname not in r.locals and rname not in param_names:
+            if not top and rname not in r.locals \
+                    and rname not in param_names:
                 self.w(f'{_py_name(rname)} = {self.zero_value(rtype, rname)}')
             if self._reads_input(r):
                 # Сторож офлайн-прогона: когда ввод исчерпан, программа
@@ -385,7 +424,7 @@ class Emitter:
                 self.w('try:')
                 self.indent += 1
                 self.block(body)
-                self.indent = base + 1
+                self.indent = def_indent + 1
                 self.w('except _ExitRoutine as _e:')
                 self.indent += 1
                 self.w(f'if _e.rid != {self.rid}: raise')
@@ -415,7 +454,7 @@ class Emitter:
                 self.w('try:')
                 self.indent += 1
                 self.block(body)
-                self.indent = base + 1
+                self.indent = def_indent + 1
                 self.w('except _ExitRoutine as _e:')
                 self.indent += 1
                 self.w(f'if _e.rid != {self.rid}: raise')
@@ -423,6 +462,11 @@ class Emitter:
         if var_names:
             self.w('return (' + ', '.join(var_names) + ')')
         self.routine = saved
+        if hoisted:
+            self.indent = def_indent
+            self.w(f'return {name}')
+            self.indent = base
+            self.w(f'{name} = _static_{name}()')
         self.indent = base
         self.rid += 1
         if self.shadow_stack:
@@ -792,10 +836,24 @@ class Emitter:
             dims = aty.get('index') or []
             items = [self.expr(it[1]) for it in value[1]]
             if len(dims) > 1:
+                # Литерал двумерного массива плоский и заполняет массив
+                # по строкам: `[1..NП,0..4]` с 20 значениями — это четыре
+                # строки по пять (`ПХ.МС` — позы крыльев птицы в `ПТИЦА`).
+                # Резать нужно по размеру ВТОРОЙ размерности; прежнее
+                # целиком реплицированное значение давало четыре одинаковые
+                # строки и одну позу на все взмахи.
                 lo0, hi0 = dims[0]
+                lo1, hi1 = dims[1]
                 rows = hi0 - lo0 + 1
-                inner = ', '.join(items)
-                items = [f'[{inner}]' for _ in range(rows)]
+                cols = hi1 - lo1 + 1
+                if cols > 0 and len(items) == rows * cols:
+                    items = ['[' + ', '.join(
+                        items[r * cols:(r + 1) * cols]) + ']'
+                             for r in range(rows)]
+                else:
+                    # Неполный литерал — прежняя репликация строк.
+                    inner = ', '.join(items)
+                    items = [f'[{inner}]' for _ in range(rows)]
             return "{'" + arr[0] + "': [" + ', '.join(items) + ']}'
         return self.expr(value)
 

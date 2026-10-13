@@ -40,6 +40,17 @@ log = logging.getLogger(__name__)
 VUK_HEADER_CODE = 0o172  # 'z'
 VUK_HEADER_LEN = 20       # длина служебной записи в байтах вместе с 'z'
 
+#: Коды `≡240` (`SC_ROW`) в потоке.
+#:
+#: На реальной линии приходит код 0o240 как есть.  В потоках, снятых
+#: нашими средствами (`tools/pascal/runtime.py`), `≡240` проходит через
+#: КОИ-8 как NBSP и приходит 0o232 (то же — для `≡267` и других
+#: типографских кодов).  Оба варианта допустимы.
+SC_ROW_CODES = (SC_ROW, 0o232)
+
+#: Служебный хвост `ВНУК`: `≡257≡215` и заполнитель нулями.
+VUK_LINE_END = bytes((0o257, SC_ENDTEXT))
+
 #: Префикс блока ВУК: `'/'` + ВК.
 VUK_BLOCK = bytes((ord('/'), VK))
 
@@ -78,8 +89,6 @@ class _State(Enum):
     NORMAL = auto()
     VUK_HEADER = auto()
     VUK_PAYLOAD = auto()
-    DEFCHAR_CODE = auto()   # ждём 7 байт кода знака
-    DEFCHAR_ROWS = auto()   # собираем строки знака до 0o215
 
 
 class CommandStreamReader:
@@ -95,14 +104,13 @@ class CommandStreamReader:
         self._pos = 0
         self._closed = False
         self._state = _State.NORMAL
-        #: Код знака, загружаемого командой `≡110`.
-        self._defcode = 0
-        self._defrows: list[int] = []
         #: Последняя запись `9 S ВК` — её данные придут следующей записью.
         self._text_size: bytes = b''
         #: Накопленные данные строки текста.
         self._text_buf = bytearray()
         self._text_mode = False
+        #: Строка текста без записей `ВК` (данные до `≡215`).
+        self._row_mode = False
 
     # ── состояние ────────────────────────────────────────────────────────────
 
@@ -126,6 +134,10 @@ class CommandStreamReader:
             return
         self._closed = True
         self._flush_text()
+        if self._row_mode and self._buf:
+            row, self._row_mode = bytes(self._buf), False
+            self._buf.clear()
+            self._emit(EventKind.COMMAND, row, row=True)
         if self._buf:
             self._emit(EventKind.COMMAND, bytes(self._buf))
             self._buf.clear()
@@ -175,20 +187,6 @@ class CommandStreamReader:
                     return
                 continue
 
-            if st is _State.DEFCHAR_CODE:
-                if len(self._buf) < 7:
-                    return
-                self._defcode = self._take(7)[0] & 0o77
-                self._defrows = []
-                self._pos += 6
-                self._state = _State.DEFCHAR_ROWS
-                continue
-
-            if st is _State.DEFCHAR_ROWS:
-                if not self._defrow_step():
-                    return
-                continue
-
             if not self._normal_step():
                 return
 
@@ -206,10 +204,29 @@ class CommandStreamReader:
             self._emit(EventKind.TEXT_LINE)
             return True
 
-        # возврат к русскому шрифту: 0o273 0o240
-        if head[:2] == bytes((0o273, SC_ROW)):
+        # Строка набора: 0o273 0o240 … 0o215 (так пишет строки `СИМВОЛЫ`
+        # в graf.pas).  Пара — признак строки данных: знаки идут до
+        # `≡215` без записей `ВК`; регистр (русский/латинский) задают
+        # коды `0o16`/`0o17` внутри строки, поэтому сам маркер шрифт
+        # не меняет: таблица знаков ведёт и латинскую, и русскую секции.
+        if head[:2] in (bytes((0o273, SC_ROW)), bytes((0o273, 0o232))):
             self._skip(2)
-            self._emit(EventKind.RU_FONT)
+            self._row_mode = True
+            return True
+
+        # данные строки текста — до `≡215` (конец текста)
+        if self._row_mode:
+            return self._text_row_step()
+
+        # Служебный хвост ВНУК: `≡257≡215` и заполнитель нулями.  Встречается
+        # после строк набора и после блоков знаков; без обработчика он
+        # съедал следующую строку вместе с записью.
+        if bytes(self._buf[:2]) == VUK_LINE_END:
+            self._skip(2)
+            zeros = 0
+            while zeros < 14 and self._buf[:1] == b'0':
+                self._skip(1)
+                zeros += 1
             return True
 
         # заполнитель кадра: 0o32 ВК (терминал не выполняет операции)
@@ -225,11 +242,14 @@ class CommandStreamReader:
             self._emit(EventKind.VUK_BLOCK, VUK_BLOCK, vuk=True)
             return True
 
-        # загрузка пользовательского знака: 0o110 0o240
-        if head[:2] == bytes((0o110, SC_ROW)):
-            self._skip(2)
-            self._emit(EventKind.DEFCHAR)
-            self._state = _State.DEFCHAR_CODE
+        # Описание пользовательского знака: `≡110≡240 … ≡215`
+        if head[:2] in (bytes((0o110, SC_ROW)), bytes((0o110, 0o232))):
+            end = self._buf.find(SC_ENDTEXT)
+            if end < 0:
+                return False
+            block = bytes(self._buf[:end + 1])
+            self._skip(end + 1)
+            self._emit(EventKind.DEFCHAR, block, defchar=True)
             return True
 
         # маркер конца потока
@@ -267,11 +287,13 @@ class CommandStreamReader:
         if rec[:1] == b';' or self._text_mode:
             if len(rec) <= 2:            # одиночный символ — продолжение
                 self._text_mode = True
+                # Разделитель записей `ВК` внутрь строки не попадает.
+                piece = rec[:-1] if rec.endswith(bytes((VK,))) else rec
                 if rec[:1] == b';':
                     self._flush_text()
-                    self._text_buf = bytearray(rec)
+                    self._text_buf = bytearray(piece)
                 else:
-                    self._text_buf += rec
+                    self._text_buf += piece
                 return True
             # Строка закончилась: отдаём накопленное, запись разбирается
             # как обычная команда.
@@ -287,6 +309,31 @@ class CommandStreamReader:
             return
         buf, self._text_buf = bytes(self._text_buf), bytearray()
         self._emit(EventKind.COMMAND, buf, text=True)
+
+    def _text_row_step(self) -> bool:
+        """Строка текста без записей `ВК`: знаки идут до `≡215` (конец текста).
+
+        Так строки набора пишет `СИМВОЛЫ` в graf.pas: после пары
+        `≡033≡306≡336≡215` `≡273≡240` следуют знаки строки, за ними
+        `≡215` и служебный хвост `ВНУК`.  У строки, которая заканчивается
+        хвостом напрямую (демо-строка заказных знаков), перед `≡215`
+        стоит `≡257` — он часть хвоста, а не знак.
+        """
+        end = self._buf.find(SC_ENDTEXT)
+        if end < 0:
+            return False
+        row = bytes(self._buf[:end])
+        self._skip(end + 1)
+        self._row_mode = False
+        if row.endswith(VUK_LINE_END[:1]):       # `≡257` — начало хвоста ВНУК
+            row = row[:-1]
+            zeros = 0
+            while zeros < 14 and self._buf[:1] == b'0':
+                self._skip(1)
+                zeros += 1
+        if row:
+            self._emit(EventKind.COMMAND, row, row=True)
+        return True
 
     def _emit_frame_marker(self, rec: bytes) -> None:
         """Разобрать ESC-запись кадра.
@@ -328,39 +375,16 @@ class CommandStreamReader:
                     while len(payload) >= 4 and payload[-4:-3] == bytes((AR2,)):
                         self._emit(EventKind.FRAME_BEGIN, payload[-4:])
                         payload = payload[:-4]
-                    if payload:
-                        self._emit(EventKind.COMMAND, payload, payload=True)
-                self._emit(EventKind.FRAME_END,
-                           bytes(self._buf[idx:idx + n]))
-                self._skip(idx + n)
+                marker = bytes(self._buf[idx:idx + n])
+                del self._buf[idx:idx + n]
+                if payload:
+                    # Нагрузка блока — обычные записи и строки текста
+                    # (`СИМВОЛЫ`): возвращаем её в разбор, а не считаем
+                    # одной нераспознанной командой.
+                    self._buf[:idx] = payload
+                self._pos += n
+                self._emit(EventKind.FRAME_END, marker)
                 self._state = _State.NORMAL
                 return True
             idx = self._buf.find(AR2, idx + 1)
-        return False
-
-    # ── пользовательский знак ───────────────────────────────────────────────
-
-    def _defrow_step(self) -> bool:
-        """Собрать строки пользовательского знака до `0o215`."""
-        while self._buf:
-            b = self._buf[0]
-            if b == SC_ROW:                       # начало строки
-                self._skip(1)
-                if len(self._buf) < 3:
-                    return False
-                self._defrows.append(self._take(3)[0] & 0o377)
-                self._pos += 2
-                continue
-            if b == SC_ENDTEXT:                   # конец знака
-                self._skip(1)
-                self._emit(EventKind.COMMAND,
-                           bytes((0o110, SC_ROW)) +
-                           bytes((self._defcode,)) +
-                           bytes(self._defrows) +
-                           bytes((SC_ENDTEXT,)),
-                           defchar=True)
-                self._state = _State.NORMAL
-                return True
-            # Неожиданный байт — пропускаем.
-            self._skip(1)
         return False

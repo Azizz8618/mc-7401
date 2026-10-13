@@ -57,11 +57,18 @@ class Viewport:
         то есть минимальный подходящий масштаб — это **наибольшее** из
         двух требований.  Раньше здесь стояло наименьшее, и кадр не
         влезал: в окне оставался его угол, а остальное — пустота.
+
+        Кадр встаёт в **верхний левый угол** окна (`x = y = 0`), а не по
+        центру: так же ведёт себя настоящий 15ИЭ-00-013, у которого кадр
+        ЭВМ начинается с левого верхнего угла окна и растёт вниз
+        (см. `ie15/README.md`: «кадр ЭВМ начинается с четвёртого ряда
+        окна»).  Центрирование осталось отдельной командой — `Ctrl-c`.
         """
         by_x = -(-fb.width // max(1, cols))          # ceil
         by_y = -(-fb.height // max(1, rows * 2))
         self.scale = max(1, max(by_x, by_y))
-        self.center(fb, cols, rows)
+        self.x = 0
+        self.y = 0
 
     def center(self, fb: Framebuffer, cols: int, rows: int) -> None:
         span_x = max(1, cols * self.scale)
@@ -85,26 +92,36 @@ class ScreenRenderer:
 
     # ── выборка пикселей ────────────────────────────────────────────────────
 
-    def _on(self, px: int, py_top: int) -> bool:
-        """Есть ли зажжённый пиксель в ячейке знакоместа.
+    def _cell_runs(self, py_top: int) -> list[list[tuple[int, int]]]:
+        """Серии зажжённых точек в двух половинах ячейки знакоместа.
 
-        `px`, `py_top` — координаты **сверху вниз**, как их видит терминал;
-        кадр использует `Y` вверх, поэтому `Y` отражается.
+        Выборка идёт **по сериям**, а не по точкам: обход `fb.get()` в
+        каждой ячейке на кадре 560×400 стоил 20 мс, и перерисовка окна на
+        каждое нажатие отставала.  Серии ряда берутся один раз и
+        переиспользуются всеми ячейками ряда.
 
         Выборка «максимальная», а не усреднение: тонкая линия на
         уменьшенном масштабе остаётся видимой, тогда как при усреднении
         исчезает.
         """
-        s = self.vp.scale
+        fb, s = self.fb, self.vp.scale
+        top, bottom = [], []
         for dy in range(s):
-            row = py_top + dy                       # сверху вниз
-            yy = self.fb.height - 1 - row           # Y кадра (вверх)
-            if not 0 <= yy < self.fb.height:
-                continue
-            for dx in range(s):
-                xx = px + dx
-                if 0 <= xx < self.fb.width and self.fb.get(xx, yy):
-                    return True
+            for runs, row in ((top, py_top + dy), (bottom, py_top + s + dy)):
+                yy = fb.height - 1 - row             # Y вверх → строки вниз
+                if 0 <= yy < fb.height:
+                    runs.extend(fb.row_runs(yy))
+        return top, bottom
+
+    @staticmethod
+    def _hit(runs: list[tuple[int, int]], px: int, span: int) -> bool:
+        """Пересекает ли блок `px … px+span` хоть одна серия."""
+        x1 = px + span
+        for x0, x2 in runs:
+            if x0 >= x1:
+                return False
+            if x2 > px:
+                return True
         return False
 
     # ── вывод ───────────────────────────────────────────────────────────────
@@ -121,19 +138,17 @@ class ScreenRenderer:
         out: list[str] = []
         for row in range(rows):
             py_top = vp.y + row * vp.scale * 2      # Y вниз от верхнего края
+            top, bottom = self._cell_runs(py_top)
             line: list[str] = []
             for col in range(cols):
                 px = vp.x + col * vp.scale
-                up = self._on(px, py_top)
-                down = self._on(px, py_top + vp.scale)
-                if up and down:
-                    line.append(BLOCK_FULL if self.mode == 'color' else MONO_ON)
-                elif up:
-                    line.append(BLOCK_UP if self.mode == 'color' else MONO_ON)
-                elif down:
-                    line.append(BLOCK_DOWN if self.mode == 'color' else MONO_OFF)
-                else:
-                    line.append(BLOCK_EMPTY)
+                up = self._hit(top, px, vp.scale)
+                down = self._hit(bottom, px, vp.scale)
+                # Зажжён любой из двух пикселей ячейки — «включено»,
+                # пустая — «выключено» (а не пробел: иначе горизонтальные
+                # линии на нечётных рядах исчезали).  Раньше нижний пиксель
+                # давал символ «выключено».
+                line.append(MONO_ON if (up or down) else MONO_OFF)
             out.append(''.join(line))
         return '\n'.join(out)
 
@@ -149,14 +164,17 @@ class ScreenRenderer:
         out: list[str] = []
         for row in range(rows):
             py_top = vp.y + row * vp.scale * 2
+            top, bottom = self._cell_runs(py_top)
             parts: list[str] = []
             for col in range(cols):
                 px = vp.x + col * vp.scale
-                up = self._on(px, py_top)
-                down = self._on(px, py_top + vp.scale)
+                up = self._hit(top, px, vp.scale)
+                down = self._hit(bottom, px, vp.scale)
                 if not up and not down:
-                    continue
-                if up and not down:
+                    # По знаку на ячейку: `continue` схлопывал колонки, и
+                    # горизонтальные координаты кадра терялись.
+                    parts.append(' ')
+                elif up and not down:
                     parts.append(f'\x1b[38;2;{FG[0]};{FG[1]};{FG[2]}m▀'
                                  f'\x1b[0m')
                 elif down and not up:

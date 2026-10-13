@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>МС 7401 — снимки кадров</title>
+<style>
+ body { background:#0b1410; color:#cfe8d8; font:14px/1.5 system-ui, sans-serif;
+        margin:2rem auto; max-width:1100px; padding:0 1rem; }
+ h1 { font-weight:600; } a { color:#7dcea0; }
+ .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+          gap:1.2rem; }
+ figure { margin:0; background:#12241b; border:1px solid #23493a;
+           border-radius:8px; padding:.6rem; }
+ img { width:100%; image-rendering:pixelated; background:#08140c; }
+ figcaption { padding:.5rem .2rem 0; font-size:13px; }
+</style>
+</head>
+<body>
+<h1>Электроника МС 7401 — снимки кадров</h1>
+<p>19 кадров из эталонных потоков <code>golden/streams/</code>
+(программа <code>graf.pas</code>). Кадр — то, что видел оператор:
+самое наполненное состояние экрана.</p>
+<div class="grid">
+  <figure>
+    <a href="render/ГРА.png"><img src="render/ГРА.png" alt="ГРА" loading="lazy"></a>
+    <figcaption><b>ГРА</b> — граф: полный граф на N вершинах<br>
+      <a href="render/ГРА.svg">SVG</a> · <a href="streams/ГРА.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ЗАГ.png"><img src="render/ЗАГ.png" alt="ЗАГ" loading="lazy"></a>
+    <figcaption><b>ЗАГ</b> — заголовок: титульный экран с текстом<br>
+      <a href="render/ЗАГ.svg">SVG</a> · <a href="streams/ЗАГ.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/КИНО.png"><img src="render/КИНО.png" alt="КИНО" loading="lazy"></a>
+    <figcaption><b>КИНО</b> — кино: движение окружности<br>
+      <a href="render/КИНО.svg">SVG</a> · <a href="streams/КИНО.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/КОТ.png"><img src="render/КОТ.png" alt="КОТ" loading="lazy"></a>
+    <figcaption><b>КОТ</b> — ко��: криволинейный рисунок<br>
+      <a href="render/КОТ.svg">SVG</a> · <a href="streams/КОТ.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ЛЕД.png"><img src="render/ЛЕД.png" alt="ЛЕД" loading="lazy"></a>
+    <figcaption><b>ЛЕД</b> — леди: фигура «леди»<br>
+      <a href="render/ЛЕД.svg">SVG</a> · <a href="streams/ЛЕД.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ЛИН.png"><img src="render/ЛИН.png" alt="ЛИН" loading="lazy"></a>
+    <figcaption><b>ЛИН</b> — линии: образцы типов линий 1…7<br>
+      <a href="render/ЛИН.svg">SVG</a> · <a href="streams/ЛИН.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ОКР.png"><img src="render/ОКР.png" alt="ОКР" loading="lazy"></a>
+    <figcaption><b>ОКР</b> — окружности: серия окружностей со смещением окна<br>
+      <a href="render/ОКР.svg">SVG</a> · <a href="streams/ОКР.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ПТИ.png"><img src="render/ПТИ.png" alt="ПТИ" loading="lazy"></a>
+    <figcaption><b>ПТИ</b> — птица: анимация полёта (кадр для начального экрана)<br>
+      <a href="render/ПТИ.svg">SVG</a> · <a href="streams/ПТИ.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/РОЗ.png"><img src="render/РОЗ.png" alt="РОЗ" loading="lazy"></a>
+    <figcaption><b>РОЗ</b> — роза: розетка со случайным именем<br>
+      <a href="render/РОЗ.svg">SVG</a> · <a href="streams/РОЗ.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/СЕТ.png"><img src="render/СЕТ.png" alt="СЕТ" loading="lazy"></a>
+    <figcaption><b>СЕТ</b> — сетка: рамка и линии через 7 точек<br>
+      <a href="render/СЕТ.svg">SVG</a> · <a href="streams/СЕТ.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/СИМ.png"><img src="render/СИМ.png" alt="СИМ" loading="lazy"></a>
+    <figcaption><b>СИМ</b> — символы: таблица знаков и заказные знаки<br>
+      <a href="render/СИМ.svg">SVG</a> · <a href="streams/СИМ.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/СОЛ.png"><img src="render/СОЛ.png" alt="СОЛ" loading="lazy"></a>
+    <figcaption><b>СОЛ</b> — солнце: 150 концентрических окружностей<br>
+      <a href="render/СОЛ.svg">SVG</a> · <a href="streams/СОЛ.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ТЕК.png"><img src="render/ТЕК.png" alt="ТЕК" loading="lazy"></a>
+    <figcaption><b>ТЕК</b> — текст: вывод строки символов<br>
+      <a href="render/ТЕК.svg">SVG</a> · <a href="streams/ТЕК.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ТИП.png"><img src="render/ТИП.png" alt="ТИП" loading="lazy"></a>
+    <figcaption><b>ТИП</b> — тип линии 3 и сетка<br>
+      <a href="render/ТИП.svg">SVG</a> · <a href="streams/ТИП.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/УЗО.png"><img src="render/УЗО.png" alt="УЗО" loading="lazy"></a>
+    <figcaption><b>УЗО</b> — узор: фрактальный узор<br>
+      <a href="render/УЗО.svg">SVG</a> · <a href="streams/УЗО.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ФУН.png"><img src="render/ФУН.png" alt="ФУН" loading="lazy"></a>
+    <figcaption><b>ФУН</b> — функция: затухающая синусоида с рамкой<br>
+      <a href="render/ФУН.svg">SVG</a> · <a href="streams/ФУН.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ЦЕП.png"><img src="render/ЦЕП.png" alt="ЦЕП" loading="lazy"></a>
+    <figcaption><b>ЦЕП</b> — цепь: имитация схемы<br>
+      <a href="render/ЦЕП.svg">SVG</a> · <a href="streams/ЦЕП.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ЧАС.png"><img src="render/ЧАС.png" alt="ЧАС" loading="lazy"></a>
+    <figcaption><b>ЧАС</b> — часы: циферблат со стрелками<br>
+      <a href="render/ЧАС.svg">SVG</a> · <a href="streams/ЧАС.bin">поток</a></figcaption>
+  </figure>
+  <figure>
+    <a href="render/ШАР.png"><img src="render/ШАР.png" alt="ШАР" loading="lazy"></a>
+    <figcaption><b>ШАР</b> — шар: псевдообъёмный шар<br>
+      <a href="render/ШАР.svg">SVG</a> · <a href="streams/ШАР.bin">поток</a></figcaption>
+  </figure>
+</div>
+</body>
+</html>

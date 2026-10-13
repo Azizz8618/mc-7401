@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 
 from mc7401 import Framebuffer, TerminalEmulator                     # noqa: E402
 from mc7401.chars import glyph_matrix                               # noqa: E402
-from mc7401.constants import END, S0, VK                          # noqa: E402
+from mc7401.constants import END, S0, S1, VK                          # noqa: E402
 from mc7401.reader import PAD_CMD                                     # noqa: E402
 from mc7401.link import (                                           # noqa: E402
     IacStripper, LinkError, busy_reply, parse_port_spec, spec_hint, split_endpoint,
@@ -197,9 +197,10 @@ def render(name: str) -> Framebuffer:
     """Отрисовать эталонный поток и вернуть кадр оператора.
 
     Программа (`graf.pas`) очищает экран командой `S` в начале каждой
-    картины и оставляет его пустым после выхода.  Поэтому берётся
-    состояние на границе блока ВУК с наибольшим числом точек — именно
-    его видел оператор.  Так же работает `tools/gen_golden.py`.
+    картины и оставляет его пустым после выхода.  Поэтому берётся самое
+    «наполненное» состояние кадра — после каждой команды: `ПТИЦА`
+    рисует птицу пером `+` и тут же стирает пером `≠` внутри одного
+    блока ВУК.  Так же работает `tools/gen_golden.py`.
     """
     path = GOLDEN / f'{name}.bin'
     if not path.exists():                     # поток не сгенерирован
@@ -210,11 +211,11 @@ def render(name: str) -> Framebuffer:
     reader.feed(path.read_bytes())
     reader.close()
     for ev in reader.pop():
-        if ev.kind is EventKind.VUK_BLOCK:
+        emu.handle_event(ev)
+        if ev.kind is EventKind.COMMAND:
             n = emu.fb.count_set()
             if n > best_n:
                 best, best_n = emu.fb.copy(), n
-        emu.handle_event(ev)
     return best if best_n else emu.fb
 
 
@@ -266,6 +267,199 @@ def test_copy_is_independent():
     c.point(6, 6)
     assert not fb.get(6, 6)
     assert c.get(5, 5)
+
+
+# ── дефекты 2026-10-10: зеркальный кадр, латиница, смещение окна ───────────
+
+def test_frame_output_is_top_down():
+    """Вывод кадра — сверху вниз, как на экране.
+
+    Строка хранения 0 — верх экрана; раньше все backend'ы шли по строкам
+    хранения с конца, и PNG/SVG/Tk/Pygame выходили зеркальными по
+    вертикали (линии шли в обратном порядке, знаки — вверх ногами).
+    """
+    from mc7401.backends import BG, FG, framebuffer_pixels
+    fb = Framebuffer()
+    fb.point(0, 399)                       # верхний левый угол кадра
+    rows = list(framebuffer_pixels(fb, FG, BG))
+    assert rows[0][0] == FG                # первая строка вывода — верх
+    assert rows[-1][0] == BG
+
+
+def test_svg_keeps_screen_orientation():
+    """SVG: верх кадра — y=0, а не y=399."""
+    from mc7401.backends import SVGBackend
+    fb = Framebuffer()
+    fb.point(5, 399)                       # верх кадра
+    svg = SVGBackend(fb).to_svg()
+    assert 'y1="0"' in svg
+    assert 'y1="399"' not in svg
+
+
+def test_s0_inside_string_switches_glyphs_immediately():
+    """`S0` переключает набор внутри строки, а не после неё.
+
+    Признак набора обновлялся в разборе строки и не доходит до выбора
+    глифов: «ИТМ» после `S0` рисовалось латинскими «itm» (титульный
+    экран `ЗАГ`).
+    """
+    from mc7401.chars import glyph_matrix, text_offsets
+    emu = run(stream('J1', '4 0 300', b'9\x01',
+                     ';\x00 ' + chr(S0) + 'ИТМ'))
+    exp = set()
+    for n, code in enumerate('ИТМ'.encode('koi8-r')):
+        for dx, dy in text_offsets(glyph_matrix(code & 0x7F, True), 0, 1):
+            exp.add((n * 8 + dx, 300 + dy))
+    got = {(x, y) for y in range(400) for x in range(560) if emu.fb.get(x, y)}
+    assert got == exp
+
+
+def test_font_set_changes_mid_string():
+    """`S0`/`S1` внутри строки меняют набор для последующих знаков."""
+    from mc7401.chars import glyph_matrix, text_offsets
+    emu = run(stream('J1', '4 0 300', b'9\x01',
+                     ';\x00 ' + chr(S0) + 'ВТ' + chr(S1) + ' ' + chr(S0) + 'АН'))
+    exp = set()
+    x0 = 0
+    for code, ru in ((0xF7, True), (0xF4, True), (0x20, False),
+                     (0xE1, True), (0xEE, True)):
+        for dx, dy in text_offsets(glyph_matrix(code, ru), 0, 1):
+            exp.add((x0 + dx, 300 + dy))
+        x0 += 8
+    got = {(x, y) for y in range(400) for x in range(560) if emu.fb.get(x, y)}
+    assert got == exp
+
+
+def test_window_shift_translates_coordinates():
+    """`}` (`СМЕЩ` в graf.pas) переносит начало координат.
+
+    В `ОКР` рисунок задан координатами за краем экрана (пары кругов
+    около x=980 при `СМЕЩ(700,0)`): раньше смещение двигало только
+    прямоугольник отсечения, и круги отсекались целиком.
+    """
+    emu = run(stream('J1', '} 700 0', '4 835 200', '>1 0'))
+    assert emu.fb.get(135, 200)            # 835 − 700, 200 − 0
+    assert emu.fb.count_set() == 1
+
+
+def test_coordinates_outside_screen_are_clipped():
+    """Точка за экраном не рисуется и без смещения окна."""
+    emu = run(stream('J1', '4 835 200', '>1 0'))
+    assert emu.fb.count_set() == 0
+
+
+def test_pick_frame_sees_picture_before_xor_erase():
+    """Кадр выбирается после каждой команды, а не на границе блока ВУК.
+
+    `ПТИЦА` рисует птицу пером `+` и тут же стирает пером `≠` внутри
+    одного блока: снимок по блокам неизменно попадал на пустое место и
+    вместо птицы оставалась точечная траектория.
+    """
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import gen_golden
+    xor_pen = bytes((0o256,))                        # `≠` — инвертирующее перо
+    data = stream('J1', '4 100 100', '+', '7 1 200 200',
+                  xor_pen, '7 1 200 200')
+    fb, _ = gen_golden.pick_frame(data)
+    assert fb.count_set() > 0          # поймано между рисованием и стиранием
+
+
+def test_reset_accepts_cyrillic_k():
+    """Сброс `К` в graf.pas записан кириллической буквой (байт 0xEB)."""
+    emu = run(stream('J1', '4 10 10', '>1 5', b'\xeb'))
+    assert emu.fb.count_set() == 0
+    assert (emu.state.x, emu.state.y) == (0, 0)
+
+
+def test_symbol_table_rows_are_drawn():
+    """Строки набора `СИМВОЛЫ` идут без записей `ВК` — до `≡215`.
+
+    Раньше они терялись внутри нагрузки блока ВУК («нераспознано»), и
+    таблица знаков не выводилась вовсе.
+    """
+    row = bytes(range(0x21, 0x30))                    # !\"#$%&'()*+,-./
+    data = (stream('J1', '4 40 340', '91', ':0 ')
+            + bytes((0x1B, 0o306, 0o336, 0o215))       # ≡033≡306≡336≡215
+            + bytes((0o273, 0o232))                    # ≡273≡240
+            + row
+            + bytes((0o215, 0o257, 0o215)) + b'0' * 14)
+    emu = TerminalEmulator()
+    emu.run(data)
+    assert emu.stats['chars'] == len(row)
+    assert emu.fb.count_set() > 0
+
+
+def test_symbol_table_rows_are_literal():
+    """В строке набора каждый байт — код знака, включая `p`/`q`.
+
+    Коды 0o170/0o171 совпадают с переключателями шрифта `S0`/`S1`, но в
+    таблице знаков они должны выводиться как знаки (иначе из таблицы
+    пропадают `p` и `q`, а на русской странице — «п» и «я»).
+    """
+    from mc7401.chars import glyph_matrix, text_offsets
+    data = (stream('J1', '4 0 300', '91', ':0 ')
+            + bytes((0x1B, 0o306, 0o336, 0o215))
+            + bytes((0o273, 0o232))
+            + b'pq'
+            + bytes((0o215, 0o257, 0o215)) + b'0' * 14)
+    emu = TerminalEmulator()
+    emu.run(data)
+    exp = set()
+    for n, code in enumerate(b'pq'):
+        for dx, dy in text_offsets(glyph_matrix(code, False), 0, 1):
+            exp.add((n * 8 + dx, 300 + dy))
+    got = {(x, y) for y in range(400) for x in range(560) if emu.fb.get(x, y)}
+    assert got == exp
+
+
+def test_symbol_table_rows_switch_register():
+    """Регистр строки набора переключают коды `0o16`/`0o17` (SO/SI, 15ИЭ).
+
+    Так в таблице знаков `СИМВОЛЫ` уживаются обе секции: латинская
+    (`0o17` в начале строки — позиции `A-Z`, `a-z`) и русская (`0o16` —
+    зоны `0o60..0o7E` и `0o40..0o5E`).
+    """
+    from mc7401.chars import glyph_matrix, text_offsets
+    data = (stream('J1', '4 0 300', '91', ':0 ')
+            + bytes((0x1B, 0o306, 0o336, 0o215))
+            + bytes((0o273, 0o232))
+            + bytes((0o17,)) + b'AB' + bytes((0o16,)) + b'\xc1\xfe'
+            + bytes((0o215, 0o257, 0o215)) + b'0' * 14)
+    emu = TerminalEmulator()
+    emu.run(data)
+    exp = set()
+    x0 = 0
+    for code, ru in ((ord('A'), False), (ord('B'), False),
+                     (0xC1, True), (0xFE, True)):
+        for dx, dy in text_offsets(glyph_matrix(code, ru), 0, 1):
+            exp.add((x0 + dx, 300 + dy))
+        x0 += 8
+    got = {(x, y) for y in range(400) for x in range(560) if emu.fb.get(x, y)}
+    assert got == exp
+
+
+def test_printable_letters_survive_text_rows():
+    """`T` (0o124) и `U` (0o125) в строке набора — печатные знаки.
+
+    В таблице знаков есть вся латиница.  Раньше эти два знака гасились
+    как служебные (`АР2` и `ВК`); `U` и выразим только в строках набора
+    (до `≡215`) — в записях, разделённых `ВК`, он сам является
+    разделителем.
+    """
+    from mc7401.chars import glyph_matrix, text_offsets
+    data = (stream('J1', '4 0 300', '91', ':0 ')
+            + bytes((0x1B, 0o306, 0o336, 0o215))
+            + bytes((0o273, 0o232))
+            + b'TU'
+            + bytes((0o215, 0o257, 0o215)) + b'0' * 14)
+    emu = TerminalEmulator()
+    emu.run(data)
+    exp = set()
+    for n, code in enumerate(b'TU'):
+        for dx, dy in text_offsets(glyph_matrix(code, False), 0, 1):
+            exp.add((n * 8 + dx, 300 + dy))
+    got = {(x, y) for y in range(400) for x in range(560) if emu.fb.get(x, y)}
+    assert got == exp
 
 
 # ── связь с БЭСМ-6 по ДКС ─────────────────────────────────────────────────
@@ -575,8 +769,8 @@ def test_local_mode_buffers_until_send():
     assert s.type_line('ЛИН 3 ') == b''          # в линию не уходит
     assert s.pending() == b'lin 3 '               # КОИ-7, регистр свёрнут
     out = s.send()
-    # Конец строки на линии ДКС — ETX, а не ВК (как в 15ИЭ).
-    assert out.endswith(bytes((0o003,)))
+    # Конец строки на линии ДКС — ПР (как в 15ИЭ, `to_line` dks).
+    assert out.endswith(bytes((0o015,)))
     assert out.startswith(b'lin 3')
     assert s.pending() == b''                    # буфер очищен
 
@@ -681,3 +875,75 @@ def test_startup_screen_mentions_model_and_clock():
     assert '12:34:56' in text
     assert 'ДКС 127.0.0.1:4202' in text
     assert 'q — выход' in text
+
+
+# ── порядок КОИ-7: буквы БЭСМ-6 заглавными ──────────────────────────────────
+
+def test_koi7_letters_are_capitals():
+    """Буквы пути ДКС/Н2 — заглавные ЮАБЦДЕ… в обеих строках кодов.
+
+    Линия БЭСМ-6 регистронезависима (simh `unicode_to_koi7` складывает
+    оба регистра в строку `0x60…0x7F`), и по архитектуре терминала
+    (ПЗУ КР556РТ5, ГОСТ 27463-87) буквы показываются заглавными, а не
+    строчными.
+    """
+    from mc7401.chars import RUS7, display_char, display_dks, koi7_label
+    for row in (0x40, 0x60):
+        assert ''.join(koi7_label(row + i) for i in range(0x1F)) == RUS7
+    assert koi7_label(0x7C) == 'Э'                # заглавная, не «э»
+    assert display_dks(0x7C) == 'Э'
+    assert display_char(0x7C, 'n2') == 'Э'
+    assert koi7_label(0x7F) == '█'
+    assert koi7_label(0x5F) == 'Ъ'
+
+
+def test_koi8r_page_keeps_case():
+    """Страница КОИ-8Р (S0) не тронута: 0x60…0x7F — заглавные."""
+    from mc7401.chars import display_char
+    assert display_char(0x69, 'koi8r') == 'И'
+    assert display_char(0x49, 'koi8r') == 'и'
+
+
+# ── заказные знаки (`≡110≡240`) ─────────────────────────────────────────────
+
+def test_defchar_block_defines_custom_char():
+    """Блок знака `≡110≡240 … ≡215` определяет пользовательский знак.
+
+    Строки знака идут тремя глифами `WN` («N точек в знакоместе 3×3»);
+    значение 5 пишется кодом `≡065` («5»), а не `≡265` — из-за этого
+    знаки с пятёрками не загружались.
+    """
+    from mc7401 import chars
+    rows_mm = [0o376, 0o202, 0o202, 0o202, 0o202, 0o202, 0o376]   # рамка
+    block = bytearray((0o110, 0o240, 3, 0o267, 0o267))
+    for r in rows_mm:
+        block.append(0o240)
+        block += bytes((chars.DOT_GLYPH_CODES[(r >> 6) & 3],
+                        chars.DOT_GLYPH_CODES[(r >> 3) & 7],
+                        chars.DOT_GLYPH_CODES[r & 7]))
+    block.append(0o215)
+    parsed = chars.decode_defchar(bytes(block))
+    assert parsed is not None
+    code, rows = parsed
+    assert code == 3 and rows == tuple(rows_mm)
+    # значение 5 кодируется «5» (≡065)
+    assert chars.DOT_GLYPH_CODES[5] == 0o65
+
+
+def test_vuk_service_tail_does_not_eat_next_row():
+    """Хвост `ВНУК` (`≡257≡215` и нули) не должен съедать следующую строку.
+
+    Демо-строка заказных знаков идёт сразу после блоков знаков; раньше
+    хвост без обработчика превращал маркер строки с данными в одну
+    нераспознанную запись.
+    """
+    data = (stream('J1', '4 180 35')
+            + bytes((0o110, 0o240, 3, 0o267, 0o267))
+            + bytes((0o240, 0o63, 0o267, 0o66)) * 7 + bytes((0o215,))
+            + bytes((0o257, 0o215)) + b'0' * 14
+            + bytes((0x1B, 0o306, 0o336, 0o215))
+            + bytes((0o273, 0o240)) + bytes((1, 0o40, 2))
+            + bytes((0o257, 0o215)) + b'0' * 14)
+    emu = TerminalEmulator()
+    emu.run(data)
+    assert emu.stats['chars'] == 3

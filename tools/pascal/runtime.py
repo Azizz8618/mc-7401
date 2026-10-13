@@ -77,13 +77,21 @@ def to_wire_char(c: str) -> int:
     младшие восемь бит кода Unicode.  Латиница, цифры и знаки
     препинания в КОИ-8 совпадают с ASCII, поэтому командами потока
     ничего не портится.
+
+    Символы с кодом Unicode `0x80…0xFF` приходят из литералов `≡NNN`
+    (`≡240` → `chr(160)`) и уходят в линию кодом `NNN` как есть: в
+    КОИ-8 они отображаются на псевдографику (`NBSP` → `0x9A`, `·` →
+    `0x9E`), искажая служебные маркеры (`≡240`, `≡267`, `≡215`).
     """
     if c in CHAR_MAP:
         return CHAR_MAP[c]
+    code = ord(c)
+    if 0x80 <= code <= 0xFF:
+        return code
     try:
         return c.encode('koi8-r')[0]
     except UnicodeEncodeError:
-        return ord(c) & 0xFF
+        return code & 0xFF
 
 
 def _is_cyrillic(code: int) -> bool:
@@ -303,9 +311,7 @@ class Terminal:
         if not final and n < FLUSH_LIMIT:
             return False
         self.byte_count += n
-        self.wire += ord('/')
-        self.wire += VK
-        self.wire += VUK_MARK
+        self.wire += bytes((ord('/'), VK, VUK_MARK))
         self.wire += bytes(VUK_HEADER_LEN - 1)     # хвост служебной записи
         for ch in self.data:
             self.wire.append(to_wire_char(ch))

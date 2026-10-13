@@ -26,10 +26,14 @@ link.py — связь эмулятора МС 7401 с БЭСМ-6 по кана�
 from __future__ import annotations
 
 import logging
+import re
 import socket
 import time
+from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
+from . import chars
+from .constants import ETX
 from .emulator import TerminalEmulator
 from .reader import CommandStreamReader
 
@@ -128,13 +132,13 @@ class IacStripper:
     """Срезка telnet-IAC (RFC 854) из потока ЭВМ → терминал.
 
     Состояние между вызовами сохраняется: последовательность IAC может
-    прийти двумя чтениями.  Данные терминала не содержат 0xFF, поэтому
-    эсквейп IAC IAC сюда не попадает и просто отбрасывается.
+    прийти двумя чтениями.  Сабnegoциация (`IAC SB … IAC SE`) отбрасывается
+    целиком — до `IAC SE`, как бы ни была разбита по чтениям; `IAC IAC`
+    внутри её тела — экранированный IAC, а не конец.
     """
 
     def __init__(self) -> None:
         self.state = 'data'
-        self.skip = 0
 
     def feed(self, data: bytes) -> bytes:
         out = bytearray()
@@ -154,18 +158,197 @@ class IacStripper:
             elif self.state == 'opt':
                 self.state = 'data'              # код опции отброшен
             elif self.state == 'sb':
+                # Тело сабnegoциации отбрасывается до `IAC SE`.
                 if b == IAC:
-                    self.skip = 2                 # ждём IAC SE
-                else:
-                    self.state = 'data'
-            elif self.state == 'skip':
-                self.skip -= 1
-                if self.skip == 0:
-                    self.state = 'data'
+                    self.state = 'sb_iac'
+            elif self.state == 'sb_iac':
+                # После IAC в теле: SE — конец, IAC IAC — эсквейп,
+                # прочее — снова тело.
+                self.state = 'data' if b == SE else 'sb'
         return bytes(out)
 
 
 # ── канал связи ────────────────────────────────────────────────────────────
+
+class EchoStrip:
+    """Срезка эха линии ДКС: Э-60 всегда эхит отданные знаки.
+
+    По эталону 15ИЭ (`ie15emu/session.py::_queue_echo` +
+    `_strip_pending_echo`): эхо-ответ на отправленное срезается из
+    потока приёма.  Иначе набранное показывается дважды (локальное эхо
+    и эхо машины), а при выключенном ЭХО пароль виден в эхе машины.
+
+    Эхо не байт-в-байт (проверено на живой линии): ПР возвращается
+    ПС, ВК — тройкой «ВК ПРОБЕЛ ВК».
+    """
+
+    #: Как линия эхит отправленные управляющие знаки.
+    ECHO_OF = {0x0D: b"\n", 0x08: b"\x08 \x08"}
+
+    def __init__(self) -> None:
+        self.pending = bytearray()
+
+    def sent(self, data: bytes) -> None:
+        """Запомнить, что вернёт линия в эхо на отданные байты."""
+        for b in data:
+            self.pending += self.ECHO_OF.get(b, bytes((b,)))
+
+    def strip(self, data: bytes) -> bytes:
+        """Убрать из `data` эхо-ответ; остаток — настоящий вывод ЭВМ.
+
+        ПР и ПС при сверке неразличимы (линия эхит ПР как ПС).
+        Сверка идёт по префиксу: совпавшие байты — эхо, первое
+        несовпадение — вывод машины, он показывается целиком
+        (как в 15ИЭ `_strip_pending_echo`: очередь сохраняется —
+        эхо опоздавших знаков придёт позже и будет срезано).
+        """
+        if not self.pending:
+            return data
+        i, n = 0, len(data)
+        pend = self.pending
+        while i < n and pend:
+            b = data[i]
+            if b == pend[0] or (b in (0x0D, 0x0A) and pend[0] in (0x0D, 0x0A)):
+                pend.pop(0)
+                i += 1
+            else:
+                break
+        return bytes(data[i:])
+
+
+# ── баннер линии ────────────────────────────────────────────────────────────
+#
+# Строка состояния над кадром должна говорить, что за линия, и говорить
+# ПРАВДУ: тип, номер терминала и режим берутся из баннера SIMH, который
+# выдаёт обвязка стенда при подключении (его же разбирает эталон 15ИЭ —
+# `ie15/ie15emu/session.py::_parse_banner`).  Без разбора в строке стояло
+# постоянное «КВУ», и линия ДКС, объявленная баннером «Connected to DKS»,
+# выглядела как клавиатурно-вычислительный узел.
+#
+# Тип линии: `Connected to DKS` → «ДКС», обычный tty → «КВУ».
+
+# Баннер приходит кодами КОИ-7 в режиме `raw`: латиница лежит в
+# `0x40…0x5E`, а русские знаки — в `0x60…0x7E` и выводятся заглавными.
+# Поэтому «Connected to DKS» приходит на экране как «CОNNECTED TO DKS»:
+# часть букв — латинские коды, часть — кириллические омоглифы, и поиск
+# по сырым байтам не находит ни «Connected to DKS», ни «Encoding is RAW».
+# Сначала баннер приводится к тексту **тем же** способом, каким его
+# показывает знакогенератор (`chars.display_dks`), и уже по нему идут
+# все образцы — с заглавными буквами, потому что линия их переводит.
+
+#: «TTY DEVICE, LINE N» — номер терминала на линии.
+BANNER_LINE_NO = re.compile(r'TTY\s+DEVICE,?\s*LINE\s+(\d+)', re.IGNORECASE)
+#: Модель и номер ЭВМ в баннере: «ЭВМ-3», «the БЭСМ-6 simulator».
+BANNER_MACHINE = re.compile(r'(?:ЭВМ|БЭСМ|ЕС)\s*-?\s*(\d+)', re.IGNORECASE)
+#: Режим линии: `Encoding is …`.
+BANNER_MODE = (('raw', 'RAW'), ('utf-?8', 'UNICODE'),
+               ('koi-?7', 'JCUKEN'), ('jcuken', 'JCUKEN'))
+#: Маркер линии ДКС в баннере.
+BANNER_DKS = re.compile(r'CONNECTED\s+TO\s+DKS', re.IGNORECASE)
+
+
+@dataclass
+class LineInfo:
+    """Что баннер линии говорит о соединении."""
+
+    #: «ДКС» — линия объявлена как ДКС, «КВУ» — обычный tty, `''` — баннера нет.
+    kind: str = ''
+    #: Номер ЭВМ из приветствия ДКС («ЭВМ-3» → 3), 0 — неизвестно.
+    machine: int = 0
+    #: Номер терминала на линии (`TTY DEVICE, LINE N`), 0 — неизвестно.
+    terminal: int = 0
+    #: Режим линии из `Encoding is …`: `RAW` / `UNICODE` / `JCUKEN`.
+    wire: str = ''
+    #: Баннер получили? без него строка состояния показывает
+    #: «ПРОВЕРЬ ЛИНИЮ!» — линия не «отошла».
+    seen: bool = False
+    #: Сам баннер — для показа в подвале по запросу.
+    raw: str = ''
+
+    @property
+    def label(self) -> str:
+        return self.kind or 'НЕТ'
+
+
+def banner_text(data: bytes) -> str:
+    """Баннер как текст — теми же знаками, какими его показывает терминал.
+
+    Линия ДКС в режиме `raw` шлёт коды КОИ-7 и переводит латиницу в
+    заглавные; часть букв приходит кириллическими кодами — омоглифами
+    знакогенератора (`C`/`Н`/`Е`/`Т`/`Д`).  Поэтому «Connected to DKS»
+    приходит как «CОNNЕCTED TO DKS» и по сырым байтам не находится
+    никогда.  Сначала коды переводятся в знаки (`chars.display_dks`).
+    """
+    out = []
+    for b in data:
+        if b in (0xFF, 0xFE, 0xFB, 0xFC, 0xFD, 0xFA, 0xF1, 0xF0):
+            continue                               # telnet-служебные коды
+        out.append(chars.display_dks(b) if b else '')
+    return ''.join(out)
+
+
+#: Омоглифы знакогенератора: кириллица, которой на экране читается
+#: латинская буква.  Нужна, чтобы найти английские маркеры в баннере,
+#: пришедшем кодами КОИ-7.
+_HOMOGLYPHS = str.maketrans('АВЕКМНОРСТУХ', 'ABEKMHOPCTYX')
+
+
+def parse_greeting(data: bytes) -> LineInfo:
+    """Разобрать баннер линии в сведения для строки состояния.
+
+    Баннер читается двумя способами — как UTF-8 (если пришёл такой) и
+    как КОИ-7 (`banner_text`); для английских маркеров второе
+    дополнительно сворачивается омоглифами.  Побеждает первое
+    нашедшееся: строка «Connected to the БЭСМ-6 simulator» на обычной
+    линии приходит UTF-8, а строка «Connected to DKS» от ДКС — кодами.
+    """
+    info = LineInfo()
+    if not data:
+        return info
+    info.raw = ' '.join(data.decode('utf-8', errors='replace').split())
+
+    texts = []
+    try:
+        texts.append(data.decode('utf-8'))
+    except UnicodeDecodeError:
+        pass
+    koi7 = banner_text(data)
+    texts.append(koi7.translate(_HOMOGLYPHS))
+    texts.append(koi7)
+
+    for text in texts:
+        if BANNER_DKS.search(text.upper()):
+            info.kind = 'ДКС'
+            break
+    else:
+        # Баннер пришёл, но ДКС не объявлена: обычный tty телетайпа.
+        info.kind = 'КВУ' if _is_banner(data) else ''
+
+    for pattern, attr in ((BANNER_LINE_NO, 'terminal'),
+                          (BANNER_MACHINE, 'machine')):
+        for text in texts:
+            m = pattern.search(text)
+            if m:
+                setattr(info, attr, int(m.group(1)))
+                info.seen = True
+                break
+    for text in texts:
+        for pat, label in BANNER_MODE:
+            if re.search(r'ENCODING\s+IS\s+' + pat, text.upper(),
+                         re.IGNORECASE):
+                info.wire = label
+                info.seen = True
+                return info
+    return info
+
+
+def _is_banner(buf: bytes) -> bool:
+    """Начало служебных строк баннера (по эталону 15ИЭ `BANNER_HEADS`)."""
+    head = buf.lstrip().lower()
+    return any(head.startswith(w) for w in
+               (b'connected', b'encoding', b'wru', b'prompt', b'from',
+                b'sun', b'mon', b'tue', b'wed', b'thu', b'fri', b'sat'))
+
 
 class DKSLink:
     """Линия ДКС: TCP-соединение с линией SIMH.
@@ -184,8 +367,13 @@ class DKSLink:
         self.strip_iac = strip_iac
         self.sock: Optional[socket.socket] = None
         self.port: Optional[int] = None
-        #: Приветствие линии, прочитанное при подключении (если было).
+        #: Приветствие линии (может приходить несколькими пакетами).
         self.greeting = b''
+        #: Что о линии говорит баннер: тип, номер терминала, режим.
+        self.info = LineInfo()
+        #: Баннер ещё можно дорасти: маркер «Connected to DKS» на стенде
+        #: приходит последней строкой и в первом пакете отсутствует.
+        self._banner_open = True
         self._iac = IacStripper()
 
     def connect(self) -> None:
@@ -216,6 +404,7 @@ class DKSLink:
             # simulator TTY device, line N» — первое, что видит
             # оператор, и по нему видно, какая линия досталась.
             self.greeting = self._iac.feed(hello) if hello else b''
+            self.info = parse_greeting(self.greeting)
             log.info('линия ДКС %s:%d установлена', self.host, port)
             return
         raise LinkError(f'нет свободной линии ДКС на {self.host}:'
@@ -226,14 +415,42 @@ class DKSLink:
             raise LinkError('соединение не установлено')
         self.sock.sendall(data)
 
-    def recv(self, size: int = 4096) -> bytes:
-        """Прочитать данные; ``b''`` — соединение закрыто."""
+    def recv(self, size: int = 4096, timeout: Optional[float] = None) -> bytes:
+        """Прочитать данные; ``b''`` — соединение закрыто.
+
+        `timeout` ограничивает ожидание: без него `poll` терминала
+        блокировался бы до таймаута соединения (до 10 с), и всё это время
+        нажатия клавиш не разбирались.
+        """
         if self.sock is None:
             raise LinkError('соединение не установлено')
+        if timeout is not None:
+            self.sock.settimeout(timeout)
         data = self.sock.recv(size)
         if not data:
             return b''
-        return self._iac.feed(data) if self.strip_iac else data
+        out = self._iac.feed(data) if self.strip_iac else data
+        self._grow_banner(out)
+        return out
+
+    def _grow_banner(self, data: bytes) -> None:
+        """Дописать пришедшее в баннер и переразобрать его.
+
+        Баннер приходит несколькими пакетами, а маркер «Connected to
+        DKS» — последней строкой: разбирать только первый пакет нельзя,
+        иначе линия ДКС объявлялась обычным tty телетайпа.  Баннер
+        считается законченным, когда за непустой строкой идёт пустая,
+        — как в эталоне 15ИЭ.
+        """
+        if not self._banner_open or not data:
+            return
+        self.greeting += data
+        body = self.greeting.lstrip(b'\r\n \t').replace(b'\r', b'\n')
+        if b'\n\n' in body:              # за непустой строкой идёт пустая
+            self._banner_open = False
+        info = parse_greeting(self.greeting)
+        if info.kind or info.terminal or info.wire:
+            self.info = info
 
     def close(self) -> None:
         if self.sock is not None:
@@ -262,17 +479,32 @@ class TerminalSession:
 
     def __init__(self, link: DKSLink,
                  on_frame: Optional[Callable[[object], None]] = None,
-                 on_key: Optional[Callable[[bytes], None]] = None) -> None:
+                 on_key: Optional[Callable[[bytes], None]] = None,
+                 eol: int = 0o015) -> None:
         self.link = link
         self.on_frame = on_frame
         self.on_key = on_key
         self.emu = TerminalEmulator()
         self.reader = CommandStreamReader()
         self.closed = False
+        #: Символ конца строки на линии ДКС — из настройки `[line] eol`,
+        #: по умолчанию ПР (0o015): по эталону 15ИЭ (`ie15emu`) окончание
+        #: строки на ДКС — ПР, а ETX для линии — просто знак.
+        self.eol = eol
 
-    def send_keys(self, text: str) -> None:
-        """Отправить ввод с клавиатуры (ДКС сам делает эхо)."""
-        self.link.send(text.encode('koi8-r', errors='replace'))
+    def send_keys(self, text: str, *, eol: Optional[int] = None) -> None:
+        """Отправить ввод с клавиатуры (ДКС сам делает эхо).
+
+        Линия ДКС семибитная (КОИ-7): знаки кодируются по правилам 15ИЭ
+        (`chars.encode_input`), а не КОИ-8Р — русские буквы идут в строку
+        `0x60…0x7E`.  В конец добавляется символ конца строки (`self.eol`,
+        настраивается `[line] eol`); `eol=0` — не добавлять.
+        """
+        code = self.eol if eol is None else eol
+        data = chars.encode_input(text)
+        if code and not data.endswith(bytes((code,))):
+            data += bytes((code,))
+        self.link.send(data)
 
     def feed(self, data: bytes) -> None:
         self.reader.feed(data)
@@ -281,7 +513,7 @@ class TerminalSession:
     def _drain(self) -> None:
         for ev in self.reader.pop():
             if ev.kind.name == 'FRAME_END':
-                self.emu.frames += 1
+                # Счётчик кадров ведёт сам эмулятор (`handle_event`).
                 if self.on_frame is not None:
                     self.on_frame(self.emu.fb)
             self.emu.handle_event(ev)
@@ -313,11 +545,15 @@ class TerminalSession:
 
 # ── режимы командной строки ────────────────────────────────────────────────
 
-def _renderer(fb, backend: str, output: str, scale: int):
-    """Создать сохранение кадра по имени backend'а."""
+def _renderer(backend: str, output: str, scale: int):
+    """Создать сохранение кадра по имени backend'а.
+
+    `save(fb)` сохраняет **переданный** кадр — тот, что нарисовала
+    сессия, а не пустой кадр нового эмулятора.
+    """
     from .backends import PNGBackend, SVGBackend
 
-    def save() -> None:
+    def save(fb) -> None:
         cls = SVGBackend if backend == 'svg' else PNGBackend
         cls(fb, **({} if backend == 'svg' else {'scale': scale})).save(output)
         log.info('кадр сохранён: %s', output)
@@ -331,8 +567,8 @@ def run_link(spec: str, *, backend: str = 'png', output: str = 'mc7401.png',
     host, ports = split_endpoint(spec)
     link = DKSLink(host, ports, timeout=timeout or 10.0)
     with link:
-        save = _renderer(TerminalEmulator().fb, backend, output, scale)
-        session = TerminalSession(link, on_frame=lambda fb: save())
+        session = TerminalSession(
+            link, on_frame=_renderer(backend, output, scale))
         log.info('ожидание данных от %s:%s (Ctrl-C — выход)',
                  host, spec_hint(link.ports))
         try:
@@ -340,6 +576,19 @@ def run_link(spec: str, *, backend: str = 'png', output: str = 'mc7401.png',
         except KeyboardInterrupt:                    # pragma: no cover
             log.info('прервано пользователем')
     return 0
+
+
+def _accepted_link(conn: socket.socket, addr, port: int,
+                   timeout: float) -> DKSLink:
+    """Собрать линию поверх уже принятого соединения (обратный режим).
+
+    `accept()` уже вернул соединение: подключаться заново нельзя —
+    иначе принятый сокет был бы потерян.  Объект достраивается теми же
+    атрибутами, которые задаёт `__init__` (приветствие, срезка IAC).
+    """
+    link = DKSLink(addr[0], [port], timeout=timeout)
+    link.sock, link.port = conn, port
+    return link
 
 
 def run_listener(spec: str, *, backend: str = 'png',
@@ -362,19 +611,16 @@ def run_listener(spec: str, *, backend: str = 'png',
             conn, addr = srv.accept()
             served += 1
             log.info('подключение: %s:%d', *addr)
-            link = DKSLink.__new__(DKSLink)
-            link.host, link.ports = addr[0], [ports[0]]
-            link.timeout, link.strip_iac = (timeout or 10.0), True
-            link.sock, link.port = conn, ports[0]
-            link._iac = IacStripper()
-            with link:
-                save = _renderer(TerminalEmulator().fb, backend,
-                                 output, scale)
-                session = TerminalSession(link, on_frame=lambda fb: save())
+            link = _accepted_link(conn, addr, ports[0], timeout or 10.0)
+            try:
+                session = TerminalSession(
+                    link, on_frame=_renderer(backend, output, scale))
                 try:
                     session.run()
                 except KeyboardInterrupt:            # pragma: no cover
                     log.info('прервано пользователем')
+            finally:
+                link.close()
     except KeyboardInterrupt:                        # pragma: no cover
         log.info('остановлено, обслужено подключений: %d', served)
     finally:

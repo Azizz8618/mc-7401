@@ -90,7 +90,6 @@ class TerminalState:
     font: str = chars.DEFAULT_SET
     text_size: int = 0
     text_direction: int = 0
-    mode: str = 'TEXT'                # 'TEXT' | 'GRAPHICS'
     window_shift: tuple[int, int] = (0, 0)
     window: Window = field(default_factory=Window)
     #: Счётчик выполненных команд (для отчётов и тестов).
@@ -100,7 +99,7 @@ class TerminalState:
         return TerminalState(
             x=self.x, y=self.y, pen=self.pen, line_type=self.line_type,
             font=self.font, text_size=self.text_size,
-            text_direction=self.text_direction, mode=self.mode,
+            text_direction=self.text_direction,
             window_shift=self.window_shift,
             window=Window(self.window.x0, self.window.y0,
                           self.window.x1, self.window.y1),
@@ -176,7 +175,16 @@ class TerminalEmulator:
         if kind is EventKind.PAD:
             return
         if kind is EventKind.COMMAND:
-            self.execute(self.parser.parse(ev.data))
+            if ev.meta.get('row'):
+                # Строка набора без записей `ВК` (`СИМВОЛЫ`): знаки идут
+                # до `≡215` и каждый байт — код знака; размер задан
+                # предыдущей записью `9 S`.
+                self.execute(Command(Op.TEXT,
+                                     args=[self.parser.text_size, b'\x00'],
+                                     payload=ev.data, raw=ev.data, name='9',
+                                     literal=True))
+            else:
+                self.execute(self.parser.parse(ev.data))
             return
         # FRAME_BEGIN, TEXT_LINE, DEFCHAR, DEFROW, DEFDONE, END_OF_STREAM
         # действий не требуют: они уже учтены разбором записи.
@@ -191,11 +199,12 @@ class TerminalEmulator:
         a = cmd.args
         st = self.state
 
-        if op is Op.TEXT_MODE:
-            st.mode = 'TEXT'
+        if op is Op.NOOP:
+            # `J0` — текстовый режим упразднён, запись игнорируется.
             return
         if op is Op.GRAPHICS_MODE:
-            st.mode = 'GRAPHICS'
+            # `J1` — терминал всегда графический, запись принимается
+            # и не меняет состояния.
             return
         if op is Op.RESET:
             self.reset()
@@ -290,7 +299,6 @@ class TerminalEmulator:
         st.font = chars.DEFAULT_SET
         st.text_size = 0
         st.text_direction = 0
-        st.mode = 'GRAPHICS'
         st.window_shift = (0, 0)
         st.window = Window()
 
@@ -359,12 +367,11 @@ class TerminalEmulator:
         sx = 1 if x0 < x1 else -1
         sy = 1 if y0 < y1 else -1
         err = dx + dy
-        win = self.state.window
         guard = 0
         limit = 4 * (SCREEN_WIDTH + SCREEN_HEIGHT) + 8
         while True:
-            if win.contains(x0, y0):
-                self.plot(x0, y0)
+            # Отсечение по окну выполняет `plot` после переноса координат.
+            self.plot(x0, y0)
             if x0 == x1 and y0 == y1:
                 break
             guard += 1
@@ -379,8 +386,16 @@ class TerminalEmulator:
                 y0 += sy
 
     def plot(self, x: int, y: int, pen: Optional[str] = None) -> None:
-        """Поставить точку пером терминала (с отсечением по окну)."""
+        """Поставить точку пером терминала (с отсечением по окну).
+
+        Координаты команд заданы в системе смещённого окна: команда `}`
+        (`СМЕЩ` в graf.pas) переносит начало координат в точку (X, Y),
+        поэтому перед отсечением из точки вычитается смещение окна.
+        """
         st = self.state
+        ox, oy = st.window_shift
+        x -= ox
+        y -= oy
         if not st.window.contains(x, y):
             return
         self.fb.apply(x, y, pen or st.pen)
@@ -444,55 +459,96 @@ class TerminalEmulator:
         # Нулевой размер в потоке означает «мелкий знак», а не отсутствие
         # знака: без этого глифы вырождаются в одну точку.
         size = max(1, size)
-        payload = self._prepare_payload(cmd.payload, russian)
-        if not payload:
+        if cmd.literal:
+            # Строка набора: каждый байт — код знака (в том числе коды
+            # `S0`/`S1`, совпадающие с `p`/`q`); регистр переключают
+            # управляющие коды `0o16`/`0o17` (SO/SI, как в 15ИЭ).
+            items = []
+            for b in cmd.payload:
+                if b == 0o16:                # SO — русский регистр
+                    st.font = RUSSIAN_SET
+                    russian = True
+                    continue
+                if b == 0o17:                # SI — латинский регистр
+                    st.font = chars.DEFAULT_SET
+                    russian = False
+                    continue
+                items.append((b, russian))
+        else:
+            items = self._prepare_payload(cmd.payload, russian)
+        if not items:
             return
-        self.stats['chars'] += len(payload)
+        self.stats['chars'] += len(items)
         ux, uy = chars.text_advance(direction, size)
         pen_saved = st.pen
-        for n, code in enumerate(payload):
-            mat = chars.glyph_matrix(code, russian)
+        for n, (code, is_ru) in enumerate(items):
+            mat = chars.glyph_matrix(code, is_ru)
             for dx, dy in chars.text_offsets(mat, direction, size):
                 self.plot(round(st.x + ux * n + dx), round(st.y + uy * n + dy))
         # После строки текста терминал перемещает маркер по её концу.
-        st.x = round(st.x + ux * len(payload))
-        st.y = round(st.y + uy * len(payload))
+        st.x = round(st.x + ux * len(items))
+        st.y = round(st.y + uy * len(items))
         st.pen = pen_saved
 
-    def _prepare_payload(self, payload: bytes, russian: bool) -> list[int]:
-        """Разобрать байты строки: S0/S1 переключают набор знаков, 0o240 — пропуск."""
-        out: list[int] = []
+    def _prepare_payload(self, payload: bytes, russian: bool) -> list[tuple[int, bool]]:
+        """Разобрать байты строки: S0/S1 переключают набор знаков.
+
+        Возвращает пары `(код, русский_набор)`: набор может меняться
+        внутри строки (`S0` перед русскими знаками и `S1` перед
+        международными, как делает `ТЕКФАЙ` в graf.pas), поэтому признак
+        запоминается для каждого выводимого знака.  Печатные коды
+        выводятся всегда (правило 15ИЭ): в таблице знаков есть и `T`
+        (0o124), и `U` (0o125) — раньше они гасились как служебные.
+        """
+        out: list[tuple[int, bool]] = []
         for b in payload:
             if b == END:                        # признак конца текста
                 break
-            if b in (S0, S1):                   # S0 — набор Н1, S1 — Н2
+            if b in (S0, S1):                   # S0 — КОИ-8Р, S1 — Н2
                 name = chars.set_for_code(b)
                 if name is not None:
                     self.state.font = name
-                    russian = (name == 'n1')
+                    russian = (name == RUSSIAN_SET)
                 continue
-            if b in (0o124, 0o125, 0o33):       # служебные
+            if b == 0o16:                       # SO — русский регистр (15ИЭ)
+                self.state.font = RUSSIAN_SET
+                russian = True
                 continue
-            out.append(b)
+            if b == 0o17:                       # SI — латинский регистр
+                self.state.font = chars.DEFAULT_SET
+                russian = False
+                continue
+            if b == 0o33:                       # АР2 — служебный префикс
+                continue
+            out.append((b, russian))
         return out
 
     # ── окно ─────────────────────────────────────────────────────────────────
 
     def shift_window(self, dx: int, dy: int) -> None:
-        """Сместить окно отсечения (команда `LF`)."""
+        """Сместить начало координат (команда `}`, `СМЕЩ` в graf.pas).
+
+        Окно просмотра остаётся экраном 560×400: смещение переносит
+        систему координат команд, а не прямоугольник отсечения — иначе
+        рисунок, заданный координатами за краем экрана (в `ОКР` — круги
+        около x=980 при `СМЕЩ(700,0)`), отсекался бы целиком.
+        """
         st = self.state
         st.window_shift = (st.window_shift[0] + dx, st.window_shift[1] + dy)
-        ox, oy = st.window_shift
-        st.window = Window(ox, oy, ox + SCREEN_WIDTH - 1, oy + SCREEN_HEIGHT - 1)
 
     # ── пользовательские знаки ───────────────────────────────────────────────
 
     def _define_char(self, data: bytes) -> None:
-        """Загрузить пользовательский знак (команда `≡110`)."""
-        if len(data) < 9:
+        """Загрузить пользовательский знак (блок `≡110≡240 … ≡215`).
+
+        Блок несёт код знака и семь строк — по три глифа `WN`
+        (`chars.decode_defchar`).
+        """
+        parsed = chars.decode_defchar(data)
+        if parsed is None:
+            log.debug('знак не загружен: %r', data)
             return
-        code = data[1] & 0o77
-        rows = list(data[2:9])
+        code, rows = parsed
         try:
             chars.USER_TABLE.define(code, rows)
         except (IndexError, ValueError) as exc:      # pragma: no cover

@@ -86,13 +86,18 @@ def test_draw_erases_row_tail():
 
 
 def test_panel_below_body():
-    """Подвал идёт после кадра и занимает своё число рядов."""
+    """Подвал идёт после кадра и занимает столько рядов, сколько занял.
+
+    Высота подвала зависит от ширины окна: ячейки раскладываются по
+    плану `panel`, поэтому она не константа.
+    """
     a = TerminalApp(FakeDriver(), config=Config.default())
     panel = a._service_panel(80)
-    assert len(panel) == a.PANEL_ROWS
-    assert panel[3].startswith('-'), 'третий ряд подвала — черта'
-    assert 'РЕЖИМ=' in panel[0]
-    assert 'ПОСЛ:' in panel[2]
+    assert len(panel) == a.panel_rows(80)
+    rule = next(n for n, line in enumerate(panel) if line.startswith('-'))
+    assert 'РЖМ=' in panel[0], 'первая ячейка — режим сеанса'
+    assert any('ПОСЛ' in line for line in panel[:rule]), \
+        'ПОСЛ должен быть над чертой'
 
 
 # ── текст ЭВМ в окне ─────────────────────────────────────────────────────────
@@ -103,14 +108,14 @@ def test_dks_text_is_visible():
     a.feed(b'\x7c\x42\x4d-3,\x54\x30\x31\x37\r\n')
     lines = a._text_lines()
     assert lines, 'текст ЭВМ не разобран'
-    assert any('Т017' in ln for ln in lines), lines
+    assert any('T017' in ln for ln in lines), lines
 
 
 def test_dks_text_takes_lines_of_window():
     """Текст занимает строки окна (а не прятался в подсказку)."""
     a = TerminalApp(FakeDriver(), config=Config.default())
-    a.feed(b'\x54\x30\x31\x37\r\n')          # «Т017»
-    assert a._text_window(80, 5)[0].strip() == 'Т017'
+    a.feed(b'\x54\x30\x31\x37\r\n')          # «T017» (омоглиф «Т»)
+    assert a._text_window(80, 5)[0].strip() == 'T017'
     assert len(a._text_window(80, 5)) == 5
 
 
@@ -123,29 +128,42 @@ def test_text_closes_splash():
 
 
 def test_dks_codes_are_koi7():
-    """ОС шлёт семибитные коды КОИ-7, а не КОИ-8Р.
+    """ОС шлёт семибитные коды КОИ-7, а не восьмибитный КОИ-8Р.
 
-    Кириллица занимает обе строки: 0x40…0x5E (заглавные, как в наборе
-    Н1) и 0x60…0x7E; цифры и знаки препинания — свои места.  Латинской
-    строчки в КОИ-7 нет вообще: слот `0x68` — это «Х».
+    Русские буквы приходят строкой `0x60…0x7E` — так их печатает
+    `koi7_rus_to_unicode` в СИМХ — и показываются заглавными.
+    Строка `0x40…0x5E` — латиница: именно её рисует эталонный 15ИЭ
+    (`koi7_raw_upper` трогает только `0x60…0x7E`).
     """
     assert chars.display_dks(0x7C) == 'Э'
-    assert chars.display_dks(0x4D) == 'М'
-    assert chars.display_dks(0x54) == 'Т'
+    assert chars.display_dks(0x4D) == 'M'       # латинская M — омоглиф «М»
+    assert chars.display_dks(0x54) == 'T'       # латинская T — омоглиф «Т»
     assert chars.display_dks(0x30) == '0'
     assert chars.display_dks(0x2D) == '-'
-    assert chars.display_dks(0x68) == 'Х'       # не «h» — слот кириллицы
+    assert chars.display_dks(0x68) == 'Х'       # русская строка — «Х», не «h»
     assert chars.display_dks(0x0D) == ''
     assert chars.display_dks(0x20) == ' '
 
 
-def test_dks_uppercase_row_matches_rom():
-    """Буквы строки 0x40…0x5E совпадают с РУС7 (порядок ПЗУ)."""
+def test_dks_prompt_reads_evm():
+    """Приглашение ОС «ЭВМ-3,Т020» читается как ЭВМ, а не как ЭБМ.
+
+    Байты `7C 42 4D` — «Э» из русской строки плюс латинские `B` и `M`,
+    омоглифы «В» и «М»: их глифы читаются как «ЭВМ».  Раньше мы
+    переводили `0x42` в «Б» и печатали «ЭБМ» — см. JOURNAL.md.
+    """
+    wire = bytes([0x7C, 0x42, 0x4D, 0x2D, 0x33, 0x2C, 0x54, 0x30, 0x32, 0x30])
+    shown = ''.join(chars.display_dks(b) for b in wire)
+    assert shown == 'ЭBM-3,T020', shown
+
+
+def test_dks_rows_match_reference():
+    """Строка `0x60…0x7E` — русская заглавными, `0x40…0x5E` — латиница."""
     from mc7401.chars import RUS7
-    for code in (0x40, 0x45, 0x4D, 0x54):
-        assert chars.display_dks(code) == RUS7[code - 0x40]
     for code in (0x60, 0x6D, 0x7C):
         assert chars.display_dks(code) == RUS7[code - 0x60]
+    for code in (0x40, 0x42, 0x4D, 0x54):
+        assert chars.display_dks(code) == chr(code)
 
 
 # ── передача символов ────────────────────────────────────────────────────────
@@ -155,7 +173,7 @@ def test_host_mode_sends_chars_once(app):
     for key in 'СЕТ ':
         app.handle_key(key)
     app.handle_key('\r')
-    assert app.driver.sent == ['s', 'e', 't', ' ', '\x03']
+    assert app.driver.sent == ['s', 'e', 't', ' ', '\r']
 
 
 def test_submit_does_not_resend_line(app):
@@ -164,7 +182,7 @@ def test_submit_does_not_resend_line(app):
         app.handle_key(key)
     app.driver.sent.clear()
     app.handle_key('\r')
-    assert app.driver.sent == ['\x03'], app.driver.sent
+    assert app.driver.sent == ['\r'], app.driver.sent
 
 
 def test_local_mode_accumulates_then_sends(app):
@@ -176,7 +194,7 @@ def test_local_mode_accumulates_then_sends(app):
         app.handle_key(key)
     assert app.driver.sent == [], 'в АВТОНОМНО знаки уходят по ПЕРЕДАЧА'
     app.handle_key(KEY_SEND)                  # F10 — ПЕРЕДАЧА
-    assert app.driver.sent == ['lin3\x03']
+    assert app.driver.sent == ['lin3\r']
     assert app.session.buffer == []
 
 
@@ -255,13 +273,26 @@ def test_kitty_geometry():
 
 
 def test_kitty_payload_is_chunked():
-    """Данные режутся на куски по 4096 байт, ключи — в последнем."""
-    from mc7401.backends.kitty import _apc_stream
+    """Данные режутся на куски; ключи — в первом, `m` — у всех.
+
+    По спецификации kitty: полный набор ключей несёт первый кусок,
+    куски, кроме последнего, помечены `m=1`, последний — `m=0`.
+    Раньше ключи клались в последний кусок без `m`, и изображения
+    больше 4 КБ никогда не отображались.
+    """
+    from mc7401.backends.kitty import MAX_CHUNK, _apc_stream
     png = b'\x89PNG' + bytes(20000)
     out = _apc_stream('a=T,f=100,t=d,i=1', png)
     assert out.count('\x1b_G') > 1
     assert out.endswith('\x1b\\')
-    assert '\x1b_Ga=T,f=100,t=d,i=1;' in out
+    bodies = out.split('\x1b_G')[1:]
+    assert bodies[0].startswith('a=T,f=100,t=d,i=1,m=1;')
+    for body in bodies[1:-1]:
+        assert body.startswith('m=1;')
+    assert bodies[-1].startswith('m=0;')
+    for body in bodies:
+        payload = body.split(';', 1)[1].split('\x1b\\')[0]
+        assert len(payload) <= MAX_CHUNK
 
 
 def test_graphics_disabled_by_config():

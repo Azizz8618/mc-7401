@@ -54,27 +54,32 @@ class Session:
 
     # ── режим ───────────────────────────────────────────────────────────────
 
-    def set_mode(self, mode: str) -> None:
+    def set_mode(self, mode: str) -> bytes:
+        """Установить режим; вернуть накопленное для линии.
+
+        При переходе в HOST накопленное не теряется: оно уходит
+        вызывающему — сеанс не знает о транспорте, отправку в линию
+        делает вызывающая сторона.  Новый режим — в `self.mode`.
+        """
         if mode not in (MODE_LOCAL, MODE_HOST):
             raise ValueError(f'неизвестный режим: {mode!r}')
-        # При переходе в HOST накопленное отправляется — иначе набор
-        # «потерялся бы».
+        out = self.send(line_end=0) if mode == MODE_HOST else b''
         self.mode = mode
         self._check_layout()
+        return out
 
-    def toggle_mode(self) -> str:
-        """Переключить режим; возвращает новый."""
+    def toggle_mode(self) -> bytes:
+        """Переключить режим; вернуть накопленное для линии.
+
+        Новый режим — в `self.mode`.  При уходе из АВТОНОМНО в С ЭВМ
+        набранное уходит вызывающему (без символа конца строки — набор
+        может продолжаться в режиме С ЭВМ).
+        """
         if self.mode == MODE_LOCAL:
-            # Перед уходом в С ЭВМ передаём накопленное.
-            pending = self.pending()
-            self.buffer.clear()
-            self.mode = MODE_HOST
-            self._check_layout()
-            self._last_pending = pending
-            return self.mode
+            return self.set_mode(MODE_HOST)
         self.mode = MODE_LOCAL
         self._check_layout()
-        return self.mode
+        return b''
 
     # ── набор ───────────────────────────────────────────────────────────────
 
@@ -103,11 +108,13 @@ class Session:
 
     # ── SEND ────────────────────────────────────────────────────────────────
 
-    def send(self, *, line_end: int = ETX) -> bytes:
+    def send(self, *, line_end: int = 0o015) -> bytes:
         """SEND: передать накопленное в линию, буфер очистить.
 
-        `line_end` — символ конца строки на линии ДКС; по умолчанию ETX
-        (так по правилам 15ИЭ).  Значение 0 — не добавлять ничего.
+        `line_end` — символ конца строки на линии ДКС; по умолчанию ПР
+        (0o015): по эталону 15ИЭ (`ie15emu/charset.py::to_line`, ветка
+        dks) окончание строки на ДКС — ПР, ETX для линии просто знак.
+        Значение 0 — не добавлять ничего.
         """
         data = self.pending()
         if line_end and data:

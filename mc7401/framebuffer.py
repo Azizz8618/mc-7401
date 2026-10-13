@@ -23,10 +23,38 @@ from .constants import PEN_ERASE, PEN_OR, PEN_XOR, SCREEN_HEIGHT, SCREEN_WIDTH
 log = logging.getLogger(__name__)
 
 
+
+def _byte_runs() -> tuple[tuple[tuple[int, int], ...], ...]:
+    """Для каждого значения байта — серии зажжённых битов внутри него.
+
+    Байт хранит 8 точек, старший бит — левая, поэтому бит 7 отдаёт
+    отрезок `(0, 1)`.  Таблица строится один раз: `Framebuffer.runs()`
+    идёт по ней, не трогая биты по одному.
+    """
+    table = []
+    for v in range(256):
+        segs = []
+        start = None
+        for k in range(8):
+            if v & (1 << (7 - k)):
+                if start is None:
+                    start = k
+            elif start is not None:
+                segs.append((start, k))
+                start = None
+        if start is not None:
+            segs.append((start, 8))
+        table.append(tuple(segs))
+    return tuple(table)
+
+
+_BYTE_RUNS = _byte_runs()
+
+
 class Framebuffer:
     """Одноцветный (1 бит на точку) кадр 560×400."""
 
-    __slots__ = ("width", "height", "_bits")
+    __slots__ = ("width", "height", "_bits", "_count")
 
     def __init__(self, width: int = SCREEN_WIDTH, height: int = SCREEN_HEIGHT):
         if width * height % 8:
@@ -34,6 +62,8 @@ class Framebuffer:
         self.width = width
         self.height = height
         self._bits = bytearray(width * height // 8)
+        #: Число зажжённых точек (считается инкрементально).
+        self._count = 0
 
     # ── адресация ────────────────────────────────────────────────────────────
 
@@ -63,15 +93,24 @@ class Framebuffer:
         i = self._index(x, y)
         mask = 1 << (7 - (x & 7))
         if value:
-            self._bits[i] |= mask
+            if not self._bits[i] & mask:
+                self._bits[i] |= mask
+                self._count += 1
         else:
-            self._bits[i] &= ~mask & 0xFF
+            if self._bits[i] & mask:
+                self._bits[i] &= ~mask & 0xFF
+                self._count -= 1
 
     def toggle(self, x: int, y: int) -> None:
         if not self.inside(x, y):
             return
         i = self._index(x, y)
-        self._bits[i] ^= 1 << (7 - (x & 7))
+        mask = 1 << (7 - (x & 7))
+        self._bits[i] ^= mask
+        if self._bits[i] & mask:
+            self._count += 1
+        else:
+            self._count -= 1
 
     def apply(self, x: int, y: int, pen: str) -> None:
         """Применить перо к точке.
@@ -91,6 +130,26 @@ class Framebuffer:
 
     def clear(self) -> None:
         self._bits = bytearray(len(self._bits))
+        self._count = 0
+
+    def scroll_up(self, rows: int) -> None:
+        """Сдвинуть кадр вверх на `rows` строк точек, снизу — пустая полоса.
+
+        Так работает автоскролл текста: содержимое уходит к верху экрана
+        (верхние строки теряются), внизу освобождается строка под новый
+        текст.  Строки хранятся сверху вниз (`_index`), поэтому сдвиг идёт
+        в сторону начала массива.
+        """
+        if rows <= 0:
+            return
+        stride = self.width // 8
+        shift = min(rows, self.height) * stride
+        dropped = self._bits[:shift]
+        self._bits[0:len(self._bits) - shift] = self._bits[shift:]
+        self._bits[len(self._bits) - shift:] = bytes(shift)
+        self._count -= sum(bin(b).count('1') for b in dropped)
+        if self._count < 0:                      # pragma: no cover
+            self._count = 0
 
     def point(self, x: int, y: int, pen: str = PEN_OR) -> None:
         self.apply(x, y, pen)
@@ -117,6 +176,136 @@ class Framebuffer:
                 if bit:
                     self.apply(x + dx, yy, pen)
 
+    def row_runs(self, y: int) -> list[tuple[int, int]]:
+        """Серии зажжённых точек в одном ряду: `(x0, x1)`, `x1` не входит.
+
+        Рендер окна просматривает кадр по ячейкам знакоместа; обход по
+        точкам давал 20 мс на кадр, а по сериям — единицы: на ячейку
+        приходится сравнить пару отрезков вместо `scale²` вызовов `get()`.
+        """
+        if not 0 <= y < self.height:
+            return []
+        base = ((self.height - 1 - y) * self.width) >> 3
+        bits = self._bits
+        stride = self.width // 8
+        segs: list[tuple[int, int]] = []
+        for i in range(stride):
+            v = bits[base + i]
+            if v:
+                b = i << 3
+                segs.extend((b + s, b + e) for s, e in _BYTE_RUNS[v])
+        if not segs:
+            return []
+        out: list[tuple[int, int]] = []
+        start, end = segs[0]
+        for s, e in segs[1:]:
+            if s <= end:
+                if e > end:
+                    end = e
+            else:
+                out.append((start, end))
+                start, end = s, e
+        out.append((start, end))
+        return out
+
+    def set_span(self, x0: int, y: int, x1: int, pen: str = PEN_OR) -> None:
+        """Перо на горизонтальном отрезке `x0…x1` (правый край не входит).
+
+        Знак ПЗУ выводится блоками по `GLYPH_SCALE` точек, и на знак
+        приходится сотня отдельных `set()`.  Отрезок же берётся целиком,
+        по одному байту на восемь точек: служебные полосы окна рисуются
+        знаками и без этого съедали всю перерисовку.
+        """
+        if not 0 <= y < self.height:
+            return
+        x0 = max(0, x0)
+        x1 = min(self.width, x1)
+        if x0 >= x1:
+            return
+        base = ((self.height - 1 - y) * self.width) >> 3
+        first = x0 >> 3
+        last = (x1 - 1) >> 3
+        for i in range(first, last + 1):
+            lo = (x0 & 7) if i == first else 0
+            tail = x1 & 7
+            hi = tail if (i == last and tail) else 8
+            if hi <= lo:
+                continue
+            # В байте бит 7 — самая левая точка, поэтому отрезку
+            # [lo, hi) отвечают биты 8-hi … 7-lo.
+            mask = ((1 << (hi - lo)) - 1) << (8 - hi)
+            cur = self._bits[base + i]
+            if pen == PEN_OR:
+                added = mask & ~cur & 0xFF
+                if added:
+                    self._bits[base + i] = cur | mask
+                    self._count += bin(added).count('1')
+            elif pen == PEN_XOR:
+                flipped = (cur & mask) ^ mask
+                self._bits[base + i] = cur ^ mask
+                self._count += bin(flipped).count('1') \
+                    - bin(cur & mask).count('1')
+            else:
+                dropped = cur & mask
+                if dropped:
+                    self._bits[base + i] = cur & ~mask & 0xFF
+                    self._count -= bin(dropped).count('1')
+
+    def erase_rows(self, y_from: int, y_to: int) -> None:
+        """Стереть точки в рядах `y_from…y_to` (координаты Y вверх).
+
+        Служебные полосы окна (строка состояния, подвал) ложатся поверх
+        кадра и каждый раз стирают своё место.  Обход по точкам на полосе
+        560×340 — это 190 000 вызовов `apply()`, и на нём уходила вся
+        перерисовка; здесь гасится нужными байтами сразу.
+        """
+        y_from = max(0, y_from)
+        y_to = min(self.height, y_to)
+        if y_from >= y_to:
+            return
+        stride = self.width // 8
+        top = (self.height - y_to) * stride      # Y вверх → строки снизу
+        bottom = (self.height - y_from) * stride
+        dropped = self._bits[top:bottom]
+        self._bits[top:bottom] = bytes(len(dropped))
+        self._count -= sum(bin(b).count('1') for b in dropped)
+        if self._count < 0:                      # pragma: no cover
+            self._count = 0
+
+    # ── серии зажжённых точек ──────────────────────────────────────────────
+
+    def runs(self) -> Iterator[tuple[int, int, int]]:
+        """Горизонтальные серии зажжённых точек: `(x0, y, x1)`, `x1` не входит.
+
+        Это то, что окно отдаёт в `PhotoImage.put`, поэтому считать его
+        нужно на каждой перерисовке и **часто**.  Обход по точкам здесь
+        давал 120 мс на кадр 560×400 (224 000 вызовов `get()`), и ввод
+        с клавиатуры из-за этого заметно отставал.  Обход по байтам —
+        в 70 раз меньше операций (по одному на байт строки) и те же
+        серии: 1.6 мс.
+        """
+        stride = self.width // 8
+        bits = self._bits
+        for y in range(self.height):
+            base = ((self.height - 1 - y) * self.width) >> 3
+            segs: list[tuple[int, int]] = []
+            for i in range(stride):
+                v = bits[base + i]
+                if v:
+                    b = i << 3
+                    segs.extend((b + s, b + e) for s, e in _BYTE_RUNS[v])
+            if not segs:
+                continue
+            start, end = segs[0]
+            for s, e in segs[1:]:
+                if s <= end:                    # серии слиплись — склеить
+                    if e > end:
+                        end = e
+                else:
+                    yield start, y, end
+                    start, end = s, e
+            yield start, y, end
+
     # ── выгрузка ─────────────────────────────────────────────────────────────
 
     def to_rows_bottom_up(self) -> Iterator[bytearray]:
@@ -137,7 +326,7 @@ class Framebuffer:
         return out
 
     def count_set(self) -> int:
-        return sum(bin(b).count('1') for b in self._bits)
+        return self._count
 
     def bbox(self) -> tuple[int, int, int, int] | None:
         """Границы ненулевых точек: (xmin, ymin, xmax, ymax) или None."""
@@ -173,6 +362,7 @@ class Framebuffer:
         new.width = self.width
         new.height = self.height
         new._bits = bytearray(self._bits)
+        new._count = self._count
         return new
 
     def __eq__(self, other: object) -> bool:

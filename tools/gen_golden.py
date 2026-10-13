@@ -68,6 +68,9 @@ def scenario(name: str) -> str:
         # ПТИЦА сама читает два числа с клавиатуры:
         # NN (2…10) и QQ (1…350).
         'ПТИ': 'ПТИ 5 120 ',
+        # КИНО читает два числа: NN (2…60) — размер окружности,
+        # QQ (1…350) — пауза между кадрами.
+        'КИНО': 'КИН 15 120 ',
     }
     if name not in table:
         raise KeyError(f'неизвестный сценарий {name!r}')
@@ -76,7 +79,7 @@ def scenario(name: str) -> str:
 
 SCENARIOS = ['СЕТ', 'СОЛ', 'КОТ', 'ЦЕП', 'ФУН', 'ЗАГ', 'СИМ', 'ТЕК',
              'ЛИН', 'ОКР', 'ГРА', 'ШАР', 'ЛЕД', 'УЗО', 'РОЗ', 'ТИП', 'ЧАС',
-             'ПТИ']
+             'ПТИ', 'КИНО']
 
 DESCRIPTIONS = {
     'СЕТ': 'сетка: рамка и линии через 7 точек',
@@ -97,7 +100,36 @@ DESCRIPTIONS = {
     'ТИП': 'тип линии 3 и сетка',
     'ЧАС': 'часы: циферблат со стрелками',
     'ПТИ': 'птица: анимация полёта (кадр для начального экрана)',
+    'КИНО': 'кино: движение окружности',
 }
+
+
+def pick_frame(wire: bytes):
+    """Выбрать кадр, который видел оператор, и вернуть (кадр, эмулятор).
+
+    Программа (`graf.pas`) очищает экран командой `S` в начале каждой
+    картины и оставляет экран пустым после выхода.  Поэтому запоминаем
+    самое «наполненное» состояние кадра — после каждой команды, а не
+    только на границе блока ВУК: `ПТИЦА` рисует птицу пером `+` и тут же
+    стирает пером `≠` внутри одного блока, и снимок по блокам птицу
+    никогда не захватывал (оставалась лишь точечная траектория).
+    """
+    from mc7401.reader import CommandStreamReader, EventKind
+    emu = TerminalEmulator()
+    best = emu.fb.copy()
+    best_pts = 0
+    reader = CommandStreamReader()
+    reader.feed(wire)
+    reader.close()
+    for ev in reader.pop():
+        emu.handle_event(ev)
+        if ev.kind is EventKind.COMMAND:
+            n = emu.fb.count_set()
+            if n > best_pts:
+                best, best_pts = emu.fb.copy(), n
+    if emu.fb.count_set() > best_pts:
+        best = emu.fb
+    return best, emu
 
 
 def generate(source: str, name: str, *, scale: int = 2,
@@ -114,26 +146,7 @@ def generate(source: str, name: str, *, scale: int = 2,
         wire, counted = bytes(rt._terminal.wire), rt._terminal.byte_count
     elapsed = time.perf_counter() - started
 
-    # Оператор видел самую «содержательную» картину: программа очищает
-    # экран командой `S` в начале каждой картины и оставляет экран пустым
-    # после выхода.  Поэтому запоминаем состояние кадра на границе
-    # каждого блока ВУК и берём самое «наполненное».
-    from mc7401.reader import CommandStreamReader, EventKind
-    emu = TerminalEmulator()
-    best = emu.fb.copy()
-    best_pts = 0
-    reader = CommandStreamReader()
-    reader.feed(wire)
-    reader.close()
-    for ev in reader.pop():
-        if ev.kind is EventKind.VUK_BLOCK:
-            n = emu.fb.count_set()
-            if n > best_pts:
-                best, best_pts = emu.fb.copy(), n
-        emu.handle_event(ev)
-    if emu.fb.count_set() > best_pts:
-        best = emu.fb
-    fb = best
+    fb, emu = pick_frame(wire)
 
     STREAMS.mkdir(parents=True, exist_ok=True)
     RENDER.mkdir(parents=True, exist_ok=True)
@@ -156,6 +169,31 @@ def generate(source: str, name: str, *, scale: int = 2,
     }
 
 
+def rerender(name: str, *, scale: int = 2, write_svg: bool = True) -> dict:
+    """Перерисовать изображения по уже снятому потоку (без запуска graf.pas).
+
+    Используется, когда меняется только вывод кадра: поток команд в
+    `golden/streams/` остаётся прежним.
+    """
+    wire = (STREAMS / f'{name}.bin').read_bytes()
+    fb, emu = pick_frame(wire)
+    RENDER.mkdir(parents=True, exist_ok=True)
+    PNGBackend(fb, scale=scale).save(RENDER / f'{name}.png')
+    if write_svg:
+        SVGBackend(fb).save(RENDER / f'{name}.svg')
+    return {
+        'name': name,
+        'wire': len(wire),
+        'payload': len(wire),
+        'commands': emu.stats['commands'],
+        'unknown': emu.stats['unknown'],
+        'chars': emu.stats['chars'],
+        'points': fb.count_set(),
+        'bbox': fb.bbox(),
+        'seconds': 0.0,
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('names', nargs='*', help='имена сценариев')
@@ -163,6 +201,9 @@ def main(argv=None) -> int:
                     help='исходник на Паскале (по умолчанию golden/graf.pas)')
     ap.add_argument('--scale', type=int, default=2, help='масштаб PNG')
     ap.add_argument('--no-svg', action='store_true', help='не писать SVG')
+    ap.add_argument('--render-only', action='store_true',
+                    help='перерисовать изображения по снятым потокам '
+                         '(graf.pas не запускается)')
     ap.add_argument('--list', action='store_true', help='список сценариев')
     args = ap.parse_args(argv)
 
@@ -172,16 +213,21 @@ def main(argv=None) -> int:
         return 0
 
     names = args.names or SCENARIOS
-    source = translate(args.source)
-    (GOLDEN / 'graf.py').write_text(
-        '# Сгенерировано tools/gen_golden.py: golden/graf.pas -> Python\n'
-        '# Не редактировать вручную.\n\n' + source, encoding='utf-8')
+    if not args.render_only:
+        source = translate(args.source)
+        (GOLDEN / 'graf.py').write_text(
+            '# Сгенерировано tools/gen_golden.py: golden/graf.pas -> Python\n'
+            '# Не редактировать вручную.\n\n' + source, encoding='utf-8')
 
     rows = []
     for name in names:
         try:
-            info = generate(source, name, scale=args.scale,
-                            write_svg=not args.no_svg)
+            if args.render_only:
+                info = rerender(name, scale=args.scale,
+                                write_svg=not args.no_svg)
+            else:
+                info = generate(source, name, scale=args.scale,
+                                write_svg=not args.no_svg)
         except Exception as exc:                      # noqa: BLE001
             print(f'{name}: ОШИБКА {exc}')
             rows.append((name, 'ошибка', str(exc)))
