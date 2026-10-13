@@ -1,0 +1,211 @@
+"""
+history.py — история выданных на экран строк, как в терминале 15ИЭ.
+
+Когда кадр уезжает вверх (автоскролл текста у нижнего края), ушедшие
+строки не пропадают, а ложатся в **историю**.  По ней терминал листает
+колесом мыши и клавишами `ЭКРАН↑`/`ЭКРАН↓`, и оператор может вернуться
+к тому, что уже сошло с экрана.
+
+Устроено как в эталоне 15ИЭ-00-013 (`ie15/ie15emu/screen.py`:
+`_push_history`, `history_max`, `view_rows`, `scroll_view`):
+
+* глубина задаётся конфигурацией (`[display] history`), по умолчанию
+  **1000 строк**;
+* единица истории — **строка кадра**, а не ряд точек: автоскролл уводит
+  `CELL_H` точек за раз, и хранить их поштучно значило бы помнить в
+  десять раз меньше строк, чем задано;
+* **пустые строки в историю не пишутся** — иначе прокрутка уходила бы
+  в пустоту;
+* при переполнении самая старая строка выбрасывается, а счётчик
+  отброшенных строк растёт (`dropped`) — по нему видно, что история
+  уже не вмещает всё;
+* строка хранится битами кадра (`Framebuffer.row_bytes`) — знакомест
+  7×8 со смещением, восемь точек на байт.  Строка — 70 байт, и вернуть
+  её на экран можно положив байты обратно, без разбора по таблице знаков.
+  Тысяча строк — 70 килобайт.
+
+    >>> from mc7401.framebuffer import Framebuffer
+    >>> fb = Framebuffer()
+    >>> h = History()
+    >>> for i in range(1, 61):                     # 60 строк при 40 рядах
+    ...     _ = fb, i
+    >>> h.limit
+    1000
+    >>> h.push_line([bytes(70)] * 10)              # пустая строка
+    0
+    >>> h.push_line([bytes(70)] * 9 + [b'\\xff' * 70])
+    1
+    >>> h.size
+    1
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .console import CELL_H, read_row
+
+#: Глубина истории по умолчанию — как в эталоне 15ИЭ.
+DEFAULT_LIMIT = 1000
+
+
+@dataclass
+class History:
+    """Строки, сошедшие с кадра, и окно просмотра по ним."""
+
+    #: Ушедшие строки: каждая — набор битов рядов кадра (`CELL_H` штук),
+    #: **снизу вверх**, как в кадре.  Новые — в конец.
+    lines: list[tuple[bytes, ...]] = field(default_factory=list)
+    #: Глубина: сколько строк помнится.  `0` — история выключена.
+    limit: int = DEFAULT_LIMIT
+    #: Сколько строк отброшено из-за переполнения.
+    dropped: int = 0
+    #: Всего строк ушло в историю за сеанс (`pushed` в эталоне).
+    pushed: int = 0
+    #: Насколько окно листается назад от кадра: 0 — кадр, `k` — на `k`
+    #: строк выше.
+    back: int = 0
+    #: Собранное окно: `(положение, верх кадра, кадр)`.  Перерисовка
+    #: вызывает `view` по несколько раз на нажатие, а листать вхолостую
+    #: приходится часто — окно пересобирается только когда оно правда
+    #: изменилось (см. `view`).
+    _cache: Optional[tuple] = None
+
+    def __len__(self) -> int:
+        return len(self.lines)
+
+    def __bool__(self) -> bool:
+        return bool(self.lines)
+
+    @property
+    def size(self) -> int:
+        """Сколько строк в истории."""
+        return len(self.lines)
+
+    @property
+    def position(self) -> int:
+        """Насколько окно от листано назад от кадра."""
+        return self.back
+
+    # ── наполнение ─────────────────────────────────────────────────────────
+
+    def push_line(self, rows) -> bool:
+        """Положить в историю строку — ушедшие ряды кадра, снизу вверх.
+
+        Пустая строка не пишется, как в эталоне (`_push_history` тоже её
+        пропускает).  Возвращает `True`, если строка записана.
+        """
+        if self.limit <= 0 or not rows:
+            return False
+        # `Framebuffer.scroll_up` отдаёт ряды **сверху вниз** (так устроен
+        # `_bits`), а кадр растёт вверх (`Y` вверх).  Разворачиваем один
+        # раз здесь, чтобы дальше строка лежала как в кадре: `line[0]` —
+        # нижний ряд знакоместа.
+        line = tuple(bytes(r) for r in reversed(list(rows)))
+        if not any(any(r) for r in line):
+            return False
+        self.lines.append(line)
+        self.pushed += 1
+        while len(self.lines) > self.limit:
+            self.lines.pop(0)
+            self.dropped += 1
+        return True
+
+    def clear(self) -> None:
+        """Снять историю и вернуть окно к кадру."""
+        self.lines.clear()
+        self.dropped = 0
+        self.pushed = 0
+        self.back = 0
+
+    # ── окно просмотра ──────────────────────────────────────────────────────
+
+    def scroll(self, direction: int) -> int:
+        """Сдвинуть окно: `-1` — назад по истории, `1` — к кадру.
+
+        Дальше самой старой строки не ходим: прокрутка останавливается на
+        первой выданной строке и возвращается к кадру — пустоту не
+        листаем, как и в эталоне.
+        """
+        if not self.lines:
+            self.back = 0
+            return 0
+        self.back = max(0, min(len(self.lines), self.back - direction))
+        return self.back
+
+    def view(self, frame,
+             rows: Optional[int] = None) -> Optional['Framebuffer']:
+        """Кадр для показа при листании назад; `None` — показывать кадр.
+
+        Окно на `back` строк выше текущего: сверху `back` строк истории,
+        под ними — верх кадра.  Кадр ЭВМ при этом уходит вниз за окно,
+        а подвал у нижней кромки остаётся на месте, как на 15ИЭ.
+
+        `None`, когда листать нечего: истории нет, окно у самого кадра
+        или кадра нет.
+
+        Отойти можно и дальше высоты окна: тогда кадр уходит вниз за
+        окно целиком и видны одни строки истории — так же, как в 15ИЭ,
+        где прокрутка идёт по общему потоку.
+
+        Окно собирается **одним буфером**: память кадра уложена сверху
+        вниз, так что строки истории (тоже перевёрнутые в этот порядок)
+        и верх кадра (`top_bits`) просто склеиваются.  Построчная укладка
+        обходилась в десятки миллисекунд на кадр — то есть в каждой
+        перерисовке при листании, а колесо перерисовывает окно на каждое
+        нажатие.
+
+        Собранное окно запоминается (`_cache`): перерисовка идёт и по
+        нажатию клавиш, и по событиям окна, и листать вхолостую пришлось
+        бы пересобирать одно и то же окно снова и снова.  Ключ кэша —
+        положение окна и **верх кадра**: пока ЭВМ пишет вниз, а оператор
+        смотрит вверх листания, окно не меняется.
+        """
+        if not self.lines or self.back <= 0 or frame is None:
+            return None
+        rows = rows or frame.height // CELL_H
+        k = self.back
+        n = len(self.lines)
+        from .framebuffer import Framebuffer
+        # Окно — общий поток «история, затем кадр».  Скроллив назад на `k`
+        # строк, нижняя строка окна стоит на `k` строк выше низа кадра,
+        # то есть поток кончается на позиции `n + кадр - k`.
+        start = n + (frame.height // CELL_H) - k - rows
+        first = max(0, start)               # ниже начала истории пусто
+        from_hist = max(0, min(rows, n - start))     # строк истории в окне
+        top = frame.top_bits(rows - from_hist)       # столько кадра снизу
+        if (self._cache is not None and self._cache[0] == k
+                and self._cache[1] == top):
+            return self._cache[2]
+        # Строки истории лежат снизу вверх, память кадра — сверху вниз:
+        # разворачиваем порядок рядов, а не биты внутри рядов.
+        parts = [b''.join(reversed(self.lines[p]))
+                 for p in range(first, first + from_hist)]
+        parts.append(top)
+        data = b''.join(parts)
+        pad = rows * CELL_H * (frame.width // 8) - len(data)
+        view = Framebuffer.from_bits(frame.width, frame.height,
+                                     data + bytes(pad) if pad > 0 else data)
+        self._cache = (k, top, view)
+        return view
+
+    def texts(self) -> list[str]:
+        """История как текст — для проверок и снимков.
+
+        Знаки разбираются из растра ПЗУ (`console.read_row`), а не из
+        запомненных кодов: строка хранится битами, и разбор один на
+        все строки.
+        """
+        from .framebuffer import Framebuffer
+        out = []
+        for line in self.lines:
+            width = len(line[0]) * 8
+            fb = Framebuffer(width, CELL_H)
+            for dy, row in enumerate(line):
+                fb.put_row_bytes(dy, row)
+            out.append(read_row(fb, 0).rstrip())
+        return out
+
+
+__all__ = ['History', 'DEFAULT_LIMIT']

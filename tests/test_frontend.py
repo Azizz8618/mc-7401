@@ -1653,3 +1653,63 @@ def test_last_label_shows_code_and_symbol(app):
     assert app.last_key == "≡144 'd'"
     app.handle_key('KEY_CLEAR')            # F5 — ОЧИСТКА
     assert app.last_key == 'ОЧИСТКА'
+
+
+# ── раскладка кадра на окно: таблицы вместо арифметики в цикле ──────────────
+
+def _formula_puts(fb, ox, oy, scale, *, y_from=0, y_to=None, clip=None):
+    """Заливки кадра, посчитанные формулой, — эталон для `_blit_scaled`."""
+    from mc7401.window import FG
+    out = []
+    top = fb.height if y_to is None else min(y_to, fb.height)
+    if top - y_from <= 0:
+        return out
+    for x0, y, x1 in fb.runs():
+        if y < y_from or y >= top:
+            continue
+        ax = ox + int(x0 * scale)
+        bx = max(ax + 1, ox + int(round(x1 * scale)))
+        ay = oy + int(round((top - 1 - y) * scale))
+        by = ay + max(1, int(round(scale)))
+        if clip is not None:
+            ax = max(0, min(ax, clip[0]))
+            bx = max(0, min(bx, clip[0]))
+            ay = max(0, min(ay, clip[1]))
+            by = max(0, min(by, clip[1]))
+        if bx > ax and by > ay:
+            out.append(((ax, ay, bx, by), FG))
+    return out
+
+
+@pytest.mark.parametrize('scale', [1.0, 1.42, 2.0, 0.75, 3.7])
+@pytest.mark.parametrize('origin', [(0, 0), (13, 0), (7, 33)])
+@pytest.mark.parametrize('clip', [None, (1600, 1000), (57, 41)])
+def test_blit_matches_the_formula(monkeypatch, scale, origin, clip):
+    """Увеличение кадра ложится ровно по той же формуле, что и раньше.
+
+    Раскладка считается таблицами (`xl`/`xr`/`yt`) — это ускорило
+    перерисовку вдвое, но таблицы легко разъехаться с формулой на
+    дробном масштабе или у края окна, и кадр поехал бы на точку.
+    """
+    win = make_window(monkeypatch, size=(1600, 1000))
+    win.console.write('ПРОВЕРКА 12345'.encode('koi8-r') + b'\r\n')
+    win.console.write(b'TEST abcdefgh\r\n')
+    fb = win.emu.fb
+    photo = FakePhoto(width=1600, height=1000)
+    win._blit_scaled(fb, photo, origin[0], origin[1], scale, clip=clip)
+    assert photo.puts == _formula_puts(fb, origin[0], origin[1], scale,
+                                       clip=clip)
+
+
+@pytest.mark.parametrize('band', [(0, None), (0, 60), (200, 400), (400, 400)])
+def test_blit_band_matches_the_formula(monkeypatch, band):
+    """Полосы кадра (строка состояния, подвал) считаются той же формулой."""
+    win = make_window(monkeypatch, size=(1600, 1000))
+    win.console.write(b'TEST abcdefgh\r\n')
+    fb = win.emu.fb
+    y_from, y_to = band
+    photo = FakePhoto(width=1600, height=1000)
+    win._blit_scaled(fb, photo, 0, 20, 1.42, y_from=y_from, y_to=y_to,
+                     clip=(1600, 1000))
+    assert photo.puts == _formula_puts(fb, 0, 20, 1.42, y_from=y_from,
+                                       y_to=y_to, clip=(1600, 1000))

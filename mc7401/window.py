@@ -51,13 +51,14 @@ from .console import (CELL_H, CELL_W, COLS, RASTER_H, ROWS, Console,
                       put_glyph)
 from .emulator import TerminalEmulator
 from .framebuffer import Framebuffer
+from .history import DEFAULT_LIMIT as DEFAULT_HISTORY, History
 from .link import LinkError
 from .panel import Diagnostics, Status
 from .pen import DEFAULT_TOOL, LightPen
 from .reader import CommandStreamReader, EventKind
 from .select import Selection
 from .session import MODE_LOCAL, Session
-from .undo import Undo
+from .undo import LIMIT as DEFAULT_UNDO, Undo
 
 log = logging.getLogger('mc7401.window')
 
@@ -153,6 +154,11 @@ class TerminalWindow:
         #: PgUp/PgDn листают её (`_hist_at` — индекс, None = текущий кадр).
         self._history: list[Framebuffer] = []
         self._hist_at: Optional[int] = None
+        #: История **строк**: всё, что сошло с кадра при автоскролле.
+        #: Глубина — `[display] history` (по умолчанию 1000, как в 15ИЭ).
+        self.hist = History(limit=getattr(config, 'history',
+                                          DEFAULT_HISTORY))
+        self.console.history = self.hist
         #: Диагностика — журнал сообщений; последнее идёт последним рядом
         #: подвала и рисуется глифами ПЗУ, как и весь подвал.
         self.diag = Diagnostics()
@@ -176,7 +182,8 @@ class TerminalWindow:
         #: Выделение текста мышью в режиме «выделение» пера — как на 15ИЭ.
         self.sel = Selection()
         #: Отмена последнего действия в режиме АВТОНОМНО (`Ctrl-Z`).
-        self.undo = Undo()
+        #: Глубина — `[display] undo` (по умолчанию 20 шагов).
+        self.undo = Undo(limit=getattr(config, 'undo', DEFAULT_UNDO))
         #: Сколько раз обход споткнулся — по первому пишем в подвал.
         self._faults = 0
 
@@ -623,17 +630,69 @@ class TerminalWindow:
 
     def _wheel_step(self, direction: int) -> None:
         """Колесо вверх/вниз (X11: кнопки 4/5) — тот же листатель."""
+        self.scroll_display(direction)
+
+    def _on_wheel(self, event) -> None:
+        """Колесо мыши: листать историю выдачи, как PgUp/PgDn в 15ИЭ."""
+        delta = getattr(event, 'delta', 0)
+        # Tk сообщает колесо знаками (Windows) или числами (X11).
+        self.scroll_display(-1 if delta > 0 else 1)
+
+    def clear_screen(self) -> None:
+        """`F5 ОЧИСТКА`: стереть кадр, уходящий кадр — в историю кадров.
+
+        Строка истории выдачи при этом не трогается: то, что уже сошло
+        с кадра, доступно и после очистки.
+        """
+        self.emu.execute(self.emu.parser.parse(b'S\x55'))
+        self.console.home()
+        shown = self.shown_frame()
+        if shown.count_set():
+            self._history.append(shown)
+        self._hist_at = None
+        self.best, self.best_n = self.emu.fb.copy(), 0
+        self.diag.add('экран очищен', 'ok')
+        self.last_key = 'ОЧИСТКА'
+        self.paint()
+
+    def scroll_display(self, direction: int) -> bool:
+        """Листать выдачу: сперва строки истории, потом кадры `F5 ОЧИСТКА`.
+
+        `direction`: `-1` — к более раннему, `1` — к текущему.  Истории
+        две и они разного рода: **строки** — всё, что сошло с кадра
+        автоскроллом, а **кадры** — то, что терминал стёр по `F5`.  Сперва
+        листаются строки (их много, и они мельче), а как только прокрутка
+        упирается в самую старую строку, колесо переходит к кадрам: так
+        до самого начала выдачи можно дойти одним колесом.
+        """
+        before = self.hist.position
+        if self.hist.scroll(direction) != before:
+            self.diag.add(f'история: {self.hist.size} строк, '
+                          f'назад {self.hist.position}')
+            self.last_key = 'ИСТОРИЯ'
+            self._dirty = True
+            self.paint()
+            return True
         self.scroll_view(direction)
         self.last_key = 'КОЛЕСО'
         self.paint()
+        return False
 
-    def _on_wheel(self, event) -> None:
-        """Колесо мыши: листать «историю» выдачи, как PgUp/PgDn в 15ИЭ."""
-        delta = getattr(event, 'delta', 0)
-        # Tk сообщает колесо знаками (Windows) или числами (X11).
-        self.scroll_view(-1 if delta > 0 else 1)
-        self.last_key = 'КОЛЕСО'
+    def scroll_history(self, direction: int) -> int:
+        """Листать **историю строк**: `-1` — назад, `1` — к кадру.
+
+        Отдельная от `scroll_view` история кадров (`F5 ОЧИСТКА`): сюда
+        попадает всё, что сошло с экрана при автоскролле текста.
+        Возвращает, на сколько строк окно отошло назад.
+        """
+        back = self.hist.scroll(direction)
+        if back:
+            self.diag.add(f'история: {self.hist.size} строк, '
+                          f'назад {back}')
+        self.last_key = 'ИСТОРИЯ'
+        self._dirty = True
         self.paint()
+        return back
 
     def scroll_view(self, direction: int) -> None:
         """Листать историю: `-1` — к более раннему кадру, `1` — к текущему.
@@ -801,9 +860,15 @@ class TerminalWindow:
         кадра не попадает: иначе перекрестье и подсветка затирались бы
         следующей перерисовкой программы.
         """
-        base = (self._history[self._hist_at]
-                if self._hist_at is not None and self._history
-                else (self.best if self.best_n else self.emu.fb))
+        if self._hist_at is not None and self._history:
+            base = self._history[self._hist_at]
+        else:
+            base = (self.best if self.best_n else self.emu.fb)
+            # Лента истории: при листании назад показываем строки, сошедшие
+            # с кадра, а под ними верх кадра — как на 15ИЭ.
+            past = self.hist.view(base)
+            if past is not None:
+                base = past
         need_view = self.pen.enabled or not self.sel.empty()
         if not need_view:
             return base
@@ -845,10 +910,10 @@ class TerminalWindow:
         # этом выполняется как обычно.
         self.dismiss_splash()
         if key in ('Prior', 'Next'):
-            # ЭКРАН↑/ЭКРАН↓ — то же, что колесо мыши.
-            self.scroll_view(-1 if key == 'Prior' else 1)
+            # ЭКРАН↑/ЭКРАН↓ — то же, что колесо мыши: сперва строки
+            # истории, потом кадры `F5 ОЧИСТКА`.
+            self.scroll_display(-1 if key == 'Prior' else 1)
             self.last_key = 'ЭКРАН'
-            self.paint()
             return 'break'
         if key in ('Up', 'Down', 'Left', 'Right'):
             # Курсор по ячейкам: ↑ вверх по кадру, ← влево.
@@ -902,16 +967,7 @@ class TerminalWindow:
             self.paint()
             return 'break'
         if key == 'F5':                       # ОЧИСТКА
-            self.emu.execute(self.emu.parser.parse(b'S\x55'))
-            self.console.home()
-            shown = self.shown_frame()
-            if shown.count_set():
-                self._history.append(shown)
-            self._hist_at = None
-            self.best, self.best_n = self.emu.fb.copy(), 0
-            self.diag.add('экран очищен', 'ok')
-            self.last_key = 'ОЧИСТКА'
-            self.paint()
+            self.clear_screen()
             return 'break'
         if key == 'F6':                       # ЭХО
             self.session.toggle_echo()
@@ -1136,21 +1192,43 @@ class TerminalWindow:
         границей холста.
         """
         top = fb.height if y_to is None else min(y_to, fb.height)
-        height = top - y_from
-        if height <= 0:
+        if top - y_from <= 0:
             return
+        # Ряд кадра ложится в полосу `strip` точек окна, и одна полоса
+        # считается один раз, а не на каждую серию.
+        strip = max(1, int(round(scale)))
+        xlim, ylim = clip if clip is not None else (None, None)
+        # Раскладку кадра на окно считаем таблицами, а не умножением и
+        # округлением на каждой серии: серий на кадре пять тысяч, а
+        # координат всего ширина × высота.  Раскладка в цикле обходилась в
+        # половину времени всей перерисовки, картинка же выходит ровно та
+        # же — таблицы построены той же формулой.
+        xl = [ox + int(x * scale) for x in range(fb.width + 1)]
+        xr = [ox + int(round(x * scale)) for x in range(fb.width + 1)]
+        yt = [oy + int(round((top - 1 - y) * scale)) for y in range(top)]
+        # Ряд и его полоса считаются на ряд кадра, а не на серию: серий
+        # на ряд десятки, и пересчёт `ay`/`by` на каждой обходился
+        # дороже, чем весь вывод.
+        last_y: Optional[int] = None
+        ay = by = 0
+
         for x0, y, x1 in fb.runs():
             if y < y_from or y >= top:
                 continue
-            ax = ox + int(x0 * scale)
-            bx = max(ax + 1, ox + int(round(x1 * scale)))
-            ay = oy + int(round((top - 1 - y) * scale))
-            by = ay + max(1, int(round(scale)))
-            if clip is not None:
-                ax = max(0, min(ax, clip[0]))
-                bx = max(0, min(bx, clip[0]))
-                ay = max(0, min(ay, clip[1]))
-                by = max(0, min(by, clip[1]))
+            if y != last_y:
+                last_y = y
+                ay = yt[y]
+                by = ay + strip
+                if xlim is not None and (ay < 0 or by > ylim):
+                    ay = max(0, min(ay, ylim))
+                    by = max(0, min(by, ylim))
+            ax = xl[x0]
+            bx = xr[x1]
+            if bx <= ax:                    # узкая серия — хоть одна точка
+                bx = ax + 1
+            if xlim is not None and (ax < 0 or bx > xlim):
+                ax = max(0, min(ax, xlim))
+                bx = max(0, min(bx, xlim))
             if bx > ax and by > ay:
                 photo.put(FG, to=(ax, ay, bx, by))
 
@@ -1220,6 +1298,9 @@ class TerminalWindow:
             input_line=''.join(ses.buffer),
             cursor=f'{cx},{cy}',
             graphics=self._graphics_label(),
+            # Положение окна в истории выдачи: пусто у живого кадра,
+            # `-N` — на сколько строк окно отошло назад.
+            history=f'-{self.hist.position}' if self.hist.position else '',
         )
 
     def _line_info(self) -> Line:

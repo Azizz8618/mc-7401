@@ -17,6 +17,9 @@ config.py — файл конфигурации эмулятора МС 7401.
 
 from __future__ import annotations
 
+from .history import DEFAULT_LIMIT as DEFAULT_HISTORY
+from .undo import LIMIT as DEFAULT_UNDO
+
 import configparser
 import logging
 import os
@@ -166,6 +169,13 @@ graphics = auto
 # Значение `none` — заставка без картинки, только текст.
 # Заставка закрывается при первом вводе или первом байте от ЭВМ.
 splash = КОТ
+# Глубина истории выданных на экран строк: сколько строк, сошедших с
+# кадра, помнится и доступно колесом мыши и клавишами ЭКРАН↑/ЭКРАН↓.
+# По умолчанию 1000 — как в эталоне 15ИЭ.  0 — история не ведётся.
+history = 1000
+# Сколько шагов правки помнит Ctrl-Z в режиме АВТОНОМНО: каждый шаг —
+# кадр целиком, так что глубина стоит памяти.  0 — отмена выключена.
+undo = 20
 
 [keys]
 # Переназначение клавиш: «что нажато = что делается».
@@ -218,6 +228,10 @@ class Config:
     # (по умолчанию КОТ).  `none` — без картинки.
     # Закрывается при первом вводе или первом байте от ЭВМ.
     splash: str = 'КОТ'
+    # Глубина истории выданных строк (`[display] history`), как в 15ИЭ.
+    history: int = DEFAULT_HISTORY
+    # Сколько шагов правки помнит `Ctrl-Z` (`[display] undo`).
+    undo: int = DEFAULT_UNDO
     # [keys]
     keys: dict[str, str] = field(default_factory=dict)
     #: Откуда прочитали (для сообщения при запуске).
@@ -276,6 +290,9 @@ class Config:
             self.fullscreen = p.getboolean('display', 'fullscreen',
                                            fallback=self.fullscreen)
             self.splash = p.get('display', 'splash', fallback=self.splash)
+            self.history = p.getint('display', 'history',
+                                    fallback=self.history)
+            self.undo = p.getint('display', 'undo', fallback=self.undo)
             self.graphics = p.get('display', 'graphics', fallback=self.graphics)
         if p.has_section('keys'):
             self.keys = {k.strip(): v.strip() for k, v in p.items('keys')

@@ -143,6 +143,10 @@ class Console:
         self.fb = fb
         #: Колонка курсора, 0…`COLS`-1.
         self.col = 0
+        #: История выданных строк (`mc7401.history.History`) или `None`.
+        #: Заводится фронтендом; кадр при автоскролле кладёт туда
+        #: ушедшие ряды.
+        self.history = None
         #: Строка курсора, 0…`ROWS`-1; строка 0 — верх экрана.
         self.row = 0
         #: Перо вывода текста (по умолчанию рисующее).
@@ -248,12 +252,19 @@ class Console:
         self.col = 0
 
     def newline(self) -> None:
-        """Новая строка; внизу экрана — автоскролл кадра вверх."""
+        """Новая строка; внизу экрана — автоскролл кадра вверх.
+
+        Ушедшие ряды кладутся в **историю** выдачи (`history.push_rows`),
+        если она заведена: иначе верхние строки просто пропадали бы, а
+        вернуться к ним было нечем.
+        """
         self.col = 0
         self.row += 1
         if self.row >= ROWS:
-            self.fb.scroll_up(CELL_H)
+            gone = self.fb.scroll_up(CELL_H)
             self.row = ROWS - 1
+            if self.history is not None:
+                self.history.push_line(gone)
 
     # ── стирание ────────────────────────────────────────────────────────────
 
@@ -292,6 +303,71 @@ class Console:
                     elif not on and run >= 0:
                         self.fb.set_span(x0 + run * n, y, x0 + u * n, self.pen)
                         run = -1
+
+
+#: Знаки, которыми кадр разбирается обратно в текст.  Порядок важен:
+#: у знаков-омографов («О» и «о») растр совпадает, и разбор обязан брать
+#: первым начертание из этого списка.
+ALPHABET = (' .,+-/:;()0123456789'
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+            'abcdefghijklmnopqrstuvwxyz'
+            'АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
+            'абвгдежзийклмнопрстуфхцчшщъыьэюя')
+
+#: Таблица «растр знака → знак»; заполняется при первом разборе.
+_GLYPH_KEYS: Optional[dict[bytes, str]] = None
+
+
+def _glyph_table() -> dict:
+    """Ключ растра знака → сам знак.
+
+    Ключ — биты знакоместа ровно в том виде, в каком их кладёт
+    `put_glyph`.  Сравнивать биты напрямую надёжнее, чем проверять
+    растр по координатам: преобразования `Y` вверх и масштаб заданы
+    один раз — здесь.
+    """
+    global _GLYPH_KEYS
+    if _GLYPH_KEYS is not None:
+        return _GLYPH_KEYS
+    step = GLYPH_W + GLYPH_SCALE
+    table: dict[bytes, str] = {}
+    for ch in ALPHABET:
+        fb = Framebuffer(step * GLYPH_SCALE, GLYPH_H * GLYPH_SCALE)
+        put_glyph(fb, 0, 0, ch, PEN_OR)
+        key = b''.join(fb.row_bytes(y) for y in range(GLYPH_H * GLYPH_SCALE))
+        table.setdefault(key, ch)
+    _GLYPH_KEYS = table
+    return table
+
+
+def read_row(fb: Framebuffer, y0: int, cols: Optional[int] = None,
+             blank: str = ' ') -> str:
+    """Знакоместа кадра обратно в строку знаков.
+
+    `y0` — нижняя граница знакоместа в рядах кадра (`Y` вверх).  Знак
+    ищется по таблице растров (`_glyph_table`), несовпавшее знакоместо
+    даёт `blank`.  Нужен для показа истории выдачи и для проверок.
+    """
+    table = _glyph_table()
+    step = (GLYPH_W + GLYPH_SCALE) * GLYPH_SCALE
+    cols = cols or max(0, fb.width // step)
+    height = GLYPH_H * GLYPH_SCALE
+    out = []
+    for col in range(cols):
+        x0 = col * step
+        key = b''.join(_row_bits(fb, y0 + dy, x0, step)
+                       for dy in range(height))
+        out.append(table.get(key, blank))
+    return ''.join(out)
+
+
+def _row_bits(fb: Framebuffer, y: int, x0: int, step: int) -> bytes:
+    """`step` точек ряда, начиная с `x0`, — байтами (старший бит слева)."""
+    out = bytearray((step + 7) // 8)
+    for u in range(step):
+        if fb.get(x0 + u, y):
+            out[u >> 3] |= 1 << (7 - (u & 7))
+    return bytes(out)
 
 
 def put_glyph(fb: Framebuffer, x0: int, y0: int, ch: str,

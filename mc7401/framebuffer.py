@@ -50,6 +50,17 @@ def _byte_runs() -> tuple[tuple[tuple[int, int], ...], ...]:
 
 _BYTE_RUNS = _byte_runs()
 
+#: Сколько единичных битов в каждом значении байта.  Через `translate`
+#: считается за один проход на C — `bin(b).count('1')` в цикле обходился
+#: в сотни раз дороже, а подсчёт зажжённых точек нужен при каждой правке
+#: кадра и при сборке окна истории.
+_POPCOUNT = bytes(i.bit_count() for i in range(256))
+
+
+def popcount(data) -> int:
+    """Число единичных битов в последовательности байтов."""
+    return sum(bytes(data).translate(_POPCOUNT))
+
 
 class Framebuffer:
     """Одноцветный (1 бит на точку) кадр 560×400."""
@@ -132,24 +143,81 @@ class Framebuffer:
         self._bits = bytearray(len(self._bits))
         self._count = 0
 
-    def scroll_up(self, rows: int) -> None:
-        """Сдвинуть кадр вверх на `rows` строк точек, снизу — пустая полоса.
+    def row_bytes(self, y: int) -> bytes:
+        """Ряд кадра битами, слева направо (`stride` байт).
 
-        Так работает автоскролл текста: содержимое уходит к верху экрана
-        (верхние строки теряются), внизу освобождается строка под новый
-        текст.  Строки хранятся сверху вниз (`_index`), поэтому сдвиг идёт
-        в сторону начала массива.
+        Ряд хранится побайтно, а не по точкам: историю выдачи держат
+        именно такие ряды, и вернуть их на экран — положить байты
+        обратно (`put_row_bytes`), без разбора по знакам.
         """
-        if rows <= 0:
+        if not 0 <= y < self.height:
+            return bytes(self.width // 8)
+        stride = self.width // 8
+        base = ((self.height - 1 - y) * self.width) >> 3
+        return bytes(self._bits[base:base + stride])
+
+    def put_row_bytes(self, y: int, data: bytes) -> None:
+        """Положить ряд битами, как его вернул `row_bytes`."""
+        if not 0 <= y < self.height:
             return
         stride = self.width // 8
-        shift = min(rows, self.height) * stride
-        dropped = self._bits[:shift]
+        data = bytes(data)[:stride]
+        if not data:
+            return
+        base = ((self.height - 1 - y) * self.width) >> 3
+        old = self._bits[base:base + stride]
+        self._bits[base:base + stride] = data
+        self._count += popcount(data) - popcount(old)
+
+    def top_bits(self, rows: int) -> bytes:
+        """Верхние `rows` рядов кадра битами, **сверху вниз**.
+
+        Память кадра и так уложена сверху вниз (`_index`), так что верх
+        кадра — это её начало: его можно взять одним срезом, без сборки
+        ряд за рядом.  Нужен для показа окна истории, где к строкам
+        истории снизу приклеивается верх кадра.
+        """
+        stride = self.width // 8
+        rows = max(0, min(rows, self.height))
+        return bytes(self._bits[:rows * stride])
+
+    @classmethod
+    def from_bits(cls, width: int, height: int, bits) -> 'Framebuffer':
+        """Кадр из готовой памяти: `bits` — ряды сверху вниз.
+
+        Обратная сторона `top_bits`: окно истории собирается одним буфером
+        (строки истории, к которым снизу приклеен верх кадра), а не
+        построчной укладкой — так окно собирается за доли миллисекунды
+        вместо десятков.
+        """
+        fb = cls(width, height)
+        data = bytes(bits)[:len(fb._bits)]
+        fb._bits[:len(data)] = data
+        fb._count = popcount(data)
+        return fb
+
+    def scroll_up(self, rows: int) -> list[bytes]:
+        """Сдвинуть кадр вверх, снизу — пустая полоса; вернуть ушедшие ряды.
+
+        Так работает автоскролл текста: содержимое уходит к верху экрана,
+        внизу освобождается строка под новый текст.  Возвращённые ряды
+        (сверху вниз) уходят в **историю** выдачи — иначе верхние строки
+        просто пропадали бы.  Строки хранятся сверху вниз (`_index`),
+        поэтому сдвиг идёт в сторону начала массива.
+        """
+        if rows <= 0:
+            return []
+        stride = self.width // 8
+        rows = min(rows, self.height)
+        shift = rows * stride
+        dropped = [bytes(self._bits[i * stride:(i + 1) * stride])
+                   for i in range(rows)]
         self._bits[0:len(self._bits) - shift] = self._bits[shift:]
         self._bits[len(self._bits) - shift:] = bytes(shift)
-        self._count -= sum(bin(b).count('1') for b in dropped)
+        self._count -= popcount(b''.join(dropped))
         if self._count < 0:                      # pragma: no cover
             self._count = 0
+        return dropped
 
     def point(self, x: int, y: int, pen: str = PEN_OR) -> None:
         self.apply(x, y, pen)
