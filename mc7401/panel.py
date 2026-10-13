@@ -250,7 +250,9 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
              'on' if st.echo else 'off'),
         cell('ПЕРО=', st.pen_tool if st.pen else 'ВЫКЛ',
              'on' if st.pen else 'off'),
-        cell('МАСШ=', '1:' + str(st.scale)),
+        # Масштаб выводится из размера окна и бывает дробным, поэтому
+        # без префикса «1:» — иначе ячейка подвала обрезает значение.
+        cell('МАШ=', f'{float(st.scale):.1f}'.rstrip('0').rstrip('.')),
         cell('БУФ=', str(st.buffer) if st.buffer else '—'),
         mk(('ПОСЛ', 'label'), (_short(st.last_key, width - 5), 'last')),
         cell('ВВОД=', st.input_line),

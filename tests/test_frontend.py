@@ -385,9 +385,21 @@ class FakePhoto:
 
 
 class FakeCanvas:
+    """Холст окна: размер задаёт пользователь окна.
 
-    def __init__(self):
+    Кадр вписывается в него, поэтому размер холста — входные данные
+    для `paint()`, а не следствие масштаба.
+    """
+
+    def __init__(self, width=560, height=460):
         self.configs: list = []
+        self._w, self._h = width, height
+
+    def winfo_width(self):
+        return self._w
+
+    def winfo_height(self):
+        return self._h
 
     def itemconfig(self, *args, **kwargs):
         self.configs.append((args, kwargs))
@@ -467,11 +479,11 @@ class FakeRoot:
         return self._width
 
 
-def make_window(monkeypatch, *, scale=1):
+def make_window(monkeypatch, *, scale=0, size=(560, 460)):
     monkeypatch.setitem(sys.modules, 'tkinter',
                         types.SimpleNamespace(PhotoImage=FakePhoto))
     win = window.TerminalWindow(None, scale=scale)
-    win._canvas = FakeCanvas()
+    win._canvas = FakeCanvas(*size)
     win._image_id = 1
     win.lbl_status = FakeText()
     win.lbl_panel = FakeText()
@@ -479,51 +491,108 @@ def make_window(monkeypatch, *, scale=1):
     return win
 
 
-def test_window_paint_draws_point_runs(monkeypatch):
-    """`PhotoImage.put` получает строку цвета и прямоугольник серии:
-    точки (0,0) и (2,0) — в левом нижнем углу кадра, это ряд y=0.
+def test_window_paint_fills_user_window(monkeypatch):
+    """Кадр равен размеру окна пользователя.
 
-    Кадр смещён вниз на строку состояния: она рисуется над кадром, как
-    на 15ИЭ, и кадр терминала от неё не страдает.
+    Служебные строки прижаты к краям окна, кадр занимает всё оставшееся
+    место: при вписывании по высоте он от края до края по вертикали и
+    одинаков по ширине с окном — значит равен ему.
     """
+    w, h = 900, 700
+    win = make_window(monkeypatch, size=(w, h))
+    win.paint()
+    assert (win._photo.width, win._photo.height) == (w, h)
+    fx, fy, scale = win._frame_geometry()
+    assert scale == min(w / 560, h / (400 + win.top_px()
+                                       + win.footer_px()))
+    # Полоса между служебными строками занята кадром целиком.
+    assert fy == int(round(win.top_px() * scale))
+    assert fy + int(round(400 * scale)) == h - int(round(
+        win.footer_px() * scale))
+
+
+def test_window_frame_is_pinned_to_left_top(monkeypatch):
+    """Кадр прижат к левому верхнему углу окна, как на 15ИЭ.
+
+    Окно шире пропорций кадра (560/400 = 1.4): кадр встаёт слева, а
+    свободное место остаётся справа — иначе знаки ПЗУ поехали бы из
+    начала координат, а оператор привык к началу слева.
+    """
+    w, h = 1600, 600
+    win = make_window(monkeypatch, size=(w, h))
+    win.paint()
+    fx, _, scale = win._frame_geometry()
+    assert fx == 0, 'кадр должен быть прижат к левому краю окна'
+    assert int(round(560 * scale)) < w, 'широкое окно: кадр вписан по высоте'
+    # По вертикали кадр занимает всю полосу между служебными строками.
+    top_h = int(round(win.top_px() * scale))
+    foot_h = int(round(win.footer_px() * scale))
+    assert 2 * top_h + 2 * int(round(400 * scale)) + 2 * foot_h <= 2 * h
+
+
+def test_window_resize_moves_frame(monkeypatch):
+    """Окно пользователя растянули — кадр вписан заново."""
+    win = make_window(monkeypatch, size=(560, 460))
+    win.paint()
+    before = win._frame_geometry()[2]
+    win._canvas._w, win._canvas._h = 1120, 920  # окно растянули вдвое
+    win.paint()
+    after = win._frame_geometry()[2]
+    assert after == before * 2, 'масштаб должен идти за размером окна'
+
+
+def test_window_paint_draws_point_runs(monkeypatch):
+    """`PhotoImage.put` получает прямоугольник серии зажжённых точек."""
     win = make_window(monkeypatch)
-    y = 5                              # ряд кадра у нижней кромки
-    win.emu.fb.point(0, y)
-    win.emu.fb.point(2, y)
+    win.emu.fb.point(0, 5)                      # ряд кадра у нижней кромки
+    win.emu.fb.point(2, 5)
     win.paint()
-    off = win.top_px() + win.footer_px()    # кадр начинается под подвалом
-    row = off + window.SCREEN_HEIGHT - 1 - y
-    height = window.SCREEN_HEIGHT + win.top_px() + win.footer_px()
-    bg_fill = (0, 0, window.SCREEN_WIDTH, height)
+    fx, fy, scale = win._frame_geometry()
+    row = fy + int(round((400 - 1 - 5) * scale))
     runs = [to for to, color in win._photo.puts
-            if to != bg_fill and color == window.FG
-            and to[1] == row and to[3] == row + 1]
+            if color == window.FG and to[1] == row]
     lit = [(x0, x1) for x0, _, x1, _ in runs]
-    assert any(x0 <= 0 < x1 for x0, x1 in lit), runs
-    assert any(x0 <= 2 < x1 for x0, x1 in lit), runs
-    assert all(isinstance(color, str) and color.startswith('#')
-               for _, color in win._photo.puts)
+    assert any(x0 <= fx < x1 for x0, x1 in lit), runs
+    assert any(x0 <= fx + 2 * scale < x1 for x0, x1 in lit), runs
 
 
-def test_window_paint_zooms_up(monkeypatch):
-    win = make_window(monkeypatch, scale=3)
+def _fg_rows(win, key):
+    """Ряды окна, где нарисованы свечения: по `key` — верх или низ серии."""
+    return [to[key] for to, color in win._photo.puts
+            if color == window.FG and to is not None]
+
+
+def test_window_status_is_pinned_to_top(monkeypatch):
+    """Строка состояния — у самого верха окна, а не над кадром."""
+    w, h = 900, 700
+    win = make_window(monkeypatch, size=(w, h))
     win.paint()
-    assert win._photo.zoomed == 3
-    assert win._photo.subsampled == 0
+    _, _, scale = win._frame_geometry()
+    top_h = int(round(win.top_px() * scale))
+    rows = _fg_rows(win, 1)
+    assert rows, 'в окне ничего не нарисовано'
+    assert min(rows) < top_h, 'строка состояния должна быть у верхнего края'
+    assert max(rows) < h, 'строка состояния не должна уходить вниз окна'
+
+
+def test_window_footer_is_pinned_to_bottom(monkeypatch):
+    """Подвал — у самого низа окна, а не под кадром."""
+    w, h = 900, 700
+    win = make_window(monkeypatch, size=(w, h))
+    win.paint()
+    _, _, scale = win._frame_geometry()
+    foot_h = int(round(win.footer_px() * scale))
+    rows = _fg_rows(win, 3)
+    assert rows, 'в окне ничего не нарисовано'
+    assert max(rows) > h - foot_h, 'подвал должен доходить до низа окна'
 
 
 def test_window_paint_shows_frame_between_chrome(monkeypatch):
-    """Холст — кадр 560×400 между строкой состояния и подвалом.
-
-    Обе служебные строки **вне** кадра, как на 15ИЭ: подвал не наезжает
-    на рабочее поле, поэтому обе добавляют высоту.  Нарисованы они
-    глифами ПЗУ того же размера, что и знак в кадре.
-    """
-    win = make_window(monkeypatch)
+    """Холст равен окну; служебные строки по краям, кадр между ними."""
+    w, h = 900, 700
+    win = make_window(monkeypatch, size=(w, h))
     win.paint()
-    assert win._photo.width == window.SCREEN_WIDTH
-    assert win._photo.height == (window.SCREEN_HEIGHT + win.top_px()
-                                 + win.footer_px())
+    assert (win._photo.width, win._photo.height) == (w, h)
 
 
 def test_window_host_text_is_drawn_on_frame(monkeypatch):
@@ -592,27 +661,30 @@ def test_window_arrows_move_cursor_by_cells(monkeypatch):
 def test_window_mouse_click_puts_cursor(monkeypatch):
     """Щелчок мышью ставит курсор в знакомёст под указателем.
 
-    Знакомест — шаг `CELL_W × CELL_H` (16×20), а не размер растра знака
-    14×16: растр уже с зазором (см. `console.CELL_W/CELL_H`).  Щёлкать
-    надо по кадру: подвал и строка состояния стоят вне его и указателя
-    кадра не принимают.
+    Знакомест — шаг `CELL_W × CELL_H` (8×10), а не размер растра знака
+    7×8: растр уже с зазором (см. `console.CELL_W/CELL_H`).  Кадр вписан
+    в окно и может иметь поля по бокам, поэтому координата указателя
+    переводится через геометрию кадра.
     """
     win = make_window(monkeypatch)
-    off = win.top_px() + win.footer_px()
-    y = off + window.SCREEN_HEIGHT // 2                 # середина кадра
-    win._on_click(FakeClick(3 * CELL_W, y))
-    assert (win.console.col, win.console.row) == (3, (y - off) // CELL_H)
+    fx, fy, scale = win._frame_geometry()
+    x = fx + int(3.5 * CELL_W * scale)
+    y = fy + int(4.5 * CELL_H * scale)
+    win._on_click(FakeClick(x, y))
+    assert (win.console.col, win.console.row) == (3, 4)
 
 
 def test_window_chrome_ignores_clicks_in_footer(monkeypatch):
     """Клик по подвалу не двигает курсор: подвал не кадр."""
-    win = make_window(monkeypatch)
-    off = win.top_px() + win.footer_px()
-    win._on_click(FakeClick(3 * CELL_W, off + window.SCREEN_HEIGHT // 2))
+    w, h = 900, 700
+    win = make_window(monkeypatch, size=(w, h))
+    fx, fy, scale = win._frame_geometry()
+    win._on_click(FakeClick(fx + int(3.5 * CELL_W * scale),
+                            fy + int(4.5 * CELL_H * scale)))
     before = (win.console.col, win.console.row)
-    foot_y = win.footer_px() - CELL_H // 2             # подвал — внизу полосы
+    foot_y = h - int(round(win.footer_px() * scale) / 2)
     assert win._in_chrome(foot_y), 'подвал должен распознаваться'
-    win._on_click(FakeClick(10 * CELL_W, foot_y))
+    win._on_click(FakeClick(fx + int(10.5 * CELL_W * scale), foot_y))
     assert (win.console.col, win.console.row) == before, \
         'клик по подвалу не должен двигать курсор'
 
@@ -620,10 +692,11 @@ def test_window_chrome_ignores_clicks_in_footer(monkeypatch):
 def test_window_click_above_frame_clamps_to_top(monkeypatch):
     """Клик в строке состояния прижимается к верхнему ряду кадра.
 
-    Строка состояния в окне **вне** кадра, и указателя кадра там нет —
+    Строка состояния прижата к верху окна, указателя кадра в ней нет —
     координата всё равно обязана остаться в кадре.
     """
-    win = make_window(monkeypatch)
+    w, h = 900, 700
+    win = make_window(monkeypatch, size=(w, h))
     assert win._in_chrome(1), 'строка состояния не кадр'
     win._on_click(FakeClick(3 * CELL_W, 1))
     assert win.console.row == 0, 'указатель ушёл выше кадра'

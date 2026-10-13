@@ -99,14 +99,15 @@ class Line:
 class TerminalWindow:
     """Окно терминала: кадр, курсор, ввод, служебная панель."""
 
-    def __init__(self, driver=None, *, scale: int = 1, endpoint=None,
+    def __init__(self, driver=None, *, scale: int = 0, endpoint=None,
                  demo: bool = False, config=None) -> None:
         self.driver = driver
-        self.scale = max(1, scale)
-        #: Масштаб, запрошенный конфигурацией (`[display] scale`): по
-        #: умолчанию кадр занимает весь экран, но просьба «не мельче»
-        #: уважается, если она в экран влезает.
-        self._wanted = self.scale
+        #: Текущий масштаб показа; он выводится из размера окна.
+        self.scale = 1.0
+        #: Ограничение увеличения (`[display] scale`).  0 — кадр ровно по
+        #: размеру окна пользователя, любое положительное число запрещает
+        #: кадру стать крупнее.
+        self._wanted = max(0, scale)
         #: Развернуть окно на весь экран (`[display] fullscreen`).
         self.fullscreen = bool(getattr(config, 'fullscreen', True))
         self.endpoint = endpoint
@@ -208,30 +209,21 @@ class TerminalWindow:
         root.title(startup.MODEL)
         root.configure(bg=BG)
         self._tk = root
-        # По умолчанию кадр занимает весь экран.  Разворачиваемся
-        # **до** подбора масштаба: подбирать надо по фактическому размеру
-        # окна, а не по экрану — у развёрнутого окна есть рамка и панель
-        # задач, и кадр иначе уедет за нижнюю кромку.  `[display]
-        # fullscreen = false` отключает.
         if self.fullscreen:
             self._maximize(root)
         root.update_idletasks()
-        self._fit_scale()
-        # Один холст из трёх полос: строка состояния, кадр 560×400 и
-        # подвал.  Кадр **вне** служебных строк — рабочее поле не должно
-        # наезжать на подвал, текст ОС виден целиком.  Всё нарисовано
-        # глифами ПЗУ того же размера, что и текст в кадре.
-        w = SCREEN_WIDTH * self.scale
-        h = (SCREEN_HEIGHT + self.top_px() + self.footer_px()) * self.scale
-
-        canvas = tk.Canvas(root, width=w, height=h, bg=BG,
-                           highlightthickness=0)
-        # Подвал привязан к нижней границе экрана: холст стоит снизу,
-        # поле остаётся над строкой состояния.
-        canvas.pack(side='bottom', anchor='s')
+        # Холст занимает окно целиком и растягивается вместе с ним:
+        # кадр должен быть равен размеру окна пользователя, поэтому
+        # фиксированного размера у холста быть не может.  `[display]
+        # fullscreen = false` открывает окно обычным, растягиваемым.
+        canvas = tk.Canvas(root, bg=BG, highlightthickness=0)
+        canvas.pack(fill='both', expand=True)
         self._photo = None
         self._canvas = canvas
         self._image_id = canvas.create_image(0, 0, anchor='nw')
+        # Окно пользователя перетаскивает и растягивает — кадр вписан
+        # заново на каждое изменение размера.
+        canvas.bind('<Configure>', self._on_resize)
         canvas.bind('<Button-1>', self._on_click)
         canvas.bind('<B1-Motion>', self._on_drag)
         canvas.bind('<ButtonRelease-1>', self._on_release)
@@ -306,21 +298,6 @@ class TerminalWindow:
         """Высота подвала у нижней кромки кадра, в точках."""
         _, bottom = self.chrome_parts()
         return len(bottom) * chrome.ROW_H
-
-    def _fit_scale(self) -> None:
-        """Вписать кадр вместе со служебными строками в окно.
-
-        Масштаб **не растёт** сверх `[display] scale`: подгонка только
-        уменьшает его, если кадр не влезает.  Иначе на экране 1920×1080
-        кадр вписывается в полосу над подвалом во вдвое, и знак ПЗУ на
-        экране становится 28×32 вместо затребованных 14×16.
-        """
-        w, h = self._avail_px()
-        if w <= 1 or h <= 1:
-            return
-        full = SCREEN_HEIGHT + self.top_px() + self.footer_px()
-        fits = max(1, min(w // SCREEN_WIDTH, h // max(1, full)))
-        self.scale = min(self._wanted, fits)
 
     def _avail_px(self) -> tuple[int, int]:
         """Размер окна под кадр: само окно, а если оно ещё не показано —
@@ -403,16 +380,36 @@ class TerminalWindow:
 
     def _pen_at(self, event) -> tuple[int, int]:
         """Координаты пера в системе кадра (Y вверх) по событию Tk."""
-        x = max(0, min(self.emu.fb.width - 1, event.x // self.scale))
+        fx, _, scale = self._frame_geometry()
+        x = int((event.x - fx) / scale) if scale else 0
+        x = max(0, min(self.emu.fb.width - 1, x))
         return x, self.emu.fb.height - 1 - self._frame_row_img(event.y)
+
+    def _frame_geometry(self) -> tuple[int, int, float]:
+        """Где в окне лежит кадр: `(x, y, масштаб)`.
+
+        Кадр вписан в окно пользователя и прижат к **левому верхнему**
+        углу — как на 15ИЭ.  Если окно шире пропорций кадра, свободное
+        место остаётся справа: центрировать нельзя, знаки ПЗУ поехали бы
+        вместе с кадром, а оператор привык к началу координат слева.
+        Координаты указателя переводятся через эту геометрию.
+        """
+        width, height = self._view_px()
+        scale = self._fit_scale(width, height, self.top_px(),
+                                self.footer_px())
+        frame_h = int(round(SCREEN_HEIGHT * scale))
+        top_h = int(round(self.top_px() * scale))
+        foot_h = int(round(self.footer_px() * scale))
+        y = top_h + max(0, (height - top_h - foot_h - frame_h) // 2)
+        return 0, y, scale
 
     def _frame_row_img(self, y: int) -> int:
         """Ряд кадра под указателем, **сверху вниз** (0 — верх кадра).
 
-        В изображении сверху вниз идут строка состояния, кадр и подвал;
-        указатель вне кадра прижимается к ближайшему его краю.
+        Указатель вне кадра прижимается к ближайшему его краю.
         """
-        row = y // self.scale - (self.top_px() + self.footer_px())
+        _, fy, scale = self._frame_geometry()
+        row = int((y - fy) / scale) if scale else 0
         return max(0, min(row, SCREEN_HEIGHT - 1))
 
     def _on_click(self, event) -> None:
@@ -420,7 +417,8 @@ class TerminalWindow:
         if self.pen.enabled:
             self._pen_down(event, button=1)
             return
-        col = (event.x // self.scale) // CELL_W
+        fx, _, scale = self._frame_geometry()
+        col = max(0, int((event.x - fx) / scale) // CELL_W) if scale else 0
         row = self._frame_row_img(event.y) // CELL_H
         if self._in_chrome(event.y):
             self.last_key = 'ПОДВАЛ'          # клик не по кадру
@@ -432,9 +430,9 @@ class TerminalWindow:
 
     def _in_chrome(self, y: int) -> bool:
         """Указатель попал в строку состояния или подвал — это не кадр."""
-        off = self.top_px() + self.footer_px()
-        y_img = y // self.scale
-        return not (off <= y_img < off + SCREEN_HEIGHT)
+        _, fy, scale = self._frame_geometry()
+        frame_h = int(round(SCREEN_HEIGHT * scale))
+        return not (fy <= y < fy + frame_h)
 
     def _pen_down(self, event, *, button: int = 1) -> None:
         """Нажатие пера: начать штрих (правой кнопкой — стирание)."""
@@ -619,15 +617,10 @@ class TerminalWindow:
             if low == 'q':
                 self.close()
                 return 'break'
-            if ch in '+=':                    # МАСШТАБ ближе
-                self.scale = min(8, self.scale + 1)
-            elif ch == '-':                   # МАСШТАБ дальше
-                self.scale = max(1, self.scale - 1)
-            elif low == 'c':                  # ЦЕНТР
+            if low == 'c':                     # ЦЕНТР
                 self.console.goto(COLS // 2, ROWS // 2)
             else:
                 return None
-            self._resize_canvas()
             self.last_key = 'УПР-' + low
             self.paint()
             return 'break'
@@ -645,13 +638,8 @@ class TerminalWindow:
             return 'break'
         return None
 
-    def _resize_canvas(self) -> None:
-        """Пересчитать холст под масштаб."""
-        self._canvas.config(
-            width=SCREEN_WIDTH * self.scale,
-            height=(SCREEN_HEIGHT + self.chrome_px()) * self.scale)
-
     def close(self) -> None:
+        """Закрыть окно: конец сеанса и линии."""
         self.running = False
         if self._tk is not None:
             self._tk.quit()
@@ -659,73 +647,154 @@ class TerminalWindow:
     # ── отрисовка кадра ─────────────────────────────────────────────────────
 
     def paint(self) -> None:
-        """Вывести окно целиком: служебные строки и кадр с курсором.
+        """Вывести окно целиком: строка состояния, кадр и подвал.
 
-        Полоса из двух частей: кадр 560×400, а над ним строка состояния.
-        Подвал поверх нижней кромки кадра и высоты не добавляет — иначе
-        окно перестало бы влезать в экран целиком.  Всё нарисовано
-        глифами ПЗУ того же размера: у экрана одна типографика, как на
-        настоящем терминале.
+        Раскладка по требованию «кадр равен размеру окна»:
+
+            ┌──────────────────────────────┐
+            │ строка состояния — у верха   │
+            ├──────────────────────────────┤
+            │                              │
+            │        кадр 560×400          │
+            │   (заполняет окно по месту)  │
+            │                              │
+            ├──────────────────────────────┤
+            │ подвал — у низа              │
+            └──────────────────────────────┘
+
+        Служебные строки прижаты к краям окна, кадр занимает всё
+        оставшееся место и потому равен размеру окна пользователя.
+        Всё нарисовано глифами ПЗУ того же размера: у экрана одна
+        типографика, как на настоящем терминале.
         """
         import tkinter as tk
         top_rows, bottom_rows = self.chrome_parts()
-        top_px = self.top_px()
-        height = SCREEN_HEIGHT + top_px + self.footer_px()
-        photo = tk.PhotoImage(master=self._tk, width=SCREEN_WIDTH,
-                              height=height)
-        photo.put(BG, to=(0, 0, SCREEN_WIDTH, height))
-        # Кадр терминала — между служебными строками: под ним подвал,
-        # над ним строка состояния.  Рабочее поле ни с чем не пересекается.
-        self._blit(self.shown_frame(), photo, top_px + self.footer_px())
-        strip = Framebuffer(SCREEN_WIDTH, height)
+        top_px, foot_px = self.top_px(), self.footer_px()
+        frame = self.shown_frame()
+
+        width, height = self._view_px()
+        scale = self._fit_scale(width, height, top_px, foot_px)
+        self.scale = scale
+
+        photo = tk.PhotoImage(master=self._tk, width=max(1, width),
+                              height=max(1, height))
+        photo.put(BG, to=(0, 0, max(1, width), max(1, height)))
+
+        top_h = int(round(top_px * scale))
+        foot_h = int(round(foot_px * scale))
+        frame_h = int(round(SCREEN_HEIGHT * scale))
+        # Кадр прижат к левому краю окна и стоит в полосе между служебными
+        # строками; при вписывании по высоте он занимает её целиком.
+        frame_x = 0
+        frame_y = top_h + max(0, (height - top_h - foot_h - frame_h) // 2)
+
+        self._blit_scaled(frame, photo, frame_x, frame_y, scale,
+                          clip=(width, height))
+        self._cursor_frame_scaled(photo, frame_x, frame_y, scale)
+
+        strip = Framebuffer(SCREEN_WIDTH, max(top_px, foot_px))
         chrome.render_status(strip, top_rows)
+        self._blit_scaled(strip, photo, frame_x, 0, scale,
+                          y_from=strip.height - top_px, clip=(width, height))
+        strip = Framebuffer(SCREEN_WIDTH, max(top_px, foot_px))
         chrome.render_footer(strip, bottom_rows)
-        self._blit(strip, photo, 0)
-        self._cursor_frame(photo, top_px + self.footer_px())
-        if self.scale > 1:
-            # Холст сделан scale× больше — изображение увеличивается,
-            # а не уменьшается (раньше стояло `subsample`).
-            photo = photo.zoom(self.scale)
+        self._blit_scaled(strip, photo, frame_x, height - foot_h, scale,
+                          clip=(width, height))
+
         self._photo = photo                      # держим ссылку
         self._canvas.itemconfig(self._image_id, image=photo)
         self._dirty = False
 
-    def _blit(self, fb: Framebuffer, photo, offset: int) -> None:
-        """Вывести кадр `fb` в изображение, сдвинув его на `offset`."""
-        self._blit_band(fb, photo, offset, 0, fb.height)
+    def _view_px(self) -> tuple[int, int]:
+        """Размер окна в точках — на него и вписывается кадр."""
+        try:
+            w, h = self._canvas.winfo_width(), self._canvas.winfo_height()
+        except Exception:                          # pragma: no cover
+            return SCREEN_WIDTH, SCREEN_HEIGHT
+        if w <= 1 or h <= 1:                      # окно ещё не показано
+            return self._avail_px()
+        return w, h
 
-    def _blit_band(self, fb: Framebuffer, photo, offset: int,
-                   y_from: int, y_to: int) -> None:
-        """Вывести полосу `fb` по рядам `y_from…y_to` в изображение.
+    def _fit_scale(self, width: int, height: int, top_px: int,
+                   foot_px: int) -> float:
+        """Масштаб кадра под окно: кадр занимает его целиком.
 
-        Координаты `y` — кадровые (`Y` вверх); `offset` — куда встаёт
-        **верх** полосы в изображении (строки сверху вниз).  Серии берутся
-        готовыми (`Framebuffer.runs`) — обход по точкам на кадре 560×400
-        занимал 120 мс и ввод с клавиатуры заметно отставал.
+        Равномерный, иначе пропорции кадра исказились бы; выбирается по
+        той стороне, которая вписывается, — по ней и получается равенство
+        окну.  `[display] scale`, если он задан, ограничивает увеличение.
         """
-        limit = min(y_to, fb.height)
-        skip_to = offset + fb.height - limit      # ряды выше — не рисуем
-        for x0, y, x1 in fb.runs():
-            if y < y_from or y >= limit:
-                continue
-            img_y = offset + fb.height - 1 - y
-            if img_y < skip_to:
-                continue
-            photo.put(FG, to=(x0, img_y, x1, img_y + 1))
+        full = SCREEN_HEIGHT + top_px + foot_px
+        scale = min(width / SCREEN_WIDTH, height / max(1, full))
+        if self._wanted > 0:            # запрет кадру стать крупнее
+            scale = min(scale, float(self._wanted))
+        return max(scale, 0.05)
 
-    def _cursor_frame(self, photo, offset: int) -> None:
+    def _on_resize(self, event) -> None:
+        """Окно пользователя изменилось — кадр вписывается заново."""
+        if event.widget is not self._canvas:
+            return
+        self._dirty = True
+        self.paint()
+
+    def _blit_scaled(self, fb: Framebuffer, photo, ox: int, oy: int,
+                     scale: float, *, y_from: int = 0,
+                     y_to: Optional[int] = None,
+                     clip: Optional[tuple[int, int]] = None) -> None:
+        """Вывести `fb` в изображение окна, увеличив в `scale` раз.
+
+        Растягивание идёт **по сериям точек** (`Framebuffer.runs`), а не по
+        точкам: одна серия кадра остаётся одной серией и при дробном
+        увеличении, поэтому перерисовка кадра любого размера стоит столько
+        же, сколько при целом.  Tk 8.6 не умеет дробный `zoom`
+        (`expected integer`), иначе масштаб был бы только целым, а кадр
+        не мог бы быть равен размеру окна.
+
+        `y_from`…`y_to` — ряды полосы, которые выводить: строка состояния
+        лежит в верхних рядах полосы, подвал — в нижних, а обе полосы
+        сделаны одной высоты и рисуются из неё по очереди.  Верх
+        выводимого отрезка — его верхний ряд, а не верх полосы.
+
+        `clip` — размеры изображения окна: при дробном масштабе ряд может
+        на пол-точки выйти за край, и его надо обрезать, а не оставить за
+        границей холста.
+        """
+        top = fb.height if y_to is None else min(y_to, fb.height)
+        height = top - y_from
+        if height <= 0:
+            return
+        for x0, y, x1 in fb.runs():
+            if y < y_from or y >= top:
+                continue
+            ax = ox + int(x0 * scale)
+            bx = max(ax + 1, ox + int(round(x1 * scale)))
+            ay = oy + int(round((top - 1 - y) * scale))
+            by = ay + max(1, int(round(scale)))
+            if clip is not None:
+                ax = max(0, min(ax, clip[0]))
+                bx = max(0, min(bx, clip[0]))
+                ay = max(0, min(ay, clip[1]))
+                by = max(0, min(by, clip[1]))
+            if bx > ax and by > ay:
+                photo.put(FG, to=(ax, ay, bx, by))
+
+    def _cursor_frame_scaled(self, photo, ox: int, oy: int,
+                            scale: float) -> None:
         """Рамка знакоместа курсора поверх кадра.
 
-        Рамка — часть экрана терминала, но не часть его памяти: на
-        кадре её нет, рисуется она при выводе (как на настоящем
-        терминале, где курсор — не зажжённая точка).
+        Рамка — часть экрана терминала, но не часть его памяти: на кадре
+        её нет, рисуется она при выводе (как на настоящем терминале,
+        где курсор — не зажжённая точка).
         """
         x0, y0, x1, y1 = self.console.cell_rect()
-        iy0 = offset + SCREEN_HEIGHT - 1 - y1
-        photo.put(FG, to=(x0, iy0, x1 + 1, iy0 + 1))
-        photo.put(FG, to=(x0, iy0 + RASTER_H - 1, x1 + 1, iy0 + RASTER_H))
-        photo.put(FG, to=(x0, iy0, x0 + 1, iy0 + RASTER_H))
-        photo.put(FG, to=(x1, iy0, x1 + 1, iy0 + RASTER_H))
+        ax0, ay0 = ox + int(x0 * scale), oy + int(round(SCREEN_HEIGHT * scale))
+        ay0 -= int(round((SCREEN_HEIGHT - y1) * scale))
+        ay1 = ay0 + max(1, int(round((y1 - y0) * scale)))
+        ax1 = ox + int(round((x1 + 1) * scale))
+        ex, ey = max(1, int(round(scale))), max(1, int(round(scale)))
+        photo.put(FG, to=(ax0, ay0, ax1, ay0 + ey))
+        photo.put(FG, to=(ax0, ay1 - ey, ax1, ay1))
+        photo.put(FG, to=(ax0, ay0, ax0 + ex, ay1))
+        photo.put(FG, to=(ax1 - ex, ay0, ax1, ay1))
 
     # ── строка состояния и подвал ────────────────────────────────────────────
 

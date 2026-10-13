@@ -169,11 +169,10 @@ def main(argv=None) -> int:
         # (нет tkinter или дисплея) откатываемся на TUI.
         if not args.tui and _gui_usable():
             from .window import run_window
-            # Масштаб окна — из конфигурации (`[display] scale`), если
-            # его не задали в командной строке: по умолчанию знак ПЗУ на
-            # экране ровно 14×16 точек.
-            scale = args.scale if args.scale else int(getattr(cfg, 'scale', 1))
-            code = run_window(endpoint=args.link, scale=max(1, scale),
+            # Ограничение увеличения кадра: из конфигурации, если его не
+            # задали в командной строке.  0 — кадр ровно по размеру окна.
+            scale = args.scale if args.scale else int(getattr(cfg, 'scale', 0))
+            code = run_window(endpoint=args.link, scale=scale,
                               demo=args.demo, config=cfg)
             if code != 3:                 # 3 — графика недоступна
                 return code

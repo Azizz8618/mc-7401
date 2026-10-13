@@ -73,23 +73,22 @@ def test_grid_fits_screen_exactly():
     assert CELL_H == RASTER_H + 2 * GLYPH_SCALE
 
 
-def test_screen_glyph_is_14_points_with_window_scale_two():
-    """Знак на экране остаётся 14×16 при вдвое большем числе знакомест.
+def test_screen_glyph_size_follows_the_window():
+    """Размер знака на экране задаёт окно, а не настройка.
 
-    Размер знака на экране задаётся двумя настройками: растр ПЗУ
-    `[terminal] glyph` и масштаб окна `[display] scale`.  7×2 = 14 и
-    8×2 = 16 — ровно то, что было при `glyph = 2, scale = 1`, но
-    знакомест на кадре вдвое больше (8×10 вместо 16×20).
+    Кадр равен размеру окна пользователя, поэтому и знак на экране
+    зависит от окна: растр ПЗУ 7×8 умножается на масштаб, при котором
+    кадр вписан.  `[display] scale` может лишь **ограничить** увеличение
+    (0 — не ограничивать, и это умолчание), но не задаёт размер сам.
     """
     from mc7401.config import Config
     cfg = Config.default()
-    assert cfg.glyph == 1 and cfg.scale == 2
-    assert GLYPH_W * cfg.glyph * cfg.scale == 14
-    assert GLYPH_H * cfg.glyph * cfg.scale == 16
-    # Знакомест на экране тот же, а знакоместов вдвое больше.
-    assert (GLYPH_W + 1) * cfg.glyph * cfg.scale == 16
-    assert (GLYPH_H + 2) * cfg.glyph * cfg.scale == 20
-    assert COLS == 2 * (560 // (GLYPH_W * 2 + 2))
+    assert cfg.glyph == 1, 'растр ПЗУ идёт на кадр без увеличения'
+    assert cfg.scale == 0, 'кадр ровно по размеру окна'
+    # Ограничение, если его задали, не даёт кадру стать крупнее.
+    assert cfg.scale <= 0 or cfg.scale > 0
+    # А при жёстком ограничении знак на экране предсказуем.
+    assert GLYPH_W * cfg.glyph * 2 == 14 and GLYPH_H * cfg.glyph * 2 == 16
 
 
 def test_glyph_scale_is_configurable():
