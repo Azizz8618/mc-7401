@@ -101,6 +101,11 @@ endpoint = 127.0.0.1:4202-4223
 # Значение — имя символа: CR (по умолчанию), LF, ETX или код
 # в восьмеричной записи (0o015).
 eol = CR
+# Запрашивать ли приглашение ОС при подключении к линии: терминал
+# сам отправляет ПРПС и ждёт ответа.  Нужно было для проверки
+# работоспособности на начальном этапе; по умолчанию выключено —
+# терминал молчит, пока оператор не нажмёт ПРПС (Enter) сам.
+prompt = false
 
 [terminal]
 # Режим сеанса: host (С ЭВМ) или local (АВТОНОМНО).
@@ -181,6 +186,9 @@ class Config:
     #: Символ конца введённой строки на линии ДКС (по умолчанию ПР = CR):
     #: по эталону 15ИЭ окончание строки на ДКС — ПР, ETX лишь знак.
     eol: int = 0o015
+    #: Запрашивать ли приглашение ОС самому при подключении.  Выключено:
+    #: линия должна молчать, пока оператор не нажмёт ПРПС.
+    prompt: bool = False
     # [terminal]
     mode: str = 'host'
     charset: str = 'n2'
@@ -249,6 +257,8 @@ class Config:
             self.endpoint = p.get('line', 'endpoint', fallback=self.endpoint)
             self.eol = parse_eol(p.get('line', 'eol', fallback=None),
                                  self.eol)
+            self.prompt = p.getboolean('line', 'prompt',
+                                       fallback=self.prompt)
         if p.has_section('terminal'):
             self.mode = p.get('terminal', 'mode', fallback=self.mode)
             self.charset = p.get('terminal', 'charset', fallback=self.charset)

@@ -1272,7 +1272,8 @@ def run_window(*, endpoint: Optional[str] = None, scale: int = 1,
         endpoint = getattr(cfg, 'endpoint', None) or DEFAULT_ENDPOINT
     if endpoint:
         try:
-            driver = LiveDriver(endpoint)
+            driver = LiveDriver(endpoint,
+                                prompt=getattr(cfg, 'prompt', False))
         except LinkRefused as exc:
             print(str(exc))
             return 2

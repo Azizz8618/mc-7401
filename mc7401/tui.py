@@ -309,7 +309,7 @@ class LiveDriver(Driver):
     #: Пауза между повторами, с.
     PROMPT_RETRY = 3.0
 
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, *, prompt: bool = False) -> None:
         from .link import DKSLink, LinkError, spec_hint, split_endpoint
         host, ports = split_endpoint(endpoint)
         self.endpoint = endpoint
@@ -327,8 +327,11 @@ class LiveDriver(Driver):
         #: эхо-ответ из потока (иначе набранное показывается дважды,
         #: а пароль виден в эхе машины).
         self._echo = EchoStrip()
-        #: Запрос приглашения ОС (ПРПС): повторяется, пока машина
-        #: не ответит.
+        #: Запрашивать ли приглашение ОС самому (`[line] prompt`).
+        #: Выключено: автозапрос нужен был только для проверки
+        #: работоспособности на начальном этапе, а линия должна молчать,
+        #: пока оператор не нажмёт ПРПС (Enter) сам.
+        self.auto_prompt = prompt
         self._prompt_at = time.monotonic() + self.PROMPT_DELAY
         self._prompt_tries = 0
         self._prompted = False
@@ -379,7 +382,7 @@ class LiveDriver(Driver):
         # (баннер линии приходит до него и в счёт не идёт).
         if data and self._prompt_tries:
             self._prompted = True
-        if not self._prompted:
+        if not self._prompted and self.auto_prompt:
             # Запрос приглашения живёт здесь же: recv на тихой линии
             # отбрасывается таймаутом, и без этого до него не дошло бы.
             self._request_prompt()
@@ -387,6 +390,11 @@ class LiveDriver(Driver):
 
     def _request_prompt(self) -> None:
         """Запросить приглашение ОС — ПРПС (пустая строка), как в 15ИЭ.
+
+        Вызывается только при `[line] prompt = true`.  По умолчанию линия
+        не трогается: автозапрос был нужен только для проверки
+        работоспособности на начальном этапе, а приглашение запрашивает
+        оператор клавишей ПРПС.
 
         ОС Диспак отвечает на ПРПС приглашением «ЭВМ-3,ТNNN»; так же
         поступает эталон (`ie15emu/agent.py`: `key("KEY_ENTER")`).
@@ -1541,7 +1549,8 @@ def run_tui(path: Optional[Path] = None, *, endpoint: Optional[str] = None,
     else:
         # По умолчанию — интерактивная сессия с БЭСМ-6 по каналу ДКС.
         try:
-            driver = LiveDriver(endpoint or DEFAULT_ENDPOINT)
+            driver = LiveDriver(endpoint or DEFAULT_ENDPOINT,
+                                prompt=getattr(cfg, 'prompt', False))
         except LinkRefused as exc:
             print(str(exc), file=sys.stderr)
             return 2

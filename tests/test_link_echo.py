@@ -107,12 +107,54 @@ class FakeLine:
         pass
 
 
-def _driver(monkeypatch):
+def _driver(monkeypatch, *, prompt=True):
+    """Драйвер на поддельной линии; `prompt` — автозапрос приглашения.
+
+    По умолчанию здесь `prompt=True`: проверки ниже относятся именно к
+    механизму запроса, а молчание линии по умолчанию проверяется
+    отдельно (`test_no_prompt_requested_by_default`).
+    """
     from mc7401 import link as linkmod
     from mc7401.tui import LiveDriver
     FakeLine.instances.clear()
     monkeypatch.setattr(linkmod, 'DKSLink', FakeLine)
-    return LiveDriver('127.0.0.1:4202'), FakeLine.instances[0]
+    return (LiveDriver('127.0.0.1:4202', prompt=prompt),
+            FakeLine.instances[0])
+
+
+def test_no_prompt_requested_by_default(monkeypatch):
+    """По умолчанию линия не трогается: терминал молчит до ПРПС.
+
+    Автозапрос был нужен только для проверки работоспособности на
+    начальном этапе.  Теперь терминал подключается и не отправляет
+    ничего, пока оператор не нажмёт ПРПС.
+    """
+    from mc7401.config import Config
+    assert Config.default().prompt is False, 'автозапрос включён по умолчанию'
+    drv, line = _driver(monkeypatch, prompt=False)
+    for _ in range(10):
+        drv._prompt_at = 0.0
+        drv.poll(0)
+    assert line.sent == [], 'терминал что-то отправил в линию сам'
+    assert not drv._prompted
+
+
+def test_prompt_is_still_available(monkeypatch):
+    """Механизм запроса не выброшен: его включает `[line] prompt`."""
+    drv, line = _driver(monkeypatch, prompt=True)
+    assert drv.auto_prompt
+    drv._prompt_at = 0.0
+    drv.poll(0)
+    assert line.sent == [b'\r']
+
+
+def test_config_reads_prompt_flag(monkeypatch, tmp_path):
+    """`[line] prompt = true` в файле включает автозапрос."""
+    from mc7401.config import Config
+    path = tmp_path / 'mc7401.ini'
+    path.write_text('[line]\nprompt = true\n', encoding='utf-8')
+    assert Config.load(path).prompt is True
+    assert Config.default().prompt is False
 
 
 def test_prompt_requested_with_prps(monkeypatch):
