@@ -862,7 +862,7 @@ def test_config_sample_roundtrip(tmp_path):
 
 
 def test_startup_screen_mentions_model_and_clock():
-    """Начальный экран: модель, разрешение, время, состояние линии."""
+    """Начальный экран: модель, разрешение, время, настройки, выход."""
     from datetime import datetime
 
     from mc7401 import startup
@@ -873,8 +873,25 @@ def test_startup_screen_mentions_model_and_clock():
     assert 'МС 7401' in text
     assert '560×400' in text
     assert '12:34:56' in text
-    assert 'ДКС 127.0.0.1:4202' in text
+    assert 'набор n2' in text
     assert 'q — выход' in text
+
+
+def test_startup_screen_has_no_connection_banner():
+    """Надписи о подключении на заставке нет.
+
+    Подключение написано в строке состояния над кадром и в подвале; на
+    заставке «соединение…» только занимало место и мелькало.
+    """
+    from datetime import datetime
+
+    from mc7401 import startup
+    text = startup.build(80, state='ДКС 127.0.0.1:4202',
+                         summary='набор n2, режим host',
+                         hint=startup.hint_text(),
+                         clock=datetime(2026, 10, 10, 12, 34, 56))
+    assert 'ДКС 127.0.0.1:4202' not in text
+    assert 'соединение' not in text.lower()
 
 
 # ── порядок КОИ-7: буквы БЭСМ-6 заглавными ──────────────────────────────────

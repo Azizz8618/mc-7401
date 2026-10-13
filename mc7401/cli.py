@@ -43,8 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help='выходной файл (для svg/png)')
     ap.add_argument('--png', metavar='FILE',
                     help='дополнительно сохранить PNG')
-    ap.add_argument('--scale', type=int, default=2,
-                    help='масштаб растрового вывода (по умолчанию 2)')
+    ap.add_argument('--scale', type=int, default=None,
+                    help='масштаб растрового вывода; окно берёт его из '
+                         'конфигурации, где по умолчанию 1 — знак ПЗУ '
+                         'на экране ровно 14×16 точек')
     ap.add_argument('--xor-code', type=lambda v: int(v, 8),
                     default=None, metavar='OCT',
                     help='код команды инвертирующего пера (восьмеричный)')
@@ -129,6 +131,9 @@ def main(argv=None) -> int:
 
     from .config import load as load_config
     cfg = load_config(args.conf)
+    # Масштаб выгрузки кадра: у окна он из конфигурации, где 1 — знак
+    # ровно 14×16 точек, а картинку удобнее писать вдвое крупнее.
+    export_scale = args.scale if args.scale else 2
 
     if args.list_backends:
         for name in sorted(BACKENDS):
@@ -139,7 +144,7 @@ def main(argv=None) -> int:
     if args.listen:
         from .link import run_listener
         return run_listener(args.listen, backend=args.backend,
-                            output=args.output, scale=args.scale,
+                            output=args.output, scale=export_scale,
                             timeout=args.link_timeout,
                             verbose=args.verbose)
 
@@ -164,7 +169,11 @@ def main(argv=None) -> int:
         # (нет tkinter или дисплея) откатываемся на TUI.
         if not args.tui and _gui_usable():
             from .window import run_window
-            code = run_window(endpoint=args.link, scale=max(1, args.scale),
+            # Масштаб окна — из конфигурации (`[display] scale`), если
+            # его не задали в командной строке: по умолчанию знак ПЗУ на
+            # экране ровно 14×16 точек.
+            scale = args.scale if args.scale else int(getattr(cfg, 'scale', 1))
+            code = run_window(endpoint=args.link, scale=max(1, scale),
                               demo=args.demo, config=cfg)
             if code != 3:                 # 3 — графика недоступна
                 return code
@@ -180,7 +189,7 @@ def main(argv=None) -> int:
     if args.link:
         from .link import run_link
         return run_link(args.link, backend=args.backend,
-                        output=args.output, scale=args.scale,
+                        output=args.output, scale=export_scale,
                         timeout=args.link_timeout,
                         verbose=args.verbose)
 
@@ -213,18 +222,18 @@ def main(argv=None) -> int:
         return 0
 
     if args.backend == 'png':
-        PNGBackend(fb, scale=args.scale).save(args.output)
+        PNGBackend(fb, scale=export_scale).save(args.output)
         print(args.output)
     elif args.backend == 'svg':
         SVGBackend(fb).save(args.output)
         print(args.output)
     elif args.backend == 'tk':                       # pragma: no cover
-        TkBackend(fb, scale=args.scale).show()
+        TkBackend(fb, scale=export_scale).show()
     elif args.backend == 'pygame':                   # pragma: no cover
-        PygameBackend(fb, scale=args.scale, fps=args.fps).show(frames or None)
+        PygameBackend(fb, scale=export_scale, fps=args.fps).show(frames or None)
 
     if args.png:
-        PNGBackend(fb, scale=args.scale).save(args.png)
+        PNGBackend(fb, scale=export_scale).save(args.png)
         print(args.png)
     return 0
 

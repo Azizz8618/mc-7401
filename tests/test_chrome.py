@@ -30,15 +30,27 @@ def make_status(**kw) -> Status:
 
 
 def draw(top, bottom) -> Framebuffer:
-    """Полоса во всю высоту кадра — служебные строки поверх него."""
-    fb = Framebuffer(SCREEN_WIDTH, chrome.ROW_H * (len(top) + len(bottom)))
-    chrome.render(fb, top, bottom, frame_height=fb.height)
+    """Полоса: кадр в середине, строка состояния над ним, подвал под ним."""
+    fb = Framebuffer(SCREEN_WIDTH,
+                     400 + chrome.ROW_H * (len(top) + len(bottom)))
+    chrome.render(fb, top, bottom, frame_height=400)
     return fb
 
 
-def cell_pixels(fb: Framebuffer, col: int, row: int) -> int:
-    """Сколько точек зажёг знак в знакоместе (`col`, `row`) снизу вверх."""
-    x0, y0 = col * CELL_W, row * CELL_H
+def bands(top_rows, bottom_rows) -> tuple[int, int, int]:
+    """Границы полос в рядах полосы: `(подвал, кадр, верх)`, `Y` вверх."""
+    foot = chrome.ROW_H * len(bottom_rows)
+    top = chrome.ROW_H * len(top_rows)
+    return foot, foot + 400, foot + 400 + top
+
+
+def cell_pixels(fb: Framebuffer, col: int, y0: int) -> int:
+    """Сколько точек зажёг знак в знакоместе `col` над рядом `y0`.
+
+    `y0` — нижняя граница знакоместа в рядах кадра (`Y` вверх), а не
+    номер строки сверху: полоса растёт и вниз (подвал), и вверх.
+    """
+    x0 = col * CELL_W
     return sum(fb.get(x0 + dx, y0 + dy)
                for dx in range(CELL_W) for dy in range(CELL_H))
 
@@ -69,8 +81,9 @@ def test_status_line_is_not_cut_to_column_width():
     text = ''.join(chrome.cell_text(c) for row in rows for c in row)
     assert re.search(r'\d\d\.\d\d \d\d:\d\d', text), text
     fb = draw(rows, [])
-    lit = [cell_pixels(fb, col, row)
-           for row in range(len(rows)) for col in range(chrome.cols())]
+    hi = fb.height
+    lit = [cell_pixels(fb, col, hi - (n + 1) * chrome.ROW_H)
+           for n in range(len(rows)) for col in range(chrome.cols())]
     assert max(lit) > CELL_W
 
 
@@ -100,35 +113,46 @@ def test_footer_draws_letters_not_only_separators():
     st = make_status()
     top, bottom = chrome.status_rows(st), chrome.footer_rows(st)
     fb = draw(top, bottom)
+    foot, _, _ = bands(top, bottom)
 
     lit = fb.count_set()
     # Одни разделители дали бы единицы сотен точек; знаки — тысячи.
     assert lit > 500, f'в подвале почти пусто: {lit} точек'
     # И первая ячейка первого ряда подвала — буква, а не пустота.
-    first = cell_pixels(fb, 0, 0)
+    first = cell_pixels(fb, 0, foot - chrome.ROW_H)
     assert first > CELL_W, f'первая ячейка подвала пуста: {first} точек'
+    assert foot == chrome.ROW_H * len(bottom)
 
 
 def test_status_line_draws_text():
-    """Верхняя кромка кадра — строка состояния, и она читаема."""
+    """Над кадром — строка состояния, и она читаема."""
     st = make_status()
     top = chrome.status_rows(st)
     fb = draw(top, [])
-    lit = [cell_pixels(fb, col, row)
-           for row in range(len(top)) for col in range(chrome.cols())]
+    hi = fb.height
+    lit = [cell_pixels(fb, col, hi - (n + 1) * chrome.ROW_H)
+           for n in range(len(top)) for col in range(chrome.cols())]
     assert max(lit) > CELL_W
 
 
-def test_chrome_does_not_touch_frame_middle():
-    """Служебные строки закрывают только кромки кадра, середина цела."""
+def test_chrome_does_not_touch_frame():
+    """Подвал не наезжает на рабочее поле: кадр остаётся нетронутым.
+
+    Раньше подвал ложился поверх нижней кромки кадра и закрывал
+    рабочее поле — текст ОС Диспак под ним пропадал.  Теперь подвал
+    стоит **под** кадром, а строка состояния — **над** ним.
+    """
     top, bottom = chrome.status_rows(make_status()), \
         chrome.footer_rows(make_status())
-    fb = Framebuffer(SCREEN_WIDTH, 400)
+    fb = Framebuffer(SCREEN_WIDTH,
+                     400 + chrome.ROW_H * (len(top) + len(bottom)))
     chrome.render(fb, top, bottom, frame_height=400)
-    top_px, bottom_px = chrome.top_height(top), len(bottom) * chrome.ROW_H
-    # Подвал — внизу кадра (`Y` вверх), строка состояния — вверху;
-    # между ними кадр программы не тронут.
-    for y in (bottom_px, (bottom_px + 400 - top_px) // 2, 400 - top_px - 1):
+    foot, frame_hi, top_hi = bands(top, bottom)
+
+    assert foot > 0, 'подвал должен быть под кадром, а не поверх него'
+    assert top_hi == fb.height, 'строка состояния должна быть над кадром'
+    # Ни одна точка кадра не закрашена служебными строками.
+    for y in range(foot, frame_hi):
         assert not any(fb.get(x, y) for x in range(SCREEN_WIDTH)), \
             f'строка кадра {y} закрашена служебной строкой'
     assert fb.count_set() > 0, 'служебные строки не нарисованы вовсе'

@@ -61,14 +61,16 @@ def build(lines_width: int, *, state: str, summary: str,
           hint: str, clock: datetime | None = None) -> str:
     """Собрать начальный экран.
 
-    `state` — строка состояния линии («соединение…», «ДКС 127.0.0.1:4202»),
+    `state` — строка состояния линии.  На экран она **не выводится**:
+    подключение и так написано в строке состояния над кадром и в подвале,
+    а на заставке она только занимает место и мелькает («соединение…»).
+    Оставивлена в сигнатуре — вызывающие её фронтенды знают о линии.
+
     `summary` — сводка настроек, `hint` — подсказка по клавишам.
     """
     now = (clock or datetime.now()).strftime('%d.%m.%Y  %H:%M:%S')
     body = list(TITLE_LINES)
     body.append(f'  {now}')
-    body.append('')
-    body.append(f'  {state}')
     body.append('')
     for part in summary.split(', '):
         body.append(f'  · {part}')

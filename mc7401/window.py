@@ -217,19 +217,17 @@ class TerminalWindow:
             self._maximize(root)
         root.update_idletasks()
         self._fit_scale()
-        # Один холст: строка состояния (над кадром) и подвал (поверх его
-        # нижней кромки) нарисованы **тем же знаком**, что и кадр, —
-        # глифами ПЗУ.  Отдельных надписей шрифтом окна на экране нет.
+        # Один холст из трёх полос: строка состояния, кадр 560×400 и
+        # подвал.  Кадр **вне** служебных строк — рабочее поле не должно
+        # наезжать на подвал, текст ОС виден целиком.  Всё нарисовано
+        # глифами ПЗУ того же размера, что и текст в кадре.
         w = SCREEN_WIDTH * self.scale
-        h = (SCREEN_HEIGHT + self.top_px()) * self.scale
+        h = (SCREEN_HEIGHT + self.top_px() + self.footer_px()) * self.scale
 
         canvas = tk.Canvas(root, width=w, height=h, bg=BG,
                            highlightthickness=0)
-        # Подвал привязан к нижней границе экрана, поэтому холст стоит
-        # снизу: окно на весь экран, а кадр с подвалом — его нижняя часть.
-        # Сверху остаётся поле, когда кадр не в состоянии заполнить
-        # экран по высоте целиком (560×400 — не 16:9, а масштаб у Tk
-        # целый).
+        # Подвал привязан к нижней границе экрана: холст стоит снизу,
+        # поле остаётся над строкой состояния.
         canvas.pack(side='bottom', anchor='s')
         self._photo = None
         self._canvas = canvas
@@ -310,24 +308,19 @@ class TerminalWindow:
         return len(bottom) * chrome.ROW_H
 
     def _fit_scale(self) -> None:
-        """Подобрать масштаб так, чтобы кадр занял окно, а окно — экран.
+        """Вписать кадр вместе со служебными строками в окно.
 
-        По умолчанию кадр показывается **во весь экран**: масштаб
-        максимальный, какой влезает в окно.  Разворачивается окно, под
-        масштаб попадает только строка состояния — она над кадром, а
-        подвал лежит поверх нижней кромки и высоты не добавляет.
+        Масштаб **не растёт** сверх `[display] scale`: подгонка только
+        уменьшает его, если кадр не влезает.  Иначе на экране 1920×1080
+        кадр вписывается в полосу над подвалом во вдвое, и знак ПЗУ на
+        экране становится 28×32 вместо затребованных 14×16.
         """
         w, h = self._avail_px()
         if w <= 1 or h <= 1:
             return
-        full = SCREEN_HEIGHT + self.top_px()
-        self.scale = max(1, min(w // SCREEN_WIDTH, h // max(1, full)))
-        if self.scale < self._wanted:                  # просьба не мельче
-            self.scale = self._wanted
-            if (SCREEN_WIDTH * self.scale > w
-                    or full * self.scale > h):
-                self.scale = max(1, min(w // SCREEN_WIDTH,
-                                        h // max(1, full)))
+        full = SCREEN_HEIGHT + self.top_px() + self.footer_px()
+        fits = max(1, min(w // SCREEN_WIDTH, h // max(1, full)))
+        self.scale = min(self._wanted, fits)
 
     def _avail_px(self) -> tuple[int, int]:
         """Размер окна под кадр: само окно, а если оно ещё не показано —
@@ -416,12 +409,11 @@ class TerminalWindow:
     def _frame_row_img(self, y: int) -> int:
         """Ряд кадра под указателем, **сверху вниз** (0 — верх кадра).
 
-        В изображении сверху вниз идут строка состояния, кадр и подвал,
-        поэтому указатель сначала переводится внутрь кадра, а подвал
-        прижимает его к последней свободной строке.
+        В изображении сверху вниз идут строка состояния, кадр и подвал;
+        указатель вне кадра прижимается к ближайшему его краю.
         """
-        row = y // self.scale - self.top_px()
-        return max(0, min(row, self.footer_px() - 1, SCREEN_HEIGHT - 1))
+        row = y // self.scale - (self.top_px() + self.footer_px())
+        return max(0, min(row, SCREEN_HEIGHT - 1))
 
     def _on_click(self, event) -> None:
         """Левая кнопка: перо (если включено) либо курсор в знакомёст."""
@@ -439,9 +431,10 @@ class TerminalWindow:
         self.paint()
 
     def _in_chrome(self, y: int) -> bool:
-        """Указатель попал в подвал — он лежит поверх нижней кромки кадра."""
-        lo = SCREEN_HEIGHT + self.top_px() - self.footer_px()
-        return lo <= y // self.scale < lo + self.footer_px()
+        """Указатель попал в строку состояния или подвал — это не кадр."""
+        off = self.top_px() + self.footer_px()
+        y_img = y // self.scale
+        return not (off <= y_img < off + SCREEN_HEIGHT)
 
     def _pen_down(self, event, *, button: int = 1) -> None:
         """Нажатие пера: начать штрих (правой кнопкой — стирание)."""
@@ -677,19 +670,18 @@ class TerminalWindow:
         import tkinter as tk
         top_rows, bottom_rows = self.chrome_parts()
         top_px = self.top_px()
-        height = SCREEN_HEIGHT + top_px
+        height = SCREEN_HEIGHT + top_px + self.footer_px()
         photo = tk.PhotoImage(master=self._tk, width=SCREEN_WIDTH,
                               height=height)
         photo.put(BG, to=(0, 0, SCREEN_WIDTH, height))
-        # Кадр терминала занимает окно целиком — он и есть окно.
-        self._blit(self.shown_frame(), photo, top_px)
-        # Подвал — поверх нижней кромки кадра; строка состояния — над
-        # кадром.  В полосе кадр занимает нижние SCREEN_HEIGHT рядов.
+        # Кадр терминала — между служебными строками: под ним подвал,
+        # над ним строка состояния.  Рабочее поле ни с чем не пересекается.
+        self._blit(self.shown_frame(), photo, top_px + self.footer_px())
         strip = Framebuffer(SCREEN_WIDTH, height)
-        chrome.render_footer(strip, bottom_rows)
         chrome.render_status(strip, top_rows)
+        chrome.render_footer(strip, bottom_rows)
         self._blit(strip, photo, 0)
-        self._cursor_frame(photo, top_px)
+        self._cursor_frame(photo, top_px + self.footer_px())
         if self.scale > 1:
             # Холст сделан scale× больше — изображение увеличивается,
             # а не уменьшается (раньше стояло `subsample`).

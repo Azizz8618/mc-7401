@@ -487,12 +487,13 @@ def test_window_paint_draws_point_runs(monkeypatch):
     на 15ИЭ, и кадр терминала от неё не страдает.
     """
     win = make_window(monkeypatch)
-    y = win.footer_px() + 5          # выше подвала — точка видна
-    win.emu.fb.point(0, y)           # левый край кадра
+    y = 5                              # ряд кадра у нижней кромки
+    win.emu.fb.point(0, y)
     win.emu.fb.point(2, y)
     win.paint()
-    row = win.top_px() + window.SCREEN_HEIGHT - 1 - y
-    height = window.SCREEN_HEIGHT + win.top_px()
+    off = win.top_px() + win.footer_px()    # кадр начинается под подвалом
+    row = off + window.SCREEN_HEIGHT - 1 - y
+    height = window.SCREEN_HEIGHT + win.top_px() + win.footer_px()
     bg_fill = (0, 0, window.SCREEN_WIDTH, height)
     runs = [to for to, color in win._photo.puts
             if to != bg_fill and color == window.FG
@@ -511,18 +512,18 @@ def test_window_paint_zooms_up(monkeypatch):
     assert win._photo.subsampled == 0
 
 
-def test_window_paint_shows_frame_plus_status(monkeypatch):
-    """Холст — кадр 560×400 и строка состояния над ним.
+def test_window_paint_shows_frame_between_chrome(monkeypatch):
+    """Холст — кадр 560×400 между строкой состояния и подвалом.
 
-    Строка состояния в окне **вне** кадра, как на 15ИЭ, поэтому она
-    добавляет высоту; подвал поверх нижней кромки кадра и высоты не
-    добавляет — иначе кадр не влезет в экран целиком.  Нарисованы обе
+    Обе служебные строки **вне** кадра, как на 15ИЭ: подвал не наезжает
+    на рабочее поле, поэтому обе добавляют высоту.  Нарисованы они
     глифами ПЗУ того же размера, что и знак в кадре.
     """
     win = make_window(monkeypatch)
     win.paint()
     assert win._photo.width == window.SCREEN_WIDTH
-    assert win._photo.height == window.SCREEN_HEIGHT + win.top_px()
+    assert win._photo.height == (window.SCREEN_HEIGHT + win.top_px()
+                                 + win.footer_px())
 
 
 def test_window_host_text_is_drawn_on_frame(monkeypatch):
@@ -593,25 +594,23 @@ def test_window_mouse_click_puts_cursor(monkeypatch):
 
     Знакомест — шаг `CELL_W × CELL_H` (16×20), а не размер растра знака
     14×16: растр уже с зазором (см. `console.CELL_W/CELL_H`).  Щёлкать
-    надо в свободной полосе кадра — подвал лежит поверх и указателя
-    не принимает.
+    надо по кадру: подвал и строка состояния стоят вне его и указателя
+    кадра не принимают.
     """
     win = make_window(monkeypatch)
-    top, foot = win.top_px(), win.footer_px()
-    y = top + (window.SCREEN_HEIGHT - foot) // 2        # середина кадра
+    off = win.top_px() + win.footer_px()
+    y = off + window.SCREEN_HEIGHT // 2                 # середина кадра
     win._on_click(FakeClick(3 * CELL_W, y))
-    assert (win.console.col, win.console.row) == (3, (y - top) // CELL_H)
+    assert (win.console.col, win.console.row) == (3, (y - off) // CELL_H)
 
 
 def test_window_chrome_ignores_clicks_in_footer(monkeypatch):
-    """Клик по подвалу не двигает курсор: подвал лежит поверх кадра."""
+    """Клик по подвалу не двигает курсор: подвал не кадр."""
     win = make_window(monkeypatch)
-    top, foot = win.top_px(), win.footer_px()
-    y = top + (window.SCREEN_HEIGHT - foot) // 2
-    win._on_click(FakeClick(3 * CELL_W, y))
+    off = win.top_px() + win.footer_px()
+    win._on_click(FakeClick(3 * CELL_W, off + window.SCREEN_HEIGHT // 2))
     before = (win.console.col, win.console.row)
-    # Последний ряд подвала — у нижней кромки кадра.
-    foot_y = window.SCREEN_HEIGHT + top - CELL_H // 2
+    foot_y = win.footer_px() - CELL_H // 2             # подвал — внизу полосы
     assert win._in_chrome(foot_y), 'подвал должен распознаваться'
     win._on_click(FakeClick(10 * CELL_W, foot_y))
     assert (win.console.col, win.console.row) == before, \
@@ -619,14 +618,13 @@ def test_window_chrome_ignores_clicks_in_footer(monkeypatch):
 
 
 def test_window_click_above_frame_clamps_to_top(monkeypatch):
-    """Клик над кадром (в строке состояния) прижимается к верхнему ряду.
+    """Клик в строке состояния прижимается к верхнему ряду кадра.
 
     Строка состояния в окне **вне** кадра, и указателя кадра там нет —
     координата всё равно обязана остаться в кадре.
     """
     win = make_window(monkeypatch)
-    top, foot = win.top_px(), win.footer_px()
-    assert not win._in_chrome(1), 'строка состояния не кадр'
+    assert win._in_chrome(1), 'строка состояния не кадр'
     win._on_click(FakeClick(3 * CELL_W, 1))
     assert win.console.row == 0, 'указатель ушёл выше кадра'
     assert 0 <= win.console.col < window.SCREEN_WIDTH // CELL_W
