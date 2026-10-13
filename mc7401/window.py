@@ -47,7 +47,8 @@ from . import chrome
 from . import console as console_mod
 from . import startup
 from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
-from .console import CELL_H, CELL_W, COLS, RASTER_H, ROWS, Console
+from .console import (CELL_H, CELL_W, COLS, RASTER_H, ROWS, Console,
+                      put_glyph)
 from .emulator import TerminalEmulator
 from .framebuffer import Framebuffer
 from .link import LinkError
@@ -165,6 +166,11 @@ class TerminalWindow:
         self._blink_at = 0.0
         #: Выход идёт: обход линии остановлен, линия закрывается.
         self._stopping = False
+        #: Заставка стоит (`[display] splash`) — снимается первым нажатием
+        #: клавиши или первыми данными от ЭВМ (`dismiss_splash`).
+        self.splash = _splash_enabled(self.config)
+        #: `None` — заставка ещё не собиралась; `False` — рисунка нет.
+        self._splash_cache = None
         #: Сколько раз обход споткнулся — по первому пишем в подвал.
         self._faults = 0
 
@@ -175,6 +181,9 @@ class TerminalWindow:
         if not data:
             return
         self._dirty = True
+        # Данные от ЭВМ — тоже повод снять заставку: терминал начал
+        # работать, и пустой экран с рисунком больше не нужен.
+        self.dismiss_splash()
         if not _is_commands(data):
             self.session_text(data)
             return
@@ -574,6 +583,100 @@ class TerminalWindow:
         self._hist_at = max(0, min(len(self._history) - 1,
                                    self._hist_at + direction))
 
+    # ── заставка ────────────────────────────────────────────────────────────
+
+    def splash_frame(self) -> Optional[Framebuffer]:
+        """Кадр заставки — или `None`, если заставки уже нет.
+
+        Заставка стоит, пока не нажата клавиша и ЭВМ не прислала данных
+        (`dismiss_splash`).  Это и есть «при загрузке дисплея»: кадр
+        пустой, а на нём сразу виден, что терминал живой.
+
+        Рисунок задаётся конфигурацией (`[display] splash`), по умолчанию
+        КОТ из `golden/streams`.  Рисунок и надпись собираются в кадр
+        560×400 и **кэшируются**: разбор потока — это десятки тысяч
+        команд и заметное время, а перерисовка идёт двадцать раз в
+        секунду.
+        """
+        if not self.splash:
+            return None
+        if self._splash_cache is not None:
+            return self._splash_cache or None
+        self._splash_cache = self._build_splash() or False
+        return self._splash_cache or None
+
+    def _build_splash(self) -> Optional[Framebuffer]:
+        """Собрать кадр заставки: надпись сверху, рисунок под ней.
+
+        Рисунок переносится в кадр, а надпись пишется над ним — по
+        требованию «выводится заставка „ДИСПЛЕЙ ЭЛЕКТРОНИКА МС-7401“, а
+        под надписью изображение».  Рисунок смещается вниз на два ряда и
+        обрезается по высоте кадра, чтобы не наезжать на подвал.
+        """
+        pic = startup.picture_path(getattr(self.config, 'splash', None) or '',
+                                   prefer_stream=True)
+        if not pic:
+            return None
+        art = self._splash_picture(pic)
+        if art is None:
+            return None
+        fb = Framebuffer(SCREEN_WIDTH, SCREEN_HEIGHT)
+        shift = CAPTION_ROWS * CELL_H
+        for y in range(min(art.height, SCREEN_HEIGHT - shift)):
+            for x0, x1 in art.row_runs(y):
+                fb.set_span(x0, shift + y, x1)
+        self._splash_caption(fb)
+        return fb
+
+    def _splash_picture(self, pic) -> Optional[Framebuffer]:
+        """Разобрать эталонный поток рисунка в кадр.
+
+        Берётся самая наполненная картина: программа в конце потока
+        чистит экран (`2`), и последний кадр был бы пустым.
+        """
+        if not str(pic).lower().endswith('.bin'):
+            return None
+        emu = TerminalEmulator()
+        reader = CommandStreamReader()
+        try:
+            reader.feed(Path(pic).read_bytes())
+            reader.close()
+        except OSError:
+            return None
+        best, best_n = emu.fb.copy(), 0
+        for ev in reader.pop():
+            if ev.kind is EventKind.VUK_BLOCK:
+                n = emu.fb.count_set()
+                if n > best_n:
+                    best, best_n = emu.fb.copy(), n
+            emu.handle_event(ev)
+        return best if best_n else None
+
+    #: Подпись заставки — по требованию: надпись «ДИСПЛЕЙ …» над рисунком.
+    SPLASH_CAPTION = 'ДИСПЛЕЙ ЭЛЕКТРОНИКА МС-7401'
+
+    def _splash_caption(self, fb: Framebuffer) -> None:
+        """Написать надпись заставки — по центру верхних рядов кадра.
+
+        Знаки берутся из ПЗУ, как весь остальной текст в кадре: одна
+        типографика на весь экран.  `Y` вверх, поэтому верхний ряд кадра —
+        это `fb.height - CELL_H`.
+        """
+        text = self.SPLASH_CAPTION
+        col = max(0, (fb.width // CELL_W - len(text)) // 2)
+        top_y = fb.height - CAPTION_ROWS * CELL_H
+        for n, ch in enumerate(text):
+            if col + n >= fb.width // CELL_W:
+                break
+            put_glyph(fb, (col + n) * CELL_W, top_y + CELL_H, ch, 'OR')
+
+    def dismiss_splash(self) -> None:
+        """Снять заставку: нажата клавиша или пришли данные от ЭВМ."""
+        if not self.splash:
+            return
+        self.splash = False
+        self._dirty = True
+
     def shown_frame(self):
         """Кадр, который сейчас на экране: из истории или текущий.
 
@@ -601,6 +704,10 @@ class TerminalWindow:
         """
         key = event.keysym
         ch = event.char
+        # Любая клавиша снимает заставку — по требованию «после нажатия
+        # на любую клавишу заставка сворачивается».  Сама клавиша при
+        # этом выполняется как обычно.
+        self.dismiss_splash()
         if key in ('Prior', 'Next'):
             # ЭКРАН↑/ЭКРАН↓ — то же, что колесо мыши.
             self.scroll_view(-1 if key == 'Prior' else 1)
@@ -776,6 +883,7 @@ class TerminalWindow:
         top_rows, bottom_rows = self.chrome_parts()
         top_px, foot_px = self.top_px(), self.footer_px()
         frame = self.shown_frame()
+        splash = self.splash_frame()
 
         width, height = self._view_px()
         scale = self._fit_scale(width, height, top_px, foot_px)
@@ -793,9 +901,16 @@ class TerminalWindow:
         frame_x = 0
         frame_y = top_h + max(0, (height - top_h - foot_h - frame_h) // 2)
 
-        self._blit_scaled(frame, photo, frame_x, frame_y, scale,
-                          clip=(width, height))
-        self._cursor_frame_scaled(photo, frame_x, frame_y, scale)
+        if splash is not None:
+            # Пока не нажата клавиша и ЭВМ молчит, на кадре заставка с
+            # рисунком и надписью; курсор на ней не рисуется — до
+            # первого нажатия набора ещё не было.
+            self._blit_scaled(splash, photo, frame_x, frame_y, scale,
+                              clip=(width, height))
+        else:
+            self._blit_scaled(frame, photo, frame_x, frame_y, scale,
+                              clip=(width, height))
+            self._cursor_frame_scaled(photo, frame_x, frame_y, scale)
 
         strip = Framebuffer(SCREEN_WIDTH, max(top_px, foot_px))
         chrome.render_status(strip, top_rows)
@@ -1097,6 +1212,24 @@ class TerminalWindow:
         if isinstance(exc, (LinkError, OSError)):
             # Линия мертва — опрос больше не повторяем, но окно остаётся.
             self.driver = None
+
+
+#: Сколько рядов кадра занимает надпись заставки — рисунок начинается под
+#: ней.  Два ряда: надпись и пустой ряд под ней, как на заставке 15ИЭ.
+CAPTION_ROWS = 2
+
+#: Значения `[display] splash`, при которых заставки нет.
+NO_SPLASH = ('none', '-', 'нет', 'off')
+
+
+def _splash_enabled(config) -> bool:
+    """Показывать ли заставку в окне.
+
+    `none` — без заставки; всё остальное (в том числе пустое значение
+    конфигурации) — заставка с рисунком из `golden`.
+    """
+    name = (getattr(config, 'splash', '') or '').strip().lower()
+    return name not in NO_SPLASH
 
 
 def _ctrl_letter(event) -> Optional[str]:

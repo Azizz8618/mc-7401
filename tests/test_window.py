@@ -348,7 +348,13 @@ def test_graphics_disabled_by_config():
 
 
 def test_paint_gfx_reports_height():
-    """Графика занимает столько рядов, сколько нужно кадру."""
+    """Графика занимает столько рядов, сколько нужно кадру, и кэшируется.
+
+    Проверка не заглядывает в число кусков выгрузки: картинка режется на
+    куски по размеру APC, и это зависит от рисунка по умолчанию, а не от
+    раскладки.  Проверяется то, что тут и проверяется — ряды заняты и
+    повторный вывод не выгружает кадр заново.
+    """
     from mc7401.backends.kitty import KittyGraphics
     buf = io.StringIO()
     g = KittyGraphics(buf)
@@ -358,8 +364,14 @@ def test_paint_gfx_reports_height():
     a.gfx = g
     a.emu.fb.point(100, 100)
     height = a._paint_gfx(0, 80, 30)
-    assert height > 0
-    assert buf.getvalue().count('\x1b_G') == 1
+    assert height > 0, 'кадр не выведен'
+    assert buf.getvalue().count('\x1b_G') >= 1, 'кадр не выгружен'
+    # Тот же кадр повторно не выгружается — кэш работает.
+    once = buf.getvalue().count('\x1b_G')
+    a._paint_gfx(0, 80, 30)
+    assert buf.getvalue().count('\x1b_G') == once, \
+        'тот же кадр выгружен повторно'
+
 
 # ── раскладка как на 15ИЭ ───────────────────────────────────────────────────
 

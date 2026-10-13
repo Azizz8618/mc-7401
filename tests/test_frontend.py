@@ -24,11 +24,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mc7401.config import Config                                   # noqa: E402
-from mc7401.console import (CELL_H, CELL_W, COLS, ROWS,             # noqa: E402
+from mc7401.console import (CELL_H, CELL_W, COLS, RASTER_H, ROWS,     # noqa: E402
                              SCREEN_HEIGHT)
 from mc7401.screen import MONO_OFF, MONO_ON, ScreenRenderer, Viewport  # noqa: E402
 from mc7401.framebuffer import Framebuffer                         # noqa: E402
 from mc7401.tui import TerminalApp                                 # noqa: E402
+from mc7401 import startup                                         # noqa: E402
 from mc7401 import window                                          # noqa: E402
 
 
@@ -727,6 +728,136 @@ def test_window_click_above_frame_clamps_to_top(monkeypatch):
     win._on_click(FakeClick(3 * CELL_W, 1))
     assert win.console.row == 0, 'указатель ушёл выше кадра'
     assert 0 <= win.console.col < window.SCREEN_WIDTH // CELL_W
+
+
+# ── заставка ────────────────────────────────────────────────────────────────
+
+def splash_window(monkeypatch, splash='КОТ'):
+    """Окно с заданной заставкой."""
+    cfg = Config.default()
+    cfg.splash = splash
+    win = make_window(monkeypatch)
+    win.config = cfg
+    win.splash = window._splash_enabled(cfg)
+    win._splash_cache = None
+    return win
+
+
+def test_splash_shows_caption_and_picture(monkeypatch):
+    """При загрузке дисплея — надпись и под ней рисунок из конфигурации."""
+    win = splash_window(monkeypatch)
+    fb = win.splash_frame()
+    assert fb is not None, 'заставка не собралась'
+    # Рисунок на месте: поток КОТ зажигает десятки тысяч точек.
+    assert fb.count_set() > 5000, f'рисунок не нарисован: {fb.count_set()} точек'
+    # Подпись — в верхних рядах, над рисунком.
+    caption = win.SPLASH_CAPTION
+    assert caption == 'ДИСПЛЕЙ ЭЛЕКТРОНИКА МС-7401'
+    top = sum(fb.get(x, fb.height - 1 - dy)
+              for x in range(fb.width) for dy in range(RASTER_H))
+    assert top > 100, f'надпись не зажжена: {top} точек'
+
+
+def test_splash_caption_is_centred_and_above_picture(monkeypatch):
+    """Надпись по центру кадра, рисунок сдвинут под неё ровно на отбивку."""
+    win = splash_window(monkeypatch)
+    fb = win.splash_frame()
+    cap_h = window.CAPTION_ROWS * CELL_H
+    art = win._splash_picture(
+        startup.picture_path(win.config.splash, prefer_stream=True))
+    lit = lambda f: [y for y in range(f.height)                  # noqa: E731
+                     if any(f.get(x, y) for x in range(f.width))]
+    art_rows, fb_rows = lit(art), lit(fb)
+    # Рисунок сдвинут ровно на отбивку: его нижний край на кадре стоит
+    # на `cap_h` точек выше, чем в самом рисунке.
+    assert min(fb_rows) == min(art_rows) + cap_h, \
+        f'рисунок сдвинут на {min(fb_rows) - min(art_rows)} точек'
+    # Сверху рисунок обрезан надписью: она занимает самые верхние ряды.
+    assert max(fb_rows) > fb.height - cap_h, 'надпись не у верха кадра'
+    assert max(art_rows) - min(art_rows) > fb.height - cap_h, \
+        'рисунок не мог поместиться под надписью целиком'
+    # Надпись по центру: на пустом кадре она идёт от своей колонки, а
+    # слева от неё до середины — пусто.
+    blank = Framebuffer(fb.width, fb.height)
+    win._splash_caption(blank)
+    lit = [x for x in range(blank.width)
+           if any(blank.get(x, y) for y in range(blank.height))]
+    assert lit, 'надпись не зажжена'
+    text = win.SPLASH_CAPTION
+    want = (fb.width // CELL_W - len(text)) // 2 * CELL_W
+    assert min(lit) == want, f'надпись с {min(lit)}, а не с {want}'
+    # Блок знаков стоит по центру **сетки знакомест**: пустых колонок
+    # слева и справа поровну (в пределах одного знакоместа).  Центровать
+    # по точкам нельзя: сетка 8 точек, и половина знакоместа в остатке.
+    cells = fb.width // CELL_W
+    left = want // CELL_W
+    right = cells - left - len(text)
+    assert abs(left - right) <= 1, \
+        f'надпись не по центру: слева {left} колонок, справа {right}'
+    assert left + len(text) <= cells, 'надпись не влезла в кадр'
+
+
+def test_splash_dismissed_by_any_key(monkeypatch):
+    """Любая клавиша снимает заставку — и выполняется как обычно."""
+    win = splash_window(monkeypatch)
+    assert win.splash
+    win._on_key(FakeEvent('F2'))
+    assert not win.splash, 'F2 не снял заставку'
+    assert win.pen.enabled, 'клавиша не выполнилась'
+
+
+def test_splash_dismissed_by_machine_data(monkeypatch):
+    """Данные от ЭВМ снимают заставку: терминал начал работать."""
+    win = splash_window(monkeypatch)
+    assert win.splash
+    win.feed(b'\xeb\xe2\xec\r\n')
+    assert not win.splash, 'данные ЭВМ не сняли заставку'
+    assert win.splash_frame() is None
+
+
+def test_splash_is_cached(monkeypatch):
+    """Кадр заставки собирается один раз: разбор потока дорог."""
+    win = splash_window(monkeypatch)
+    first = win.splash_frame()
+    assert first is not None
+    calls = []
+    real = win._build_splash
+    win._build_splash = lambda: (calls.append(1), real())[1]
+    assert win.splash_frame() is first, 'кадр заставки пересобирался'
+    assert not calls, 'рисунок разбирался повторно'
+
+
+def test_splash_none_means_no_splash(monkeypatch):
+    """`[display] splash = none` — окно сразу пустое."""
+    win = splash_window(monkeypatch, splash='none')
+    assert not win.splash
+    assert win.splash_frame() is None
+
+
+def test_splash_picture_follows_config(monkeypatch):
+    """Рисунок берётся из конфигурации, а не всегда один и тот же."""
+    a = splash_window(monkeypatch, splash='КОТ')
+    b = splash_window(monkeypatch, splash='СЕТ')
+    fa, fb_ = a.splash_frame(), b.splash_frame()
+    assert fa is not None and fb_ is not None
+    assert fa.count_set() != fb_.count_set(), 'рисунок не сменился'
+
+
+def test_splash_missing_picture_is_not_fatal(monkeypatch):
+    """Нет рисунка — окно просто пустое, а не падает."""
+    win = splash_window(monkeypatch, splash='НЕТ_ТАКОГО')
+    assert win.splash, 'заставка включена'
+    assert win.splash_frame() is None, 'выдуман рисунок'
+
+
+def test_splash_gone_after_key_shows_frame_again(monkeypatch):
+    """После снятия заставки окно снова рисует рабочий кадр."""
+    win = splash_window(monkeypatch)
+    assert win.splash_frame() is not None
+    win.console.write('ПРОБА'.encode('koi8-r'))
+    win._on_key(FakeEvent('a', 'a'))
+    assert win.splash_frame() is None
+    assert win.shown_frame().count_set() > 0
 
 
 # ── выход из терминала ──────────────────────────────────────────────────────
