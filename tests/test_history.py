@@ -430,3 +430,47 @@ def test_cursor_hidden_while_scrolling_back(monkeypatch):
     win.clear_screen()
     win._hist_at = 0
     assert cursor_sides() == 0, 'рамка курсора на кадре из истории'
+
+
+def test_wheel_scrolls_three_lines(monkeypatch):
+    """Колесо листает по три строки — как на 15ИЭ (`WHEEL_STEP`).
+
+    По одной строке страницу выдачи пришлось бы возвращать сорока
+    щелчками, а перерисовка окна стоит десятки миллисекунд.
+    """
+    from mc7401.window import TerminalWindow
+
+    assert TerminalWindow.WHEEL_STEP == 3, 'шаг колеса разошёлся с 15ИЭ'
+    win = make_window(monkeypatch)
+    fill(win.console, 200)
+    win._touch_frame()
+    win._wheel_step(-1)
+    assert win.hist.position == 3
+    win._wheel_step(-1)
+    assert win.hist.position == 6
+    win._wheel_step(1)
+    assert win.hist.position == 3
+
+
+def test_page_up_scrolls_a_page(monkeypatch):
+    """`ЭКРАН↑` листает на страницу: окно минус одна строка."""
+    win = make_window(monkeypatch)
+    fill(win.console, 200)
+    win._touch_frame()
+    assert win.page_step() == ROWS - 1
+    win.scroll_display(-1, win.page_step())
+    assert win.hist.position == ROWS - 1
+    win.scroll_display(-1, win.page_step())
+    assert win.hist.position == 2 * (ROWS - 1)
+    win.scroll_display(1, win.page_step())
+    assert win.hist.position == ROWS - 1
+
+
+def test_step_does_not_overshoot_the_oldest_line(monkeypatch):
+    """Большой шаг не уходит за самую старую строку."""
+    win = make_window(monkeypatch)
+    fill(win.console, 60)                 # истории всего 21 строка
+    win._touch_frame()
+    win.scroll_display(-1, win.page_step())
+    assert win.hist.position == win.hist.size, 'прокрутка ушла в пустоту'
+    assert win.hist.position == 21

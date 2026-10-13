@@ -411,7 +411,11 @@ class TerminalWindow:
     # кнопка рисует, а правая стирает — иначе, левая ставит текстовый
     # курсор в знакомёст под указателем.
 
-    #: Шаг колеса мыши — строк кадра за щелчок (как в 15ИЭ: `WHEEL_STEP`).
+    #: Шаг колеса мыши — строк выдачи за щелчок, как на 15ИЭ
+    #: (`session.py`, `WHEEL_STEP`).  По одной строке возвращаться на
+    #: страницу пришлось бы сорока щелчками, а перерисовка окна стоит
+    #: десятки миллисекунд: прокрутка читалась бы как «история грузится
+    #: медленно».
     WHEEL_STEP = 3
 
     def _pen_at(self, event) -> tuple[int, int]:
@@ -630,13 +634,13 @@ class TerminalWindow:
 
     def _wheel_step(self, direction: int) -> None:
         """Колесо вверх/вниз (X11: кнопки 4/5) — тот же листатель."""
-        self.scroll_display(direction)
+        self.scroll_display(direction, self.WHEEL_STEP)
 
     def _on_wheel(self, event) -> None:
         """Колесо мыши: листать историю выдачи, как PgUp/PgDn в 15ИЭ."""
         delta = getattr(event, 'delta', 0)
         # Tk сообщает колесо знаками (Windows) или числами (X11).
-        self.scroll_display(-1 if delta > 0 else 1)
+        self.scroll_display(-1 if delta > 0 else 1, self.WHEEL_STEP)
 
     def clear_screen(self) -> None:
         """`F5 ОЧИСТКА`: стереть кадр, уходящий кадр — в историю кадров.
@@ -655,18 +659,26 @@ class TerminalWindow:
         self.last_key = 'ОЧИСТКА'
         self.paint()
 
-    def scroll_display(self, direction: int) -> bool:
+    def scroll_display(self, direction: int, step: int = 1) -> bool:
         """Листать выдачу: сперва строки истории, потом кадры `F5 ОЧИСТКА`.
 
-        `direction`: `-1` — к более раннему, `1` — к текущему.  Истории
-        две и они разного рода: **строки** — всё, что сошло с кадра
-        автоскроллом, а **кадры** — то, что терминал стёр по `F5`.  Сперва
-        листаются строки (их много, и они мельче), а как только прокрутка
-        упирается в самую старую строку, колесо переходит к кадрам: так
-        до самого начала выдачи можно дойти одним колесом.
+        `direction`: `-1` — к более раннему, `1` — к текущему; `step` —
+        сколько строк за щелчок.  Истории две и они разного рода:
+        **строки** — всё, что сошло с кадра автоскроллом, а **кадры** —
+        то, что терминал стёр по `F5`.  Сперва листаются строки (их
+        много, и они мельше), а как только прокрутка упирается в самую
+        старую строку, колесо переходит к кадрам: так до самого начала
+        выдачи можно дойти одним колесом.
+
+        Шаг за щелчок — как на 15ИЭ (`session.py`: колесо на три ряда,
+        `PgUp`/`PgDn` на страницу).  Листать по одной строке было неудобно
+        вдвойне: страницу выдачи пришлось бы возвращать сорока щелчками, а
+        каждая перерисовка окна стоит десятки миллисекунд — прокрутка и
+        читалась как «история грузится медленно».
         """
+        step = max(1, int(step))
         before = self.hist.position
-        if self.hist.scroll(direction) != before:
+        if self.hist.scroll(direction * step) != before:
             self.diag.add(f'история: {self.hist.size} строк, '
                           f'назад {self.hist.position}')
             self.last_key = 'ИСТОРИЯ'
@@ -677,6 +689,15 @@ class TerminalWindow:
         self.last_key = 'КОЛЕСО'
         self.paint()
         return False
+
+    def page_step(self) -> int:
+        """Сколько строк листает `ЭКРАН↑`/`ЭКРАН↓` — страницу.
+
+        На 15ИЭ страница — это `высота окна − 1`
+        (`scroll_view(±_view_h − 1)`): одна строка остаётся на виду, чтобы
+        оператор не терял место, где остановился.  Здесь так же.
+        """
+        return max(1, ROWS - 1)
 
     def scroll_history(self, direction: int) -> int:
         """Листать **историю строк**: `-1` — назад, `1` — к кадру.
@@ -912,7 +933,7 @@ class TerminalWindow:
         if key in ('Prior', 'Next'):
             # ЭКРАН↑/ЭКРАН↓ — то же, что колесо мыши: сперва строки
             # истории, потом кадры `F5 ОЧИСТКА`.
-            self.scroll_display(-1 if key == 'Prior' else 1)
+            self.scroll_display(-1 if key == 'Prior' else 1, self.page_step())
             self.last_key = 'ЭКРАН'
             return 'break'
         if key in ('Up', 'Down', 'Left', 'Right'):
