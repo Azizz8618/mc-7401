@@ -15,6 +15,7 @@ from mc7401 import chrome
 from mc7401.console import CELL_H, CELL_W
 from mc7401.constants import SCREEN_WIDTH
 from mc7401.framebuffer import Framebuffer
+from mc7401 import panel
 from mc7401.panel import RULE, Diagnostics, Status
 
 
@@ -86,6 +87,64 @@ def test_status_line_is_not_cut_to_column_width():
     lit = [cell_pixels(fb, col, hi - (n + 1) * chrome.ROW_H)
            for n in range(len(rows)) for col in range(chrome.cols())]
     assert max(lit) > CELL_W
+
+
+def test_footer_shows_pen_mode_and_tool_without_ellipsis():
+    """Режим пера и инструмент видны в подвале целиком.
+
+    Колонка подвала — 9 знакомест, на значение остаётся четыре, а длинные
+    «выделение» и «штрих» превращались в одни многоточия: оператор не
+    видел, в каком режиме перо.  Поэтому у режимов и инструментов свои
+    короткие метки.
+    """
+    st = make_status()
+    st.pen = True
+    for mode, label in (('рисование', 'РИС'), ('выделение', 'ВЫД')):
+        st.pen_mode = mode
+        st.pen_tool = 'штрих'
+        text = ' '.join(panel.render_plain(r)
+                        for r in chrome.footer_rows(st, help_=True))
+        assert f'ПЕРО={label}' in text, f'режим {mode} не виден: {text}'
+        assert '...' not in text.split('ПЕРО=')[1][:12], 'метка обрезана'
+    st.pen_mode = ''
+    text = ' '.join(panel.render_plain(r)
+                    for r in chrome.footer_rows(st, help_=True))
+    assert 'ИНСТ=ШТР' in text, f'инструмент не виден: {text}'
+    st.pen = False
+    text = ' '.join(panel.render_plain(r)
+                    for r in chrome.footer_rows(st, help_=True))
+    assert 'ПЕРО=ВЫК' in text
+
+
+def test_footer_stays_five_rows():
+    """Подвал занимает пять рядов: каждый его ряд отнимает у кадра.
+
+    Добавление ячеек в легенду однажды выросло рядом и ужало кадр на
+    десять процентов — это не видно ни в одном снимке, а заметно на
+    глаз.  Рост подвала ловится здесь.
+    """
+    st = make_status()
+    st.pen = True
+    st.pen_mode = 'выделение'
+    rows = chrome.footer_rows(st, help_=True)
+    assert len(rows) == 5, f'подвал вырос до {len(rows)} рядов'
+
+
+def test_legend_names_pen_mode_and_undo():
+    """Легенда называет новые клавиши: F4 — режим, F7 — снять, Ctrl-Z."""
+    text = ' '.join(panel.render_plain(r)
+                    for r in chrome.footer_rows(make_status(), help_=True))
+    for key in ('F4=РЕЖИМ', 'F7=СНЯТ', 'ОТМЕНА=Ctrl-z'):
+        assert key in text, f'в легенде нет {key}'
+
+
+def test_status_line_shows_selection_size():
+    """Размер выделения виден в строке состояния, как на 15ИЭ."""
+    st = make_status()
+    st.selection = 'СТР 1фр 1с 24зн'
+    text = ' '.join(panel.cell_text(c) for r in chrome.status_rows(st)
+                    for c in r if r != [RULE])
+    assert 'ВЫД=' in text and '24зн' in text, text
 
 
 def test_footer_columns_are_even():

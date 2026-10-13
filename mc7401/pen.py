@@ -62,6 +62,17 @@ TOOL_ORDER = ('штрих', 'точка', 'стирание', 'инверсия'
 #: Инструмент по умолчанию.
 DEFAULT_TOOL = TOOL_ORDER[0]
 
+#: Режимы пера, перебираются клавишей F4.
+#:
+#: `рисование` — нынешнее поведение: протяжка рисует выбранным
+#: инструментом (F3).  `выделение` — поведение мыши 15ИЭ: нажатие и
+#: протяжка выделяют текст кадра, `Ctrl` даёт колоночное выделение, а
+#: рисования на кадре не происходит вовсе.
+MODE_DRAW = 'рисование'
+MODE_SELECT = 'выделение'
+#: Порядок перебора режимов клавишей F4.
+MODE_ORDER = (MODE_DRAW, MODE_SELECT)
+
 
 @dataclass
 class PenEvent:
@@ -102,6 +113,26 @@ class LightPen:
         self.enabled = False
         #: Инструмент рисования — см. `TOOLS`, перебирается клавишей F3.
         self.tool = DEFAULT_TOOL
+        #: Режим пера: `MODE_DRAW` — рисует по кадру, `MODE_SELECT` —
+        #: выделяет текст, как мышь 15ИЭ.  Перебирается клавишей F4.
+        self.mode = MODE_DRAW
+
+    # ── режим ───────────────────────────────────────────────────────────────
+
+    @property
+    def selecting(self) -> bool:
+        """Работает ли перо в режиме выделения."""
+        return self.mode == MODE_SELECT
+
+    @property
+    def drawing(self) -> bool:
+        """Работает ли перо в режиме рисования."""
+        return self.mode == MODE_DRAW
+
+    def toggle_mode(self) -> str:
+        """Переключить режим пера; вернуть новый."""
+        self.mode = MODE_SELECT if self.mode == MODE_DRAW else MODE_DRAW
+        return self.mode
 
     # ── инструмент ──────────────────────────────────────────────────────────
 
@@ -246,4 +277,4 @@ class LightPen:
 
 
 __all__ = ['PenEvent', 'LightPen', 'PEN_PREFIX', 'TOOLS', 'TOOL_ORDER',
-           'DEFAULT_TOOL']
+           'DEFAULT_TOOL', 'MODE_DRAW', 'MODE_SELECT', 'MODE_ORDER']

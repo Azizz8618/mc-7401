@@ -46,7 +46,7 @@ from pathlib import Path
 from . import chrome
 from . import console as console_mod
 from . import startup
-from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
+from .constants import PEN_XOR, SCREEN_HEIGHT, SCREEN_WIDTH
 from .console import (CELL_H, CELL_W, COLS, RASTER_H, ROWS, Console,
                       put_glyph)
 from .emulator import TerminalEmulator
@@ -55,7 +55,9 @@ from .link import LinkError
 from .panel import Diagnostics, Status
 from .pen import DEFAULT_TOOL, LightPen
 from .reader import CommandStreamReader, EventKind
-from .session import Session
+from .select import Selection
+from .session import MODE_LOCAL, Session
+from .undo import Undo
 
 log = logging.getLogger('mc7401.window')
 
@@ -171,6 +173,10 @@ class TerminalWindow:
         self.splash = _splash_enabled(self.config)
         #: `None` — заставка ещё не собиралась; `False` — рисунка нет.
         self._splash_cache = None
+        #: Выделение текста мышью в режиме «выделение» пера — как на 15ИЭ.
+        self.sel = Selection()
+        #: Отмена последнего действия в режиме АВТОНОМНО (`Ctrl-Z`).
+        self.undo = Undo()
         #: Сколько раз обход споткнулся — по первому пишем в подвал.
         self._faults = 0
 
@@ -419,15 +425,21 @@ class TerminalWindow:
         место остаётся справа: центрировать нельзя, знаки ПЗУ поехали бы
         вместе с кадром, а оператор привык к началу координат слева.
         Координаты указателя переводятся через эту геометрию.
+
+        По вертикали кадр стоит **вплотную** под верхней полосой, без
+        центрирования: полоса и подвал прижаты к краям окна, а кадр
+        обязан начинаться сразу под отступом в один ряд.  Раньше
+        оставшееся место делилось поровну, и в узком окне (кадр вписан
+        по ширине, а полоса выше) половина уходила **над** кадром —
+        вместо одного ряда отступа получалось одиннадцать, и отступ
+        «плавал» вместе с размером окна.  Теперь лишнее место целиком
+        уходит вниз, к подвалу, который прижат к нижней кромке.
         """
         width, height = self._view_px()
         scale = self._fit_scale(width, height, self.top_px(),
                                 self.footer_px())
-        frame_h = int(round(SCREEN_HEIGHT * scale))
         top_h = int(round(self.top_px() * scale))
-        foot_h = int(round(self.footer_px() * scale))
-        y = top_h + max(0, (height - top_h - foot_h - frame_h) // 2)
-        return 0, y, scale
+        return 0, top_h, scale
 
     def _frame_row_img(self, y: int) -> int:
         """Ряд кадра под указателем, **сверху вниз** (0 — верх кадра).
@@ -481,12 +493,28 @@ class TerminalWindow:
         return not (fy <= y < fy + frame_h)
 
     def _pen_down(self, event, *, button: int = 1) -> None:
-        """Нажатие пера: начать штрих (правой кнопкой — стирание)."""
+        """Нажатие пера: выделение (режим выделения) или штрих."""
         x, y = self._pen_at(event)
         self.pen.x, self.pen.y = x, y
         self.pen.down = True
         self.pen.button = button
         self.pen._last = (x, y)
+        if self.pen.selecting:
+            # Режим выделения — поведение мыши 15ИЭ: нажатие начинает
+            # протяжку, а на кадре ничего не рисуется.  Ctrl даёт
+            # колоночное выделение, как там же.
+            col, row = self._cell_at(event)
+            if col is None:
+                self.sel.cancel()
+                self.last_key = 'ВЫДЕЛ'
+                self.paint()
+                return
+            self.sel.begin(row, col, block=self._ctrl_held(event))
+            self.last_key = 'ВЫДЕЛ'
+            self._dirty = True
+            self.paint()
+            return
+        self._undo_push('штрих' if button == 1 else 'стирание')
         if button == 1:
             self.pen.tool = self.pen_tool
         else:
@@ -497,6 +525,28 @@ class TerminalWindow:
         self.last_key = 'ПЕРО'
         self._touch_frame()
         self.paint()
+
+    @staticmethod
+    def _ctrl_held(event) -> bool:
+        """Зажат ли `Ctrl` в событии мыши — признак колоночного выделения."""
+        return bool(getattr(event, 'state', 0) & 0x4)
+
+    def _cell_at(self, event) -> tuple[Optional[int], Optional[int]]:
+        """Знакоместо кадра под указателем: `(col, row)`.
+
+        `(None, None)` — указатель не над кадром (служебные строки или
+        поля мимо), как клик мимо текста на 15ИЭ.
+        """
+        fx, fy, scale = self._frame_geometry()
+        if not scale:
+            return None, None
+        col = round((event.x - fx) / scale) // CELL_W
+        row = self._frame_row_img(event.y) // CELL_H
+        if not 0 <= col < COLS or not 0 <= row < ROWS:
+            return None, None
+        if self._in_chrome(event.y):
+            return None, None
+        return col, row
 
     def _on_motion(self, event) -> None:
         """Указатель идёт без нажатия — перекрестье пера идёт за ним.
@@ -519,11 +569,21 @@ class TerminalWindow:
             self.paint()
 
     def _on_drag(self, event) -> None:
-        """Протяжка с нажатой кнопкой — штрих пера (если перо включено)."""
+        """Протяжка с нажатой кнопкой — штрих пера или выделение."""
         if not self.pen.enabled:
             # Без пера протяжка ведёт текстовый курсор — так удобнее
             # ставить курсор в дальний угол кадра.
             self._on_click(event)
+            return
+        if self.pen.selecting:
+            col, row = self._cell_at(event)
+            if col is None:
+                self.sel.cancel()
+            else:
+                self.sel.drag(row, col)
+            self.last_key = 'ВЫДЕЛ'
+            self._dirty = True
+            self.paint()
             return
         x, y = self._pen_at(event)
         self.pen.line_to(self.emu.fb, x, y)
@@ -532,11 +592,18 @@ class TerminalWindow:
         self.paint()
 
     def _on_release(self, _event=None) -> None:
-        """Отпускание кнопки: перо заканчивает штрих."""
+        """Отпускание кнопки: перо заканчивает штрих или выделение."""
         if not self.pen.down:
             return
         self.pen.down = False
         self.pen._last = (self.pen.x, self.pen.y)
+        if self.pen.selecting:
+            frag = self.sel.end()
+            if frag is not None:
+                self.last_key = 'ВЫДЕЛ'
+            self._dirty = True
+            self.paint()
+            return
         self._touch_frame()
         self.paint()
 
@@ -674,6 +741,51 @@ class TerminalWindow:
                 break
             put_glyph(fb, (col + n) * CELL_W, top_y + CELL_H, ch, 'OR')
 
+    # ── отмена действия (АВТОНОМНО) ─────────────────────────────────────────
+
+    def _undo_push(self, what: str) -> None:
+        """Запомнить кадр перед локальным действием.
+
+        История ведётся только в режиме **АВТОНОМНО**: там действия
+        остаются локальными, и отменять их имеет смысл.  В режиме С ЭВМ
+        действие уже ушло по линии — отменять нечего, и молчаливая
+        история только вводила бы в заблуждение.
+        """
+        if self.session.mode == MODE_LOCAL:
+            self.undo.push(self.emu.fb, what)
+
+    def undo_last(self) -> bool:
+        """Отменить последнее действие (`Ctrl-Z`).
+
+        Возвращает `True`, если было что отменить.  В режиме С ЭВМ
+        команда не выполняется: там действие ушло на ЭВМ, и «отмена»
+        означала бы тихую ложь оператору.
+        """
+        if self.session.mode != MODE_LOCAL:
+            self.diag.add('отмена только в АВТОНОМНО — действие ушло на ЭВМ',
+                          'warn')
+            self.last_key = 'ОТМЕНА'
+            self._dirty = True
+            self.paint()
+            return False
+        step = self.undo.pop()
+        if step is None:
+            self.diag.add('отменять нечего', 'info')
+            self.last_key = 'ОТМЕНА'
+            self._dirty = True
+            self.paint()
+            return False
+        restored, what = step
+        self.emu.fb = restored
+        self.console.fb = restored
+        self.best, self.best_n = None, 0
+        self._touch_frame()
+        self.diag.add('отменено: ' + (what or 'действие'), 'ok')
+        self.last_key = 'ОТМЕНА'
+        self._dirty = True
+        self.paint()
+        return True
+
     def dismiss_splash(self) -> None:
         """Снять заставку: нажата клавиша или пришли данные от ЭВМ."""
         if not self.splash:
@@ -684,18 +796,38 @@ class TerminalWindow:
     def shown_frame(self):
         """Кадр, который сейчас на экране: из истории или текущий.
 
-        С перами поверх — копия кадра с перекрестьем: перекрестье рисуется
-        при выводе и в память кадра не попадает, иначе оно затиралось бы
+        С перами поверх — копия кадра с перекрестьем, а с выделением —
+        ещё и с подсветкой.  Всё это рисуется при выводе и в память
+        кадра не попадает: иначе перекрестье и подсветка затирались бы
         следующей перерисовкой программы.
         """
         base = (self._history[self._hist_at]
                 if self._hist_at is not None and self._history
                 else (self.best if self.best_n else self.emu.fb))
-        if not self.pen.enabled:
+        need_view = self.pen.enabled or not self.sel.empty()
+        if not need_view:
             return base
         view = base.copy()
-        self.pen.crosshair(view)
+        self._highlight_selection(view)
+        if self.pen.enabled:
+            self.pen.crosshair(view)
         return view
+
+    def _highlight_selection(self, view: Framebuffer) -> None:
+        """Подсветить выделенные знакоместа инвертированием растра.
+
+        Монохромный терминал, выбранного цвета нет — как и в самом МС
+        7401.  Инверсия растра знакоместа даёт заметную подсветку и на
+        тексте, и на графике под ним.
+        """
+        cells = self.sel.cells(COLS)
+        if not cells:
+            return
+        for col, row in cells:
+            x0, y0, x1, y1 = self.console.cell_rect(col, row)
+            for y in range(y0, y1 + 1):
+                for x in range(x0, x1 + 1):
+                    view.apply(x, y, PEN_XOR)
 
     # ── ввод ────────────────────────────────────────────────────────────────
 
@@ -744,9 +876,29 @@ class TerminalWindow:
             self.paint()
             return 'break'
         if key == 'F3':                       # ИНСТРУМЕНТ пера
+            if self.pen.selecting:
+                self.diag.add('инструмент только в режиме РИСОВАНИЕ (F4)',
+                              'warn')
+                self.last_key = 'ИНСТР'
+                self.paint()
+                return 'break'
             self.pen_tool = self.pen.next_tool()
             self.diag.add('инструмент пера: ' + self.pen_tool)
             self.last_key = 'ИНСТР'
+            self.paint()
+            return 'break'
+        if key == 'F4':                       # РЕЖИМ пера
+            mode = self.pen.toggle_mode()
+            self.diag.add('режим пера: ' + mode)
+            self.last_key = 'РЕЖИМ'
+            self._dirty = True
+            self.paint()
+            return 'break'
+        if key == 'F7':                       # снять выделение
+            if self.sel.clear() or True:
+                self.diag.add('выделение снято')
+            self.last_key = 'ВЫДЕЛ'
+            self._dirty = True
             self.paint()
             return 'break'
         if key == 'F5':                       # ОЧИСТКА
@@ -805,6 +957,8 @@ class TerminalWindow:
                 return 'break'
             if low == 'c':                     # ЦЕНТР
                 self.goto_cursor(COLS // 2, ROWS // 2)
+            elif low == 'z':                   # ОТМЕНА (АВТОНОМНО)
+                self.undo_last()
             else:
                 return None
             self.last_key = 'УПР-' + low
@@ -900,10 +1054,9 @@ class TerminalWindow:
         top_h = int(round(top_px * scale))
         foot_h = int(round(foot_px * scale))
         frame_h = int(round(SCREEN_HEIGHT * scale))
-        # Кадр прижат к левому краю окна и стоит в полосе между служебными
-        # строками; при вписывании по высоте он занимает её целиком.
-        frame_x = 0
-        frame_y = top_h + max(0, (height - top_h - foot_h - frame_h) // 2)
+        # Кадр прижат к левому краю и стоит вплотную под верхней полосой;
+        # лишнее место уходит вниз, к подвалу (см. `_frame_geometry`).
+        frame_x, frame_y, _ = self._frame_geometry()
 
         if splash is not None:
             # Пока не нажата клавиша и ЭВМ молчит, на кадре заставка с
@@ -1055,6 +1208,10 @@ class TerminalWindow:
             echo=ses.echo,
             pen=self.pen.enabled,
             pen_tool=self.pen.tool,
+            pen_mode=self.pen.mode if self.pen.selecting else '',
+            selection=self.sel.label() if not self.sel.empty() else '',
+            undo=len(self.undo),
+            undo_ready=self.session.mode == MODE_LOCAL,
             buffer=len(ses.buffer),
             grid=self.grid,
             scale=self.scale,

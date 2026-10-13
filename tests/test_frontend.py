@@ -29,7 +29,8 @@ from mc7401.console import (CELL_H, CELL_W, COLS, RASTER_H, ROWS,     # noqa: E4
 from mc7401.screen import MONO_OFF, MONO_ON, ScreenRenderer, Viewport  # noqa: E402
 from mc7401.framebuffer import Framebuffer                         # noqa: E402
 from mc7401.tui import TerminalApp                                 # noqa: E402
-from mc7401 import startup                                         # noqa: E402
+from mc7401 import chrome, startup                                # noqa: E402
+from mc7401.pen import MODE_SELECT                                  # noqa: E402
 from mc7401 import window                                          # noqa: E402
 
 
@@ -728,6 +729,247 @@ def test_window_click_above_frame_clamps_to_top(monkeypatch):
     win._on_click(FakeClick(3 * CELL_W, 1))
     assert win.console.row == 0, 'указатель ушёл выше кадра'
     assert 0 <= win.console.col < window.SCREEN_WIDTH // CELL_W
+
+
+# ── отступ над кадром ───────────────────────────────────────────────────────
+
+def test_frame_starts_right_under_the_status_band(monkeypatch):
+    """Над кадром ровно один ряд — при любом размере окна.
+
+    Раньше лишнее место по вертикали делилось поровну, и в узком окне
+    (кадр вписан по ширине) половина уходила **над** кадром: вместо
+    одного ряда отступа получалось одиннадцать, и отступ «плавал» вместе
+    с размером окна.  Полоса и подвал прижаты к краям, значит кадр
+    обязан стоять вплотную под полосой, а лишнее место уходить вниз.
+    """
+    for size in ((1920, 1080), (1280, 1024), (900, 1000), (700, 900),
+                 (560, 900), (1920, 600)):
+        win = make_window(monkeypatch, size=size)
+        fx, fy, scale = win._frame_geometry()
+        top_h = int(round(win.top_px() * scale))
+        assert fx == 0, f'{size}: кадр не прижат влево'
+        assert fy == top_h, (
+            f'{size}: над кадром {fy - top_h} точек вместо нуля — '
+            f'отступ сверху не один ряд')
+
+
+def test_one_blank_row_between_rule_and_frame(monkeypatch):
+    """Черта и кадр разделены ровно одним пустым рядом."""
+    win = make_window(monkeypatch, size=(1200, 900))
+    top, _ = win.chrome_parts()
+    assert top[-2] == [chrome.RULE], 'перед отступом не черта'
+    assert top[-1] == [], 'отступ не пустой ряд'
+    fx, fy, scale = win._frame_geometry()
+    top_h = int(round(win.top_px() * scale))
+    assert fy - top_h == 0, 'кадр не вплотную под полосой'
+
+
+# ── режимы пера: рисование и выделение ───────────────────────────────────────
+
+def pen_select(monkeypatch, block=False):
+    """Окно с пером в режиме выделения."""
+    win = pen_window(monkeypatch)
+    win.pen.mode = MODE_SELECT
+    win._block = block
+    return win
+
+
+def drag_over(win, start, end, *, state=0):
+    """Протяжка мышью: точки — координаты окна (как их даёт `cell_of`)."""
+    ev = FakeClick(*start)
+    ev.state = state
+    win._on_motion(ev)
+    win._pen_down(ev)
+    ev = FakeClick(*end)
+    ev.state = state
+    win._on_drag(ev)
+    win._on_release()
+
+
+def cell_of(win, fx, fy, scale, col, row):
+    """Знакоместо `(col, row)` → точка окна для мыши."""
+    x = col * CELL_W + CELL_W // 2
+    y = (ROWS - 1 - row) * CELL_H + CELL_H // 2
+    return screen_of(win, fx, fy, scale, x, y)
+
+
+def test_pen_has_two_modes(monkeypatch):
+    """Перо переключается между рисованием и выделением (F4)."""
+    win = make_window(monkeypatch)
+    win.pen.enabled = True
+    assert win.pen.drawing and not win.pen.selecting
+    assert win._on_key(FakeEvent('F4')) == 'break'
+    assert win.pen.selecting and not win.pen.drawing
+    assert win._on_key(FakeEvent('F4')) == 'break'
+    assert win.pen.drawing, 'режим не вернулся к рисованию'
+
+
+def test_select_mode_does_not_draw(monkeypatch):
+    """В режиме выделения мышь не рисует на кадре."""
+    win = pen_select(monkeypatch)
+    win.emu.fb.clear(); win.best, win.best_n = None, 0
+    fx, fy, scale = win._frame_geometry()
+    drag_over(win,
+              cell_of(win, fx, fy, scale, 8, 30),
+              cell_of(win, fx, fy, scale, 25, 10))
+    assert win.emu.fb.count_set() == 0, 'выделение нарисовало на кадре'
+
+
+def test_select_mode_selects_cells(monkeypatch):
+    """Протяжка выделяет знакоместа между нажатием и отпусканием."""
+    win = pen_select(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    drag_over(win,
+              cell_of(win, fx, fy, scale, 3, 30),
+              cell_of(win, fx, fy, scale, 11, 30))
+    cells = win.sel.cells(COLS)
+    assert cells, 'выделение пустое'
+    rows = {r for _, r in cells}
+    assert rows == {30}, f'выделены строки {rows}'
+    assert len(cells) == 9, f'выделено {len(cells)} знакомест'
+
+
+def test_select_reports_size_in_status(monkeypatch):
+    """Размер выделения виден в строке состояния, как на 15ИЭ."""
+    win = pen_select(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    drag_over(win,
+              cell_of(win, fx, fy, scale, 0, 10),
+              cell_of(win, fx, fy, scale, 9, 10))
+    assert win.status().selection, 'размер выделения не показан'
+    assert 'СТР' in win.status().selection
+    line = ' '.join(win._status_lines())
+    assert 'ВЫД=' in line, 'ВЫД= нет в строке состояния'
+
+
+def test_select_with_ctrl_is_column(monkeypatch):
+    """Протяжка с Ctrl — колоночное выделение (КОЛ), как на 15ИЭ."""
+    win = pen_select(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    drag_over(win,
+              cell_of(win, fx, fy, scale, 2, 30),
+              cell_of(win, fx, fy, scale, 6, 34), state=0x4)
+    assert win.sel.kind == 'КОЛ', f'вид выделения {win.sel.kind}'
+    cells = win.sel.cells(COLS)
+    assert {r for _, r in cells} == {30, 31, 32, 33, 34}, 'не все строки'
+    assert len(cells) == 5 * 5, f'выделено {len(cells)} знакомест'
+
+
+def test_select_click_outside_frame_cancels(monkeypatch):
+    """Клик мимо кадра отменяет протяжку, как клик мимо текста на 15ИЭ."""
+    win = pen_select(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    ev = FakeClick(*cell_of(win, fx, fy, scale, 5, 20))
+    ev.state = 0
+    win._pen_down(ev)
+    assert win.sel.dragging
+    ev = FakeClick(fx + 2, 2)            # над кадром — в шапку
+    ev.state = 0
+    win._on_drag(ev)
+    assert not win.sel.dragging, 'протяжка не отменена'
+
+
+def test_f7_clears_selection(monkeypatch):
+    """F7 снимает выделение целиком."""
+    win = pen_select(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    drag_over(win,
+              cell_of(win, fx, fy, scale, 0, 10),
+              cell_of(win, fx, fy, scale, 5, 10))
+    assert not win.sel.empty()
+    win._on_key(FakeEvent('F7'))
+    assert win.sel.empty(), 'F7 не снял выделение'
+    assert win.status().selection == ''
+
+
+def test_selection_is_highlighted_on_screen(monkeypatch):
+    """Выделение видно на кадре, но в память не попадает."""
+    win = pen_select(monkeypatch)
+    win.console.write('ПРОБА'.encode('koi8-r'))
+    win._touch_frame()
+    fx, fy, scale = win._frame_geometry()
+    drag_over(win,
+              cell_of(win, fx, fy, scale, 0, 0),
+              cell_of(win, fx, fy, scale, 6, 0))
+    before = win.emu.fb.count_set()
+    shown = win.shown_frame()
+    assert shown.count_set() != before, 'подсветки не видно'
+    assert win.emu.fb.count_set() == before, 'подсветка попала в память'
+
+
+def test_f3_is_inert_in_select_mode(monkeypatch):
+    """Инструмент пера в режиме выделения не перебирается."""
+    win = pen_select(monkeypatch)
+    before = win.pen.tool
+    win._on_key(FakeEvent('F3'))
+    assert win.pen.tool == before, 'инструмент сменился в режиме выделения'
+
+
+# ── отмена действия в автономном режиме ──────────────────────────────────────
+
+def local_window(monkeypatch):
+    """Окно в режиме АВТОНОМНО — там работает отмена."""
+    win = make_window(monkeypatch)
+    win.session.set_mode('local')
+    win.emu.fb.clear()
+    win.best, win.best_n = None, 0
+    return win
+
+
+def test_undo_restores_frame_before_stroke(monkeypatch):
+    """Ctrl-Z отменяет штрих пера целиком."""
+    win = local_window(monkeypatch)
+    win.pen.enabled = True
+    fx, fy, scale = win._frame_geometry()
+    win._pen_down(FakeClick(*screen_of(win, fx, fy, scale, 20, 380)), button=1)
+    win._on_drag(FakeClick(*screen_of(win, fx, fy, scale, 400, 30)))
+    win._on_release()
+    assert win.emu.fb.count_set() > 0, 'штрих не нарисован'
+    assert win.undo_last()
+    assert win.emu.fb.count_set() == 0, 'штрих не отменён'
+
+
+def test_undo_is_whole_stroke_not_per_segment(monkeypatch):
+    """Отменяется весь штрих, а не одна его часть."""
+    win = local_window(monkeypatch)
+    win.pen.enabled = True
+    fx, fy, scale = win._frame_geometry()
+    win._pen_down(FakeClick(*screen_of(win, fx, fy, scale, 20, 380)), button=1)
+    for x in range(50, 400, 50):
+        win._on_drag(FakeClick(*screen_of(win, fx, fy, scale, x, 200)))
+    win._on_release()
+    assert win.emu.fb.count_set() > 0
+    assert len(win.undo) == 1, f'в истории {len(win.undo)} шагов'
+    win.undo_last()
+    assert win.emu.fb.count_set() == 0
+
+
+def test_undo_works_in_host_mode_too_but_says_so(monkeypatch):
+    """В режиме С ЭВМ отменять нечего, и терминал об этом говорит."""
+    win = make_window(monkeypatch)
+    win.session.set_mode('host')
+    assert not win.undo_last(), 'отмена сработала в режиме С ЭВМ'
+    log = str(list(win.diag.entries))
+    assert 'АВТОНОМНО' in log, 'не сказано, почему отмена не сработала'
+
+
+def test_undo_on_empty_history_reports(monkeypatch):
+    """Отменять нечего — терминал об этом говорит, а не молчит."""
+    win = local_window(monkeypatch)
+    assert not win.undo_last()
+    assert 'нечего' in str(list(win.diag.entries))
+
+
+def test_undo_recovers_after_undo(monkeypatch):
+    """После отмены картина на кадре возвращается к прежней."""
+    win = local_window(monkeypatch)
+    win.emu.fb.hline(0, 559, 200)
+    keep = win.emu.fb.count_set()
+    win._undo_push('штрих')
+    win.emu.fb.erase_rows(190, 210)
+    assert win.emu.fb.count_set() < keep
+    assert win.undo_last()
+    assert win.emu.fb.count_set() == keep, 'кадр не восстановлен'
 
 
 # ── заставка ────────────────────────────────────────────────────────────────

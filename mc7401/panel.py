@@ -34,6 +34,7 @@ from datetime import datetime
 from typing import Optional, Sequence
 
 from .chars import SET_LABELS
+from .pen import MODE_DRAW, MODE_SELECT
 
 #: Разделитель ячеек подвала.
 SEP = ' | '
@@ -156,6 +157,14 @@ class Status:
     pen: bool = False
     #: Инструмент пера: `'штрих'` | `'стирание'` | `'точка'`.
     pen_tool: str = 'штрих'
+    #: Режим пера: `'рисование'` | `'выделение'` (клавиша F4).
+    pen_mode: str = ''
+    #: Размер выделения мышью, как на 15ИЭ: `СТР 1фр 1с 12зн`.
+    selection: str = ''
+    #: Сколько действий можно отменить (`Ctrl-Z`, только АВТОНОМНО).
+    undo: int = 0
+    #: Отмена доступна — то есть терминал в режиме АВТОНОМНО.
+    undo_ready: bool = False
     #: Накоплено знаков в буфере АВТОНОМНО.
     buffer: int = 0
     grid: bool = False
@@ -214,6 +223,10 @@ def status_line(st: Status, *, now: Optional[datetime] = None,
         out.append(mk(('РЕЖ=', 'label'), (st.wire, 'state')))
     if not st.banner:
         out.append(mk(('ПРОВЕРЬ ЛИНИЮ!', 'err')))
+    # Размер выделения мышью — как на 15ИЭ (`session.py`, `_update_status`):
+    # видно сразу, выбрана одна строка или пол-экрана.
+    if st.selection:
+        out.append(mk(('ВЫД=', 'label'), (st.selection, 'state')))
     stamp = (now or datetime.now()).strftime(
         '%d.%m.%Y %H:%M:%S' if full else '%d.%m %H:%M')
     out.append(mk((stamp, 'diag')))
@@ -226,6 +239,14 @@ def _short(text: str, limit: int = 24) -> str:
 
 
 # ── подвал ─────────────────────────────────────────────────────────────────
+
+#: Короткие метки режима пера: колонка подвала даёт на значение четыре
+#: знакоместа, а полные названия в неё не влезают.
+PEN_MODES = {MODE_DRAW: 'РИС', MODE_SELECT: 'ВЫД'}
+#: Короткие метки инструментов пера — по той же причине.
+PEN_TOOLS = {'штрих': 'ШТР', 'точка': 'ТЧК', 'стирание': 'СТИР',
+             'инверсия': 'ИНВ'}
+
 
 def state_rows(st: Status, width: int = COLW) -> list[Cell]:
     """Панель состояний сеанса — первые ряды подвала.
@@ -248,8 +269,16 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
              'state' if st.banner else 'err'),
         cell('ЭХО=', 'ВКЛ' if st.echo else 'ВЫКЛ',
              'on' if st.echo else 'off'),
-        cell('ПЕРО=', st.pen_tool if st.pen else 'ВЫКЛ',
+        # Режим и инструмент пера — в **двух** ячейках: колонка подвала
+        # узка (9 знакомест, на значение остаётся четыре), и длинное
+        # «выделение» или «штрих» превращалось в одни многоточия.
+        cell('ПЕРО=', PEN_MODES.get(st.pen_mode, 'РИС') if st.pen else 'ВЫК',
              'on' if st.pen else 'off'),
+        cell('ИНСТ=', PEN_TOOLS.get(st.pen_tool, st.pen_tool)
+             if st.pen and not st.pen_mode else '—'),
+        cell('ОТМ=', str(st.undo) if st.undo else ('—' if st.undo_ready
+                                                 else 'НЕТ'),
+             'on' if st.undo else 'off'),
         # Масштаб выводится из размера окна и бывает дробным, поэтому
         # без префикса «1:» — иначе ячейка подвала обрезает значение.
         cell('МАШ=', f'{float(st.scale):.1f}'.rstrip('0').rstrip('.')),
@@ -279,10 +308,13 @@ def legend_rows(width: int = COLW) -> list[Cell]:
         mk(('F8=', fkey), ('НАБОР', '')),
         mk(('F9=', fkey), ('СЕТЬ', '')),
         mk(('F10=', fkey), ('ПЕРЕД', '')),
+        mk(('F4=', fkey), ('РЕЖИМ', '')),
+        mk(('F7=', fkey), ('СНЯТ', '')),
+        # Правую кнопку («стирание») в подвал не вносим: она ушла бы в
+        # лишний ряд, а стирание и так есть среди инструментов F3.
         mk(('ЛЕВ=', mouse), ('КУРС', '')),
-        mk(('ПРАВ=', mouse), ('СТЕР', '')),
+        mk(('ОТМЕНА=', ctrl), ('Ctrl-z', '')),
         mk(('ВЫХОД=', fkey), ('F12', '')),
-        mk(('  =', ctrl), ('Ctrl-q', '')),
     ]
 
 
