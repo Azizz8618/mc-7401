@@ -281,7 +281,8 @@ def legend_rows(width: int = COLW) -> list[Cell]:
         mk(('F10=', fkey), ('ПЕРЕД', '')),
         mk(('ЛЕВ=', mouse), ('КУРС', '')),
         mk(('ПРАВ=', mouse), ('СТЕР', '')),
-        mk(('ВЫХОД=', ctrl), ('Ctrl-q', '')),
+        mk(('ВЫХОД=', fkey), ('F12', '')),
+        mk(('  =', ctrl), ('Ctrl-q', '')),
     ]
 
 

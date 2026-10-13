@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -23,7 +24,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mc7401.config import Config                                   # noqa: E402
-from mc7401.console import CELL_H, CELL_W                          # noqa: E402
+from mc7401.console import (CELL_H, CELL_W, COLS, ROWS,             # noqa: E402
+                             SCREEN_HEIGHT)
 from mc7401.screen import MONO_OFF, MONO_ON, ScreenRenderer, Viewport  # noqa: E402
 from mc7401.framebuffer import Framebuffer                         # noqa: E402
 from mc7401.tui import TerminalApp                                 # noqa: E402
@@ -471,12 +473,36 @@ class FakeRoot:
     def __init__(self, focus=None):
         self._focus = focus
         self._width = 1200
+        #: Отложенные вызовы `after(ms, cb)` — как `Tk.after`, но без
+        #: главного цикла: тест сам решает, когда «отработает» очередь.
+        self.scheduled: list = []
+        self.quit_calls = 0
 
     def focus_get(self):
         return self._focus
 
     def winfo_width(self):
         return self._width
+
+    def after(self, ms, cb=None, *args):
+        self.scheduled.append((ms, cb, args))
+        return 'after#%d' % len(self.scheduled)
+
+    def after_cancel(self, ident):
+        self.scheduled = [s for s in self.scheduled if s[0] != ident]
+
+    def quit(self):
+        self.quit_calls += 1
+
+    def run_pending(self, count=1):
+        """Выполнить отложенные вызовы — по одному, как обход Tk."""
+        done = 0
+        while self.scheduled and done < count:
+            _, cb, args = self.scheduled.pop(0)
+            if cb is not None:
+                cb(*args)
+            done += 1
+        return done
 
 
 def make_window(monkeypatch, *, scale=0, size=(560, 460)):
@@ -701,6 +727,293 @@ def test_window_click_above_frame_clamps_to_top(monkeypatch):
     win._on_click(FakeClick(3 * CELL_W, 1))
     assert win.console.row == 0, 'указатель ушёл выше кадра'
     assert 0 <= win.console.col < window.SCREEN_WIDTH // CELL_W
+
+
+# ── выход из терминала ──────────────────────────────────────────────────────
+
+class CountingDriver(FakeDriver):
+    """Драйвер со счётчиками: сколько раз опросили и сколько раз закрыли.
+
+    Порядок выхода проверяется именно числами: важно, что линия закрыта
+    **один** раз, а опрос после выхода не идёт ни разу.
+    """
+
+    def __init__(self, data: bytes = b'') -> None:
+        super().__init__(data)
+        self.polls = 0
+        self.closes = 0
+
+    def poll(self, timeout: float) -> bytes:
+        self.polls += 1
+        return super().poll(timeout)
+
+    def close(self) -> None:
+        self.closes += 1
+        super().close()
+
+
+def test_ctrl_q_exits_with_x11_control_code(monkeypatch):
+    """Ctrl-q на X11 приходит как `char=\\x11`, а не буква — выход обязан
+    сработать и по `keysym`, иначе его нет вообще."""
+    win = make_window(monkeypatch)
+    assert win._on_key(FakeEvent('q', '\x11', state=0x4)) == 'break'
+    assert not win.running, 'Ctrl-q не закрыл терминал'
+
+
+def test_f12_exits(monkeypatch):
+    """F12 — выход, назначенная клавиша, без модификаторов."""
+    win = make_window(monkeypatch)
+    win.driver = CountingDriver()
+    assert win._on_key(FakeEvent('F12')) == 'break'
+    assert not win.running
+    assert win.driver is None, 'линия не отпущена'
+    assert win._tk.quit_calls == 1
+
+
+def test_ctrl_c_centres_cursor(monkeypatch):
+    """Ctrl-c — ЦЕНТР, и он тоже опознаётся по keysym."""
+    win = make_window(monkeypatch)
+    win.console.goto(0, 0)
+    assert win._on_key(FakeEvent('c', '\x03', state=0x4)) == 'break'
+    assert (win.console.col, win.console.row) == (COLS // 2, ROWS // 2)
+
+
+def test_exit_closes_line_and_stops_the_loop(monkeypatch):
+    """Выход: линия закрыта, обход больше не ставится в очередь."""
+    win = make_window(monkeypatch)
+    driver = win.driver = CountingDriver()
+    win.running = True
+    win._tick()
+    assert driver.polls == 1
+    win.quit()
+    assert driver.closes == 1, 'линия не закрыта при выходе'
+    win._tk.scheduled.clear()
+    win._tick()
+    assert not win._tk.scheduled, 'обход продолжился после выхода'
+    assert driver.polls == 1, 'после выхода опрос не идёт'
+
+
+def test_exit_twice_is_harmless(monkeypatch):
+    """Двойной выход (F12 и кнопка окна) не закрывает линию дважды."""
+    win = make_window(monkeypatch)
+    driver = win.driver = CountingDriver()
+    win.quit()
+    win.quit()
+    win.close()
+    assert driver.closes == 1
+
+
+def test_exit_ignores_line_failure(monkeypatch):
+    """Падение линии при выходе не должно помешать закрыть окно."""
+    class BadDriver(CountingDriver):
+        def close(self):
+            raise OSError('сокет уже закрыт')
+
+    win = make_window(monkeypatch)
+    win.driver = BadDriver()
+    win.quit()
+    assert not win.running, 'окно не закрылось из-за линии'
+    assert win._tk.quit_calls == 1
+
+
+def test_loop_survives_line_failure(monkeypatch):
+    """Обрыв линии не убивает обход: иначе окно замирает с картинкой."""
+    class DeadDriver(CountingDriver):
+        def poll(self, timeout):
+            raise OSError('обрыв')
+
+    win = make_window(monkeypatch)
+    win.driver = DeadDriver()
+    win.running = True
+    win._tick()
+    win._tick()                          # второй оборот: обход жив
+    assert len(win._tk.scheduled) >= 2, 'обход остановился после обрыва'
+    assert win.driver is None, 'мертвую линию продолжают опрашивать'
+    log = str(list(win.diag.entries))
+    assert 'обрыв' in log, f'сбой не показан в подвале: {log}'
+
+
+def test_loop_survives_paint_failure(monkeypatch):
+    """Ошибка вывода переживается: обход перерисовывает окно дальше."""
+    win = make_window(monkeypatch)
+    win.running = True
+    boom = [OSError('нечего рисовать')]
+
+    def bad_paint():
+        raise boom.pop()
+
+    win.paint = bad_paint
+    win._tick()
+    assert win.running, 'окно умерло из-за сбоя вывода'
+    assert win._tk.scheduled, 'обход остановился из-за сбоя вывода'
+    win.paint = lambda: None            # вывод починили
+    win._tick()
+    assert win._faults == 1
+
+
+def test_window_close_button_exits_cleanly(monkeypatch):
+    """Кнопка окна — тот же выход, без трассировки на каждый оборот."""
+    win = make_window(monkeypatch)
+    driver = win.driver = CountingDriver()
+    win.running = True
+    win.close()                          # WM_DELETE_WINDOW
+    assert driver.closes == 1
+    assert win._tk.quit_calls == 1
+    win._tick()
+    assert driver.polls == 0
+
+
+def test_ctrl_letter_ignores_other_keys(monkeypatch):
+    """Не буква — не сочетание: F-клавиши и цифры под Ctrl не ловятся."""
+    for keysym, char in (('F5', ''), ('1', '\x01'), ('Left', ''),
+                         ('Return', '\r'), ('Р', '')):
+        assert window._ctrl_letter(FakeEvent(keysym, char, state=0x4)) is None
+
+
+# ── курсор: рамка знакоместа и мигание ──────────────────────────────────────
+
+def cursor_box(win, fx, fy, scale):
+    """Габариты рамки курсора на экране: `(x0, y0, x1, y1)`."""
+    photo = FakePhoto()
+    win._cursor_frame_scaled(photo, fx, fy, scale)
+    box = [to for to, _ in photo.puts if to is not None]
+    if not box:
+        return None
+    return (min(b[0] for b in box), min(b[1] for b in box),
+            max(b[2] for b in box), max(b[3] for b in box))
+
+
+def test_cursor_frame_wraps_exactly_the_glyph_cell(monkeypatch):
+    """Рамка курсора лежит ровно вокруг знакоместа — ни рядом, ни в углу.
+
+    Раньше ряд кадра пересчитывался своей формулой с `SCREEN_HEIGHT`
+    вместо `SCREEN_HEIGHT - 1`: верхний ряд кадра уезжал в низ окна
+    (сдвиг до 900 точек), средние строки — на десятки точек вбок.
+    """
+    win = make_window(monkeypatch, size=(1200, 900))
+    fx, fy, scale = win._frame_geometry()
+    th = max(1, int(round(scale)))
+    for col, row in ((0, 0), (5, 5), (34, 20), (69, 39), (1, 38)):
+        win.console.goto(col, row)
+        x0, y0, x1, y1 = win.console.cell_rect(col, row)
+        want = (fx + int(round(x0 * scale)),
+                fy + int(round((SCREEN_HEIGHT - 1 - y1) * scale)),
+                fx + int(round(x1 * scale)) + th,
+                fy + int(round((SCREEN_HEIGHT - 1 - y0) * scale)) + th)
+        assert cursor_box(win, fx, fy, scale) == want, (col, row)
+
+
+def test_cursor_frame_follows_window_resize(monkeypatch):
+    """После растяжения окна рамка остаётся на своём знакоместе."""
+    win = make_window(monkeypatch, size=(600, 500))
+    win.console.goto(40, 25)
+    small = cursor_box(win, *win._frame_geometry())
+    win._canvas._w, win._canvas._h = 1600, 1200
+    fx, fy, scale = win._frame_geometry()
+    x0, y0, x1, y1 = win.console.cell_rect(40, 25)
+    th = max(1, int(round(scale)))
+    assert cursor_box(win, fx, fy, scale) == (
+        fx + int(round(x0 * scale)),
+        fy + int(round((SCREEN_HEIGHT - 1 - y1) * scale)),
+        fx + int(round(x1 * scale)) + th,
+        fy + int(round((SCREEN_HEIGHT - 1 - y0) * scale)) + th)
+    assert small is not None and small != cursor_box(win, fx, fy, scale)
+
+
+def test_cursor_blinks(monkeypatch):
+    """Курсор мигает: рамка то есть, то нет."""
+    win = make_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    win._blink_on = True
+    assert cursor_box(win, fx, fy, scale) is not None, 'рамки нет'
+    win._blink_on = False
+    assert cursor_box(win, fx, fy, scale) is None, 'погасший курсор виден'
+
+
+def test_cursor_toggle_rate(monkeypatch):
+    """Мигание переключается раз в полсекунды, а не на каждом обороте."""
+    win = make_window(monkeypatch)
+    assert window.TerminalWindow.CURSOR_BLINK_MS == 500
+    seen = []
+    for _ in range(4):
+        win._blink_on = not win._blink_on
+        seen.append(win._blink_on)
+    assert seen == [False, True, False, True]
+
+
+def test_cursor_wakes_on_movement(monkeypatch):
+    """Нажатая клавиша зажигает курсор: стрелка не должна попадать
+    на погасший курсор — иначе кажется, что он не двигается."""
+    win = make_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    win._blink_on = False
+    win.console.goto(10, 10)
+    win._on_key(FakeEvent('Right'))
+    assert win.console.col == 11
+    assert win._blink_on, 'курсор не проснулся после стрелки'
+    assert cursor_box(win, fx, fy, scale) is not None
+
+
+def test_cursor_wakes_while_typing(monkeypatch):
+    """Набор не даёт курсору погаснуть на середине слова."""
+    win = make_window(monkeypatch)
+    win._blink_on = False
+    win._on_key(FakeEvent('a', 'a'))
+    assert win._blink_on, 'курсор погас во время набора'
+    win._blink_on = False
+    win._on_key(FakeEvent('Return'))
+    assert win._blink_on, 'курсор погас после перевода строки'
+    win._blink_on = False
+    win._on_key(FakeEvent('BackSpace'))
+    assert win._blink_on, 'курсор погас после стирания'
+
+
+def test_cursor_hidden_while_browsing_history(monkeypatch):
+    """В истории на экране чужой кадр — рамка курсора там неуместна."""
+    win = make_window(monkeypatch)
+    fx, fy, scale = win._frame_geometry()
+    win._history = [win.emu.fb.copy(), win.emu.fb.copy()]
+    win.scroll_view(-1)
+    assert win._hist_at is not None
+    assert cursor_box(win, fx, fy, scale) is None, \
+        'курсор висит поверх кадра из истории'
+
+
+def test_cursor_wakes_on_machine_output(monkeypatch):
+    """ЭВМ пишет — курсор горит: приглашение ОС пришло, а курсор погас."""
+    win = make_window(monkeypatch)
+    win._blink_on = False
+    win.session_text(b'\xeb\xe2\xec\r\n')       # ЭBM-3
+    assert win._blink_on, 'курсор погас при выводе ЭВМ'
+    win._blink_on = False
+    win.session_text('ПРИВЕТ'.encode('koi8-r'))    # и для текста UTF-8
+    assert win._blink_on, 'курсор погас при выводе ЭВМ (текст)'
+
+
+def test_cursor_idles_into_blinking(monkeypatch):
+    """Без событий курсор доходит до мигания сам — по таймеру."""
+    win = make_window(monkeypatch)
+    win.running = True                  # обход крутит только рабочее окно
+    win._blink_on = True
+    win._blink_at = time.monotonic()
+    win._tick()
+    assert win._blink_on, 'фаза переключилась раньше полусекунды'
+    win._blink_at = time.monotonic() - 1.0
+    win._tick()
+    assert not win._blink_on, 'мигание не идёт в покое'
+
+
+def test_cursor_stays_inside_the_grid(monkeypatch):
+    """Стрелки упираются в края сетки, а не уезжают за кадр."""
+    win = make_window(monkeypatch)
+    win.console.goto(0, 0)
+    for keysym in ('Left', 'Up'):
+        win._on_key(FakeEvent(keysym))
+    assert (win.console.col, win.console.row) == (0, 0)
+    win.console.goto(COLS - 1, ROWS - 1)
+    for keysym in ('Right', 'Down'):
+        win._on_key(FakeEvent(keysym))
+    assert (win.console.col, win.console.row) == (COLS - 1, ROWS - 1)
 
 
 # ── световое перо (F2) ──────────────────────────────────────────────────────

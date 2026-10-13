@@ -35,7 +35,7 @@ from . import panel
 from . import startup
 from .config import Config
 from .pen import LightPen
-from .link import EchoStrip
+from .link import EchoStrip, LinkError
 from .session import MODE_HOST, Session
 
 # ── коды линии ДКС ──────────────────────────────────────────────────────────
@@ -368,7 +368,11 @@ class LiveDriver(Driver):
     def poll(self, timeout: float) -> bytes:
         try:
             data = self.link.recv(timeout=timeout)
-        except (TimeoutError, OSError):
+        except (TimeoutError, OSError, LinkError):
+            # `LinkError` ловится здесь же, а не выше: обход окна
+            # спрашивает линию уже после того, как она закрыта выходом,
+            # и без этой строки Tk печатал трассировку на каждый оборот
+            # (`Exception in Tkinter callback`).
             data = b''
         data = self._echo.strip(data)
         # Ответом считается любой приход данных после нашего запроса

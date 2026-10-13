@@ -50,6 +50,7 @@ from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
 from .console import CELL_H, CELL_W, COLS, RASTER_H, ROWS, Console
 from .emulator import TerminalEmulator
 from .framebuffer import Framebuffer
+from .link import LinkError
 from .panel import Diagnostics, Status
 from .pen import DEFAULT_TOOL, LightPen
 from .reader import CommandStreamReader, EventKind
@@ -159,6 +160,13 @@ class TerminalWindow:
         #: Кадр или состояние изменились — окно пора перерисовать.
         self._dirty = True
         self._clock_at = 0.0
+        #: Фаза мигания курсора: рамка знакоместа гаснет и вспыхивает.
+        self._blink_on = True
+        self._blink_at = 0.0
+        #: Выход идёт: обход линии остановлен, линия закрывается.
+        self._stopping = False
+        #: Сколько раз обход споткнулся — по первому пишем в подвал.
+        self._faults = 0
 
     # ── данные ──────────────────────────────────────────────────────────────
 
@@ -190,11 +198,13 @@ class TerminalWindow:
             text = data.decode('utf-8')
             if any(ord(c) > 0x7F for c in text):
                 self.console.write_text(text.replace('\r', ''))
+                self.wake_cursor()      # ЭВМ пишет — курсор должен гореть
                 self._touch_frame()
                 return
         except UnicodeDecodeError:
             pass
         self.console.write(data)
+        self.wake_cursor()              # ЭВМ пишет — курсор должен гореть
         self._touch_frame()
 
     def _touch_frame(self) -> None:
@@ -326,6 +336,7 @@ class TerminalWindow:
         буфер уходит вместе с концом строки (как по ПЕРЕДАЧА).
         """
         self.console.newline()
+        self.wake_cursor()
         self.last_key = 'ПРПС'
         if self.driver is not None:
             if self.session.mode == 'host':
@@ -345,6 +356,7 @@ class TerminalWindow:
         ЭВМ; в АВТОНОМНО стирается последний знак локального буфера.
         """
         self.console.backspace()
+        self.wake_cursor()
         self.last_key = 'ВК'
         if self.driver is not None:
             if self.session.mode == 'host':
@@ -363,6 +375,7 @@ class TerminalWindow:
         while self.console.col > 0:
             self.console.backspace()
         self.session.reset_buffer()
+        self.wake_cursor()
         self.last_key = 'ESC'
         self._touch_frame()
         self.paint()
@@ -416,6 +429,26 @@ class TerminalWindow:
         row = round((y - fy) / scale) if scale else 0
         return max(0, min(row, SCREEN_HEIGHT - 1))
 
+    def goto_cursor(self, col: int, row: int) -> None:
+        """Поставить курсор и показать его.
+
+        Любое движение курсора начинает фазу мигания заново: иначе
+        нажатая стрелка попадала бы на погасший курсор, и казалось бы,
+        что он не двигается.  Ограничение по экрану делает `Console.goto`.
+        """
+        self.console.goto(col, row)
+        self.wake_cursor()
+
+    def wake_cursor(self) -> None:
+        """Зажечь курсор и начать мигание заново.
+
+        Вызывается при наборе и любом движении: мигающий курсор, погасший
+        на середине набора, читается как «клавиатура не работает».
+        """
+        self._blink_on = True
+        self._blink_at = time.monotonic()
+        self._dirty = True
+
     def _on_click(self, event) -> None:
         """Левая кнопка: перо (если включено) либо курсор в знакомёст."""
         if self.pen.enabled:
@@ -428,7 +461,7 @@ class TerminalWindow:
             self.last_key = 'ПОДВАЛ'          # клик не по кадру
             self.paint()
             return
-        self.console.goto(col, row)
+        self.goto_cursor(col, row)
         self.last_key = 'МЫШЬ'
         self.paint()
 
@@ -578,7 +611,7 @@ class TerminalWindow:
             # Курсор по ячейкам: ↑ вверх по кадру, ← влево.
             dx = {'Left': -1, 'Right': 1}.get(key, 0)
             dy = {'Up': -1, 'Down': 1}.get(key, 0)
-            self.console.goto(self.console.col + dx, self.console.row + dy)
+            self.goto_cursor(self.console.col + dx, self.console.row + dy)
             self.last_key = key
             self.paint()
             return 'break'
@@ -646,13 +679,21 @@ class TerminalWindow:
                 self.driver.send_keys(out.decode('latin-1'))
             self.paint()
             return 'break'
-        if getattr(event, 'state', 0) & 0x4 and ch:   # Ctrl-сочетания
-            low = ch.lower()
-            if low == 'q':
-                self.close()
+        if key in ('F12', 'F11'):              # ВЫХОД
+            self.quit()
+            return 'break'
+        if getattr(event, 'state', 0) & 0x4 and _ctrl_letter(event):
+            # На X11 с Ctrl в `event.char` приходит **управляющий код**
+            # (`Ctrl-q` → `\x11`, `Ctrl-c` → `\x03`), а не буква, поэтому
+            # сочетание опознаётся по `keysym`.  Раньше сравнение шло с
+            # `event.char`, и ни `Ctrl-q`, ни `Ctrl-c` не срабатывали
+            # никогда — выход из терминала был только кнопкой окна.
+            low = _ctrl_letter(event)
+            if low == 'q':                     # ВЫХОД
+                self.quit()
                 return 'break'
             if low == 'c':                     # ЦЕНТР
-                self.console.goto(COLS // 2, ROWS // 2)
+                self.goto_cursor(COLS // 2, ROWS // 2)
             else:
                 return None
             self.last_key = 'УПР-' + low
@@ -661,6 +702,7 @@ class TerminalWindow:
         if ch and ch.isprintable():
             # Набор прямо на экране: знак уходит в линию и рисуется
             # глифом СИМ в позиции курсора (эхо, КОИ-8Р).
+            self.wake_cursor()
             out = self.session.type_key(ch)
             if out and self.driver is not None:
                 self.driver.send_keys(out.decode('latin-1'))
@@ -674,9 +716,38 @@ class TerminalWindow:
 
     def close(self) -> None:
         """Закрыть окно: конец сеанса и линии."""
+        self.quit()
+
+    def quit(self) -> None:
+        """Выход из терминала (`F12`, `Ctrl-q`, кнопка окна).
+
+        Порядок обязателен.  Сначала снимается опрос (`_stopping`) —
+        иначе обход, уже поставленный в очередь Tk, успевает дёрнуть
+        сокет после его закрытия и напечатать трассировку
+        `Exception in Tkinter callback`.  Потом закрывается линия, и
+        только потом окно: `quit()` сам по себе лишь просит Tk выйти из
+        главного цикла, обход успевает дойти до конца.
+
+        `quit_terminal` у `main`/`run_window` делает то же и возвращает
+        код процесса, а `run()` в `finally` закрывает линию на всякий
+        случай — `close` у линии повторный вызов переживает.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
         self.running = False
+        driver, self.driver = self.driver, None
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception as exc:                 # noqa: BLE001
+                # Выход не должен падать из-за линии: окно уже закрываем.
+                logging.getLogger(__name__).debug('close: %s', exc)
         if self._tk is not None:
-            self._tk.quit()
+            try:
+                self._tk.quit()
+            except Exception:                        # noqa: BLE001
+                pass                                 # Tk уже разобран
 
     # ── отрисовка кадра ─────────────────────────────────────────────────────
 
@@ -818,17 +889,31 @@ class TerminalWindow:
         Рамка — часть экрана терминала, но не часть его памяти: на кадре
         её нет, рисуется она при выводе (как на настоящем терминале,
         где курсор — не зажжённая точка).
+
+        Ряды переводятся **тем же** отображением, что и весь кадр
+        (`_blit_scaled`: ряд `y` кадра → ряд `oy + (399 - y) * scale`
+        окна).  Раньше здесь стояла своя формула с `SCREEN_HEIGHT`
+        вместо `SCREEN_HEIGHT - 1` и без общего начала отсчёта, и рамка
+        уезжала на сотни точек: верхний ряд кадра уходил в низ окна.
         """
+        if self._hist_at is not None or not self._blink_on:
+            # В истории на экране чужой кадр, курсор к нему отношения
+            # не имеет — показывать его там нельзя, иначе рамка висит
+            # поверх старой картинки и путает.
+            return
         x0, y0, x1, y1 = self.console.cell_rect()
-        ax0, ay0 = ox + int(x0 * scale), oy + int(round(SCREEN_HEIGHT * scale))
-        ay0 -= int(round((SCREEN_HEIGHT - y1) * scale))
-        ay1 = ay0 + max(1, int(round((y1 - y0) * scale)))
-        ax1 = ox + int(round((x1 + 1) * scale))
-        ex, ey = max(1, int(round(scale))), max(1, int(round(scale)))
-        photo.put(FG, to=(ax0, ay0, ax1, ay0 + ey))
-        photo.put(FG, to=(ax0, ay1 - ey, ax1, ay1))
-        photo.put(FG, to=(ax0, ay0, ax0 + ex, ay1))
-        photo.put(FG, to=(ax1 - ex, ay0, ax1, ay1))
+        th = max(1, int(round(scale)))                 # толщина рамки
+        ay0 = oy + int(round((SCREEN_HEIGHT - 1 - y1) * scale))
+        ay1 = oy + int(round((SCREEN_HEIGHT - 1 - y0) * scale)) + th
+        ax0 = ox + int(round(x0 * scale))
+        ax1 = ox + int(round(x1 * scale)) + th
+        photo.put(FG, to=(ax0, ay0, ax1, ay0 + th))
+        photo.put(FG, to=(ax0, ay1 - th, ax1, ay1))
+        photo.put(FG, to=(ax0, ay0, ax0 + th, ay1))
+        photo.put(FG, to=(ax1 - th, ay0, ax1, ay1))
+        if self.pen.down:                             # прижатое перо
+            photo.put(FG, to=(ax1, ay0, ax1 + th, ay0 + th))
+            photo.put(FG, to=(ax0, ay1, ax0 + th, ay1 + th))
 
     # ── строка состояния и подвал ────────────────────────────────────────────
 
@@ -926,6 +1011,8 @@ class TerminalWindow:
 
     #: Как часто окно опрашивает линию, мс.
     TICK_MS = 50
+    #: Период мигания курсора, мс.
+    CURSOR_BLINK_MS = 500
 
     def run(self) -> int:
         try:
@@ -939,11 +1026,18 @@ class TerminalWindow:
             return 3
         try:
             self.paint()
+            self.running = True
             root.after(self.TICK_MS, self._tick)
             root.mainloop()
         finally:
-            if self.driver is not None:
-                self.driver.close()
+            # Выход по F12/Ctrl-q закрывает линию сам; здесь — страховка
+            # для кнопки окна и для сбоя, когда `quit()` не дошёл.
+            driver, self.driver = self.driver, None
+            if driver is not None:
+                try:
+                    driver.close()
+                except Exception as exc:             # noqa: BLE001
+                    logging.getLogger(__name__).debug('run: %s', exc)
         return 0
 
     def _tick(self) -> None:
@@ -955,18 +1049,67 @@ class TerminalWindow:
         рывками.  Теперь перерисовка идёт только когда изменился кадр
         или состояние (`dirty`), а часы в строке состояния — раз в
         секунду.
+
+        Обход **не может оборваться**: `after` ставится в `finally`, а
+        любая ошибка линии или вывода гасится и показывается в подвале.
+        Иначе один обрыв связи намертво останавливал опрос — Tk печатал
+        трассировку «Exception in Tkinter callback» и больше не
+        перерисовывал окно: терминал зависал с живой картинкой.
         """
-        if not self.running:
+        if not self.running or self._stopping:
             return
-        if self.driver is not None:
-            data = self.driver.poll(0.05)
-            if data:
-                self.feed(data)
-        now = time.monotonic()
-        if self._dirty or now - self._clock_at >= 1.0:
-            self._clock_at = now
-            self.paint()
-        self._tk.after(self.TICK_MS, self._tick)
+        try:
+            if self.driver is not None:
+                data = self.driver.poll(0.05)
+                if data:
+                    self.feed(data)
+            now = time.monotonic()
+            if now - self._blink_at >= self.CURSOR_BLINK_MS / 1000:
+                self._blink_at = now
+                self._blink_on = not self._blink_on
+                self._dirty = True
+            if self._dirty or now - self._clock_at >= 1.0:
+                self._clock_at = now
+                self.paint()
+        except Exception as exc:                     # noqa: BLE001
+            self._note_fault(exc)
+        finally:
+            if self.running and not self._stopping:
+                try:
+                    self._tk.after(self.TICK_MS, self._tick)
+                except Exception:                    # noqa: BLE001
+                    self.running = False             # окно уже разобрано
+
+    def _note_fault(self, exc: BaseException) -> None:
+        """Показать сбой в подвале и один раз отключить линию.
+
+        Обрыв связи — обычное дело (ЭВМ выключили, линия перезапущена), а
+        повторять попытку опроса вслух каждую секунду только шумит.  Ошибка
+        уходит в подвал один раз, дальше терминал живёт: кадр виден, можно
+        рисовать пером и разбирать историю.
+        """
+        self._faults += 1
+        if self._faults > 3:
+            return
+        self.diag.add('сбой: ' + type(exc).__name__ + ' — ' + str(exc)[:60],
+                      'err' if self._faults == 1 else 'warn')
+        self.last_key = 'СБОЙ'
+        if isinstance(exc, (LinkError, OSError)):
+            # Линия мертва — опрос больше не повторяем, но окно остаётся.
+            self.driver = None
+
+
+def _ctrl_letter(event) -> Optional[str]:
+    """Буква сочетания Ctrl+буква в нижнем регистре — или `None`.
+
+    На X11 `event.char` при `Ctrl-q` равен `\x11`, а не `'q'`, поэтому
+    берём `keysym`: он всегда остаётся буквой.  Буквы вне `a…z`
+    (цифры, `F`-клавиши) сочетанием не считаются.
+    """
+    keysym = getattr(event, 'keysym', '') or ''
+    if len(keysym) == 1 and 'a' <= keysym.lower() <= 'z':
+        return keysym.lower()
+    return None
 
 
 def _is_commands(data: bytes) -> bool:
