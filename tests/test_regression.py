@@ -462,6 +462,102 @@ def test_printable_letters_survive_text_rows():
     assert got == exp
 
 
+# ── снятие рамки с рисунка (заставка) ───────────────────────────────────────
+
+def framed(width=560, height=400, box=(8, 1, 554, 398)) -> Framebuffer:
+    """Кадр с прямоугольной рамкой по краям и точкой внутри."""
+    fb = Framebuffer(width, height)
+    x0, y0, x1, y1 = box
+    fb.hline(x0, x1, y0)
+    fb.hline(x0, x1, y1)
+    for y in range(y0, y1 + 1):
+        fb.point(x0, y)
+        fb.point(x1, y)
+    fb.point(width // 2, height // 2)
+    return fb
+
+
+def test_strip_border_removes_rectangle():
+    """Рамка по краям кадра снимается, содержимое остаётся."""
+    fb = framed()
+    # Периметр рамки: две горизонтали и две вертикали без углов дважды.
+    perimeter = 2 * (554 - 8 + 1) + 2 * (398 - 1 + 1) - 4
+    assert fb.count_set() == perimeter + 1
+    assert fb.strip_border(), 'рамка не снята'
+    lit = [(x, y) for y in range(fb.height) for x in range(fb.width)
+           if fb.get(x, y)]
+    assert lit == [(fb.width // 2, fb.height // 2)], \
+        f'после снятия осталось {len(lit)} точек'
+
+
+def test_strip_border_keeps_inner_lines():
+    """Рамка снимается, а черта внутри рисунка остаётся."""
+    fb = framed()
+    fb.hline(100, 400, 200)               # черта поперёк рисунка
+    assert fb.strip_border(), 'рамка не снята'
+    assert sum(fb.get(x, 200) for x in range(fb.width)) == 301, \
+        'внутренняя черта потерялась'
+    for x in (8, 554):
+        assert not any(fb.get(x, y) for y in range(fb.height)), \
+            f'вертикаль рамки x={x} осталась'
+
+
+def test_strip_border_needs_empty_margin():
+    """Рамка, у которой за краем есть рисунок, рамкой не считается."""
+    fb = framed()
+    fb.point(3, 200)                      # точка снаружи рамки
+    assert not fb.strip_border(), 'рамка принята при заполненном поле'
+    assert fb.count_set() > 1000
+
+
+def test_strip_border_on_plain_frame_is_noop():
+    """На кадре без рамки ничего не происходит и это не ошибка."""
+    fb = Framebuffer(560, 400)
+    fb.hline(100, 400, 200)
+    assert not fb.strip_border()
+    assert fb.count_set() == 301
+
+
+def test_strip_border_ignores_open_lines():
+    """Незамкнутые линии рамкой не считаются."""
+    fb = Framebuffer(560, 400)
+    fb.hline(0, 559, 1)
+    fb.hline(0, 559, 398)
+    assert not fb.strip_border(), 'незамкнутые линии приняты за рамку'
+    assert fb.count_set() == 2 * 560
+
+
+def test_kot_splash_has_no_frame():
+    """На заставке с КОТ рамки нет — рисунок отрезан по краям кадра."""
+    from mc7401 import startup
+    from mc7401.window import TerminalWindow
+    from mc7401.config import Config
+    from mc7401.reader import CommandStreamReader, EventKind
+    from mc7401.emulator import TerminalEmulator
+    pic = startup.picture_path('КОТ', prefer_stream=True)
+    emu = TerminalEmulator()
+    reader = CommandStreamReader()
+    reader.feed(Path(pic).read_bytes())
+    reader.close()
+    best, best_n = emu.fb.copy(), 0
+    for ev in reader.pop():
+        if ev.kind is EventKind.VUK_BLOCK:
+            n = emu.fb.count_set()
+            if n > best_n:
+                best, best_n = emu.fb.copy(), n
+        emu.handle_event(ev)
+    assert best_n, 'поток КОТ не разобрался'
+    assert best.strip_border(), 'у КОТ не найдена рамка'
+    # Ни одна сторона прежней рамки не осталась зажжённой.
+    for x in (8, 554):
+        assert not any(best.get(x, y) for y in range(best.height)), \
+            f'вертикаль рамки x={x} осталась'
+    for y in (1, 398):
+        assert not any(best.get(x, y) for x in range(best.width)), \
+            f'горизонталь рамки y={y} осталась'
+    del TerminalWindow, Config
+
+
 # ── связь с БЭСМ-6 по ДКС ─────────────────────────────────────────────────
 
 def test_parse_port_spec_variants():

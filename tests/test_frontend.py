@@ -765,6 +765,7 @@ def test_splash_caption_is_centred_and_above_picture(monkeypatch):
     cap_h = window.CAPTION_ROWS * CELL_H
     art = win._splash_picture(
         startup.picture_path(win.config.splash, prefer_stream=True))
+    art.strip_border()          # рамки нет — сравниваем с тем же рисунком
     lit = lambda f: [y for y in range(f.height)                  # noqa: E731
                      if any(f.get(x, y) for x in range(f.width))]
     art_rows, fb_rows = lit(art), lit(fb)
@@ -772,10 +773,10 @@ def test_splash_caption_is_centred_and_above_picture(monkeypatch):
     # на `cap_h` точек выше, чем в самом рисунке.
     assert min(fb_rows) == min(art_rows) + cap_h, \
         f'рисунок сдвинут на {min(fb_rows) - min(art_rows)} точек'
-    # Сверху рисунок обрезан надписью: она занимает самые верхние ряды.
+    # Надпись занимает самые верхние ряды кадра — над рисунком.
     assert max(fb_rows) > fb.height - cap_h, 'надпись не у верха кадра'
-    assert max(art_rows) - min(art_rows) > fb.height - cap_h, \
-        'рисунок не мог поместиться под надписью целиком'
+    assert max(art_rows) + cap_h <= fb.height, \
+        'рисунок не помещается под надписью'
     # Надпись по центру: на пустом кадре она идёт от своей колонки, а
     # слева от неё до середины — пусто.
     blank = Framebuffer(fb.width, fb.height)

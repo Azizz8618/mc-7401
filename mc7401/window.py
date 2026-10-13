@@ -620,6 +620,10 @@ class TerminalWindow:
         art = self._splash_picture(pic)
         if art is None:
             return None
+        # Часть эталонных рисунков обведена рамкой (КОТ: квадрат в
+        # `graf.pas`).  На заставке она отрезает рисунок от краёв кадра,
+        # поэтому снимается — с копии, сам эталон остаётся как есть.
+        art.strip_border()
         fb = Framebuffer(SCREEN_WIDTH, SCREEN_HEIGHT)
         shift = CAPTION_ROWS * CELL_H
         for y in range(min(art.height, SCREEN_HEIGHT - shift)):

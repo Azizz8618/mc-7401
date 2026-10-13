@@ -251,6 +251,55 @@ class Framebuffer:
                     self._bits[base + i] = cur & ~mask & 0xFF
                     self._count -= bin(dropped).count('1')
 
+    def strip_border(self, cover: float = 0.9) -> bool:
+        """Снять прямоугольную рамку, очерченную почти по краям кадра.
+
+        Некоторые эталонные рисунки обведены рамкой (`graf.pas`, КОТ:
+        `ХLN` по трём сторонам квадрата).  На заставке рамка не нужна —
+        она отрезает рисунок от краёв кадра и читается как граница окна.
+        Сам эталон не трогаем: рамка снимается только на копии, из
+        которой строится заставка.
+
+        Рамкой считается **замкнутый** прямоугольник, у которого стороны
+        зажжены не меньше чем на `cover` длины, а вокруг него поля
+        пусты.  Последнее условие — главное: оно отличает рамку от любой
+        горизонтальной черты внутри рисунка, поэтому содержимое кадра
+        снять нельзя.  Возвращает `True`, если рамка была и снята.
+        """
+        w, h = self.width, self.height
+        need_x = int(w * cover)
+        need_y = int(h * cover)
+        rows = [y for y in range(h)
+                if sum(self.get(x, y) for x in range(w)) >= need_x]
+        cols = [x for x in range(w)
+                if sum(self.get(x, y) for y in range(h)) >= need_y]
+        if len(rows) < 2 or len(cols) < 2:
+            return False
+        top, bottom = rows[0], rows[-1]
+        left, right = cols[0], cols[-1]
+        if right - left < 2 or bottom - top < 2:
+            return False
+        # Стороны замкнуты: каждый ряд между углами зажжён по краям.
+        for y in range(top, bottom + 1):
+            if not self.get(left, y) or not self.get(right, y):
+                return False
+        for x in range(left, right + 1):
+            if not self.get(x, top) or not self.get(x, bottom):
+                return False
+        # Вокруг рамки пусто — иначе это часть рисунка, а не рамка.
+        for y in list(range(top)) + list(range(bottom + 1, h)):
+            if any(self.get(x, y) for x in range(w)):
+                return False
+        for x in list(range(left)) + list(range(right + 1, w)):
+            if any(self.get(x, y) for y in range(h)):
+                return False
+        for y in (top, bottom):
+            self.erase_rows(y, y + 1)
+        for x in (left, right):
+            for y in range(top, bottom + 1):
+                self.apply(x, y, PEN_ERASE)
+        return True
+
     def erase_rows(self, y_from: int, y_to: int) -> None:
         """Стереть точки в рядах `y_from…y_to` (координаты Y вверх).
 
