@@ -1523,10 +1523,14 @@ def test_right_and_middle_buttons_erase(monkeypatch):
 
 def test_click_without_pen_moves_text_cursor(monkeypatch):
     """Без пера левая кнопка ставит текстовый курсор, а не рисует."""
-    win = make_window(monkeypatch)
+    # Окно достаточно большое, чтобы масштаб был больше двух: при
+    # дробном масштабе ниже двух знакомест на экране обратный перевод
+    # может попасть в соседнее знакоместо — это округление, а не сбой.
+    win = make_window(monkeypatch, size=(1600, 1200))
     win.emu.fb.clear()
     win.best, win.best_n = None, 0
     fx, fy, scale = win._frame_geometry()
+    assert scale >= 2, f'масштаб слишком мелкий для проверки: {scale}'
     # `y` кадра считается вверх, а строки консоли — сверху вниз.
     win._on_click(FakeClick(*screen_of(win, fx, fy, scale, 8, 399)))
     assert win.emu.fb.count_set() == 0, 'курсор не должен рисовать'

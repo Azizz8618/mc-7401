@@ -74,6 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help='текстовый интерфейс в консоли (TUI)')
     ap.add_argument('--pen', action='store_true',
                     help='световое перо: мышь рисует линию (с --tui)')
+    ap.add_argument('--no-help', action='store_true', dest='no_help',
+                    help='убрать из подвала ряды-легенды клавиш '
+                         '(как на 15ИЭ): подвал становится ниже, '
+                         'а кадр выше')
     ap.add_argument('--graphics', choices=('auto', 'kitty', 'blocks', 'mono'),
                     default=None,
                     help='показ графики: протокол графики терминала, '
@@ -131,6 +135,10 @@ def main(argv=None) -> int:
 
     from .config import load as load_config
     cfg = load_config(args.conf)
+    if args.no_help:
+        # Легенда клавиш — как `--no-help` на 15ИЭ: подвал без неё ниже
+        # на два ряда, а кадр выше на столько же.
+        cfg.help = False
     # Масштаб выгрузки кадра: у окна он из конфигурации, где 1 — знак
     # ровно 14×16 точек, а картинку удобнее писать вдвое крупнее.
     export_scale = args.scale if args.scale else 2

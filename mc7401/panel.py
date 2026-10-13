@@ -257,9 +257,13 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
     масштаб), плюс специфичные для МС 7401 «последнее нажатие» и
     «набираемая строка» — их больше нигде не видно.
     """
-    def cell(label: str, value: str, style: str = 'state') -> Cell:
-        return mk((label, 'label'), (_short(value, width - len(label) - 1),
-                                     style))
+    def cell(label: str, value: str, style: str = 'state',
+             keep: Optional[int] = None) -> Cell:
+        # `keep` — сколько знакомест значению нужно вопреки ширине
+        # колонки: иначе длинное значение (`≡144 'd'`, «УПР-q») или
+        # целиком уходило в многоточия либо обрезалось по чужой метке.
+        limit = keep if keep is not None else width - len(label) - 1
+        return mk((label, 'label'), (_short(value, limit), style))
 
     return [
         cell('РЖМ=', 'СЭВМ' if st.mode == 'host' else 'АВТО',
@@ -283,8 +287,15 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
         # без префикса «1:» — иначе ячейка подвала обрезает значение.
         cell('МАШ=', f'{float(st.scale):.1f}'.rstrip('0').rstrip('.')),
         cell('БУФ=', str(st.buffer) if st.buffer else '—'),
-        mk(('ПОСЛ', 'label'), (_short(st.last_key, width - 5), 'last')),
-        cell('ВВОД=', st.input_line),
+        # ПОСЛ — широкая ячейка: значение («≡144 'd'», «УПР-q») длиннее
+        # любой колонки, и раньше метка и значение слипались в одно
+        # слово — знака «=» не было, а лимит считался от ширины колонки,
+        # а не от длины метки.  Свой ряд и ширину колонок не задаёт, как
+        # «ПОСЛ: …» на 15ИЭ.
+        wide(('ПОСЛ=', 'label'), (_short(st.last_key, 40), 'last')),
+        wide(('ВВОД=', 'label'),
+             (_short(st.input_line, 40),
+              'local' if st.mode == 'local' else 'state')),
     ]
 
 
@@ -318,26 +329,95 @@ def legend_rows(width: int = COLW) -> list[Cell]:
     ]
 
 
+#: Стиль-маркер широкой ячейки: она всегда занимает свой ряд и **не
+#: задаёт** ширину колонок.  Так в 15ИЭ устроена «ПОСЛ: …»
+#: (`screen.py`, `set_panel(..., wide=[last])`): иначе длинное значение
+#: сжимает всю сетку подвала, а с ней прыгает высота кадра.  Маркер —
+#: обычный стиль ячейки, поэтому `cell_text` и раскладка его видят.
+WIDE = 'wide'
+
+
+def wide(*pairs) -> Cell:
+    """Пометить ячейку как широкую: своя строка, ширину не задаёт."""
+    return tuple(pairs) + (('', WIDE),)
+
+
 def footer(st: Status, *, width: int, help_: bool = True,
-           colw: Optional[int] = None) -> list[Row]:
+           colw: Optional[int] = None,
+           legend_colw: Optional[int] = None,
+           per_row: Optional[int] = None,
+           legend_per_row: Optional[int] = None) -> list[Row]:
     """Подвал целиком: состояния в ровных колонках, черта, легенда.
 
-    Все ряды — и состояния, и легенда — раскладываются по **одному**
-    плану, поэтому границы колонок совпадают в каждом ряду, а черта
-    точно встаёт в границы последней ячейки.
+    Состояния и легенда раскладываются по **разным** планам: у легенды
+    свои ячейки («ОТМЕНА=Ctrl-z»), и диктовать её ширину состояниям незачем
+    — блоки и так разделены чертой.  Внутри каждого блока границы
+    колонок совпадают в каждом ряду.
+
+    `per_row`/`legend_per_row` фиксируют число ячеек в ряду: так можно
+    расширить колонки и не пожертвовать высотой подвала.
     """
     w = colw or COLW
-    rows: list[Row] = list(columns(state_rows(st, w), width, colw=colw))
+    state_pl = plan(width, per_row=per_row, colw=colw)
+    states, wides = _split_wide(state_rows(st, w))
+    rows: list[Row] = list(columns(states, width,
+                                   colw=state_pl.colw,
+                                   per_row=state_pl.per_row))
+    rows.extend(_wide_rows(wides, width))     # широкие — свой ряд
     rows.append([RULE])
     if help_:
-        rows.extend(columns(legend_rows(w), width, colw=colw))
+        lg_pl = plan(width, per_row=legend_per_row, colw=legend_colw)
+        cells, lg_wide = _split_wide(legend_rows(w))
+        for row in columns(cells, width, colw=lg_pl.colw,
+                           per_row=lg_pl.per_row):
+            rows.append(row)
+        rows.extend(_wide_rows(lg_wide, width))
     return rows
 
 
+def _wide_rows(wides: Sequence[Cell], width: int) -> list[Row]:
+    """Разложить широкие ячейки по рядам: **соседние — в один ряд**.
+
+    «ПОСЛ= …» и «ВВОД= …» дополняют друг друга (что нажато и что
+    набрано), и в один ряд помещаются оба; разносить их значило бы
+    отдать кадру лишний ряд подвала.
+    """
+    rows: list[Row] = []
+    cur: Row = []
+    used = 0
+    for cell in wides:
+        w = cell_width(cell)
+        if cur and used + len(SEP) + w > width:
+            rows.append(cur)
+            cur, used = [], 0
+        used += (len(SEP) if cur else 0) + w
+        cur.append(cell)
+    if cur:
+        rows.append(cur)
+    return rows
+
+
+def _split_wide(cells: Sequence[Cell]) -> tuple[list[Cell], list[Cell]]:
+    """Разделить ячейки на обычные и широкие (помеченные `WIDE`).
+
+    Возвращает `(обычные, широкие)`; у широких маркер снят, чтобы
+    `cell_text` и раскладка видели только текст ячейки.
+    """
+    plain: list[Cell] = []
+    wide: list[Cell] = []
+    for c in cells:
+        if any(style == WIDE for _, style in c):
+            wide.append(tuple(t for t in c if t[1] != WIDE))
+        else:
+            plain.append(c)
+    return plain, wide
+
+
 def columns(cells: Sequence[Cell], width: int, *, sep: str = SEP,
-            colw: Optional[int] = None) -> list[Row]:
+            colw: Optional[int] = None,
+            per_row: Optional[int] = None) -> list[Row]:
     """Разложить ячейки в ряды одинаковой ширины (по плану подвала)."""
-    pl = plan(width, colw=colw)
+    pl = plan(width, per_row=per_row, colw=colw)
     if not cells:
         return [[]]
     return [list(cells[i:i + pl.per_row])

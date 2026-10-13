@@ -462,6 +462,77 @@ def test_printable_letters_survive_text_rows():
     assert got == exp
 
 
+# ── текст ОС не должен уходить в разбор графики ─────────────────────────────
+
+@pytest.mark.parametrize('line', [
+    b'KLU4:\r\n', b'KEY:\r\n', b'K:\r\n', b'4103\r\n', b'2530\r\n',
+    b'SVED\r\n', b'KREML\r\n', b'3 zona\r\n', b'* konec\r\n',
+    b'+ plus\r\n', b'0 0 0\r\n', b'] ramka\r\n', b'} smesh\r\n',
+    b'> krug\r\n', b'J nachalo\r\n', b'-n\r\n',
+    b'F AJLY NA SBOJNYH ZONAH:\r\n', b'test b-3, fort\r\n',
+])
+def test_os_text_is_not_taken_for_graphics(line):
+    """Строка выдачи ОС остаётся текстом, даже начинаясь с буквы или цифры.
+
+    Разбор решался по **первому знаку** записи, и текст с ним делился:
+    строка уходила в графику и пропадала.  Под ловушку попадали строки
+    вида `4103`, `2530` и — что важнее — приглашение ввода ключа
+    (`КЛЮЧ:`, `KEY:`): машина спрашивала, на экране ничего не
+    появлялось, и диалог выглядел зависшим.
+    """
+    from mc7401.window import _is_commands
+    assert not _is_commands(line), f'{line!r} принят за графику'
+
+
+def test_key_prompt_reaches_the_screen():
+    """Приглашение ввода ключа доходит до экрана."""
+    from mc7401.console import COLS, ROWS, Console
+    from mc7401.framebuffer import Framebuffer
+    import mc7401.window as W
+    grid = [[' '] * COLS for _ in range(ROWS)]
+    fb = Framebuffer()
+    con = Console(fb)
+    real = Console.put_char
+
+    def put_char(self, ch):
+        if 0 <= self.row < ROWS and 0 <= self.col < COLS:
+            grid[self.row][self.col] = ch
+        real(self, ch)
+    Console.put_char = put_char
+    try:
+        win = W.TerminalWindow(None)
+        win.splash = False
+        win.feed(b'KLU4:\r\n')
+    finally:
+        Console.put_char = real
+    shown = [''.join(row).rstrip() for row in grid if ''.join(row).strip()]
+    assert shown, 'приглашение ключа не дошло до экрана'
+
+
+def test_command_stream_is_still_recognised():
+    """Поток команд терминала опознаётся по рамке ВУК, а не по буквам."""
+    from mc7401.window import _is_commands
+    from mc7401.constants import AR2
+    assert _is_commands(bytes((AR2,)) + b'F')
+    for name in GOLDEN.glob('*.bin'):
+        assert _is_commands(name.read_bytes()), f'{name.name} принят за текст'
+
+
+def test_multiline_listing_is_not_truncated():
+    """Многострочная выдача доходит целиком, построчно пакетами."""
+    import mc7401.window as W
+    lines = [b'fajly na svoih zonah:', b'kra', b'4103', b'2530',
+             b'sved', b'kreml']
+    win = W.TerminalWindow(None)
+    win.splash = False
+    for line in lines:
+        win.feed(line + b'\r\n')
+    # Строки не пропали: каждая увеличила число зажжённых точек.
+    assert win.emu.fb.count_set() > 0
+    for line in lines:
+        assert not W._is_commands(line + b'\r\n'), line
+
+
 # ── снятие рамки с рисунка (заставка) ───────────────────────────────────────
 
 def framed(width=560, height=400, box=(8, 1, 554, 398)) -> Framebuffer:

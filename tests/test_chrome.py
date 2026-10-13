@@ -116,18 +116,21 @@ def test_footer_shows_pen_mode_and_tool_without_ellipsis():
     assert 'ПЕРО=ВЫК' in text
 
 
-def test_footer_stays_five_rows():
-    """Подвал занимает пять рядов: каждый его ряд отнимает у кадра.
+def test_footer_rows_do_not_grow_silently():
+    """Высота подвала не растёт молча: каждый ряд отнимает у кадра.
 
     Добавление ячеек в легенду однажды выросло рядом и ужало кадр на
     десять процентов — это не видно ни в одном снимке, а заметно на
-    глаз.  Рост подвала ловится здесь.
+    глаз.  Сейчас подвал — шесть рядов: пять на состояния, легенду и
+    черту плюс ряд широких ячеек «ПОСЛ= … | ВВОД= …».
     """
     st = make_status()
     st.pen = True
     st.pen_mode = 'выделение'
     rows = chrome.footer_rows(st, help_=True)
-    assert len(rows) == 5, f'подвал вырос до {len(rows)} рядов'
+    assert len(rows) == 6, f'подвал вырос до {len(rows)} рядов'
+    # Без легенды (`--no-help`) подвал на два ряда ниже.
+    assert len(chrome.footer_rows(st, help_=False)) == 4
 
 
 def test_legend_names_pen_mode_and_undo():
