@@ -74,6 +74,20 @@ RASTER_H = GLYPH_H * GLYPH_SCALE
 
 #: Сетка знакомёстов: 70 колонок × 40 строк — складывается с кадром
 #: 560×400 без остатка.
+def _break_pair(prev, cur) -> bool:
+    """Продолжение ли это уже начатого перевода строки?
+
+    `ВК ПС` и `ПС ВК` — один перевод строки в любом порядке: ДКС так
+    закрывает запись каталога (проверено на живой линии, ответ на
+    `КТЛ`).  Раньше поглощалась только пара `ВК ПС`, и `ПС ВК` давал
+    два перевода — между строками выдачи появлялся пустой ряд.
+
+    Удвоение того же знака (`ВК ВК`, `ПС ПС`) — это уже пустая строка,
+    и поглощать его нельзя.
+    """
+    return prev in BREAKS and cur in BREAKS and prev != cur
+
+
 COLS = SCREEN_WIDTH // CELL_W
 ROWS = SCREEN_HEIGHT // CELL_H
 
@@ -102,6 +116,9 @@ def set_glyph_scale(scale: int) -> int:
 CR = 0x0D
 #: Код `ПС` (перевод строки) в потоке данных ЭВМ.
 LF = 0x0A
+#: Знаки, закрывающие строку, — и как коды байтов, и как символы:
+#: `write` идёт по байтам, `write_text` — по знакам.
+BREAKS = (CR, LF, '\r', '\n')
 
 
 def glyph_art(ch: str) -> Optional[tuple[tuple[int, ...], ...]]:
@@ -131,7 +148,6 @@ class Console:
         #: Перо вывода текста (по умолчанию рисующее).
         self.pen = PEN_OR
         #: Виден `ВК` — ждём `ПС` (пара `ВК ПС` — один перевод строки).
-        self._cr_pending = False
 
     # ── позиционирование ─────────────────────────────────────────────────────
 
@@ -191,31 +207,39 @@ class Console:
         (0x0D) тоже завершает строку — ОС Диспак завершает строки `ВК`;
         подряд идущие признаки перевода (`ВК ПС`) считаются одним.
         """
+        prev = 0
         for b in data:
             if b in (CR, LF, ETX):
-                # Пара `ВК ПС` — один перевод строки.
-                if b == LF and self._cr_pending:
-                    self._cr_pending = False
+                # `ВК ПС` и `ПС ВК` — **один** перевод строки, в любом
+                # порядке: ДКС так закрывает запись каталога (проверено
+                # на живой линии, ответ на `КТЛ`).  Раньше поглощалась
+                # только пара `ВК ПС`, и `ПС ВК` давал два перевода —
+                # между строками выдачи появлялся пустой ряд.
+                # Удвоение того же знака (`ВК ВК`, `ПС ПС`) остаётся
+                # двумя переводами — это уже пустая строка.
+                if _break_pair(prev, b):
+                    prev = b
                     continue
-                self._cr_pending = (b == CR)
+                prev = b
                 self.newline()
                 continue
-            self._cr_pending = False
+            prev = 0
             if b < 0x20:
                 continue
             self.put_code(b)
 
     def write_text(self, text: str) -> None:
         """Вывести готовый текст (символы в форме `display_dks`)."""
+        prev = ''
         for ch in text:
             if ch in '\r\n\x03':
-                if ch == '\n' and self._cr_pending:
-                    self._cr_pending = False
+                if _break_pair(prev, ch):
+                    prev = ch
                     continue
-                self._cr_pending = (ch == '\r')
+                prev = ch
                 self.newline()
                 continue
-            self._cr_pending = False
+            prev = ''
             if ch.isprintable():
                 self.put_char(ch)
 

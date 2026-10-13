@@ -135,6 +135,53 @@ def test_write_cr_lf_and_etx():
     assert con.col == 0 and con.row == 4
 
 
+def test_write_lf_cr_is_one_break():
+    """`ПС ВК` — тоже один перевод строки, как `ВК ПС`.
+
+    ДКС закрывает запись каталога парой `ПС ВК` (проверено на живой
+    линии, ответ на `КТЛ`).  Раньше поглощалась только пара `ВК ПС`, и
+    `ПС ВК` давал **два** перевода: между строками выдачи появлялся
+    пустой ряд, и список каталога шёл втрое реже строк.
+    """
+    fb = Framebuffer()
+    con = Console(fb)
+    con.write(b'AB\n\r')                # пара ПС ВК — один перевод
+    assert con.col == 0 and con.row == 1, f'ряд {con.row}, колонка {con.col}'
+    con.write(b'CD\r\n')                # и ВК ПС — тоже один
+    assert con.col == 0 and con.row == 2
+
+
+def test_write_doubled_break_is_a_blank_line():
+    """Удвоение того же знака — пустая строка, и поглощать его нельзя."""
+    fb = Framebuffer()
+    con = Console(fb)
+    con.write(b'A\r\rB')
+    assert con.row == 2, f'ряд {con.row}: удвоение ВК проглочено'
+    con2 = Console(Framebuffer())
+    con2.write(b'A\n\nB')
+    assert con2.row == 2, f'ряд {con2.row}: удвоение ПС проглочено'
+
+
+def test_ktl_listing_rows_are_not_doubled():
+    """Настоящий ответ `КТЛ` занимает ряд на запись, а не три.
+
+    Записи каталога — 71 знак при сетке в 70 знакомест, поэтому запись
+    переносится ещё на один ряд; лишнего пустого ряда между записями
+    быть не должно.
+    """
+    fb = Framebuffer()
+    con = Console(fb)
+    rec = (b'B|CM6   123400    foPgdP  123400    TECT1   123400'
+           b'    KAlxK   123400   ')
+    con.write(rec + b'\n\r')
+    first = con.row
+    con.write(rec + b'\n\r')
+    # Запись переносится (71 знак при 70 колонках) плюс один перевод.
+    assert con.row - first == 2, (
+        f'между записями {con.row - first} ряда, ожидалось два '
+        f'(перенос 71-го знака и один перевод строки)')
+
+
 def test_write_ignores_control_codes():
     fb = Framebuffer()
     con = Console(fb)
