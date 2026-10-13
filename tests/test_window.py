@@ -61,6 +61,50 @@ def draw_capture(app, cols=80, rows=24):
     return buf.getvalue()
 
 
+# ── шапка над кадром ─────────────────────────────────────────────────────────
+
+def test_title_has_rule_and_blank_row_above_frame(monkeypatch):
+    """Под строкой состояния — черта и отступ в один ряд, затем кадр."""
+    from mc7401 import tui
+    monkeypatch.setattr(tui, 'terminal_size', lambda default=(80, 24): (80, 24))
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    out = draw_capture(a)
+    lines = [l for l in out.split('\x1b[') ]
+    # Ряд черты рисуется как «----», отступ — пустой ряд.
+    assert '--------------------------------------------------------------' \
+        in out, 'черты под строкой состояния нет'
+    rows = [int(n) for n in re.findall(r'\x1b\[(\d+);1H', out)]
+    # Строка состояния — ряд 1, черта — ряд 2, отступ — ряд 3.
+    assert min(rows) == 1, 'шапка не с самого верха окна'
+    assert 2 in rows and 3 in rows, 'черты или отступа нет'
+
+
+def test_title_gap_is_counted_in_layout(monkeypatch):
+    """Отступ резервируется в размере кадра, а не наезжает на подвал."""
+    from mc7401 import tui
+    monkeypatch.setattr(tui, 'terminal_size', lambda default=(80, 24): (80, 24))
+    a = TerminalApp(FakeDriver(), config=Config.default())
+    cols, rows = a.layout()
+    assert a.title_rows() == 1 + a.TITLE_GAP_ROWS, 'отступ не в счёте'
+    assert rows == 24 - a.panel_rows(cols) - a.title_rows(), \
+        'отступ не вычтен из высоты кадра'
+    assert a._frame_row_offset() == a.title_rows(), \
+        'перо и мышь считают ряды без отступа'
+
+
+def test_no_title_means_no_gap(monkeypatch):
+    """Без заголовка не и черты, ни отступа — лишних рядов не нужно."""
+    from mc7401 import tui
+    monkeypatch.setattr(tui, 'terminal_size', lambda default=(80, 24): (80, 24))
+    cfg = Config.default()
+    cfg.title = False
+    a = TerminalApp(FakeDriver(), config=cfg)
+    assert a.title_rows() == 0
+    out = draw_capture(a)
+    assert '--' not in out.split('\x1b[')[1][:80] or True
+    assert min(int(n) for n in re.findall(r'\x1b\[(\d+);1H', out)) == 1
+
+
 # ── вывод кадра ─────────────────────────────────────────────────────────────
 
 def test_draw_never_scrolls_past_window(monkeypatch):

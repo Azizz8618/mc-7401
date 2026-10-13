@@ -65,7 +65,7 @@ def test_cols_matches_frame_width():
 
 def test_status_line_fits_narrow_strip():
     """Полоса — 35 знакомест: строка состояния переносится, а не режется."""
-    rows = chrome.status_rows(make_status())
+    rows = chrome.status_text_rows(make_status())
     assert rows, 'строка состояния не пуста'
     for row in rows:
         assert sum(chrome.cell_width(c) + 3 for c in row) - 3 <= chrome.cols()
@@ -78,7 +78,7 @@ def test_status_line_is_not_cut_to_column_width():
     применялась к строке состояния: «13.10 07:52» превращалось в
     «13.10 07:».
     """
-    rows = chrome.status_rows(make_status())
+    rows = chrome.status_text_rows(make_status())
     text = ''.join(chrome.cell_text(c) for row in rows for c in row)
     assert re.search(r'\d\d\.\d\d \d\d:\d\d', text), text
     fb = draw(rows, [])
@@ -100,6 +100,67 @@ def test_footer_columns_are_even():
             xs.append(x)
             x += chrome.cell_width(cell) + len(chrome.SEP) * CELL_W
         assert len(set(xs)) == len(xs), 'колонки налезают друг на друга'
+
+
+def test_status_line_has_rule_and_gap_above_frame():
+    """Под строкой состояния — черта и отступ в один ряд, затем кадр.
+
+    По требованию: «после верхней строки состояния черта, затем отступ
+    в одну строку перед рабочей областью».  Отступ нужен, чтобы верхний
+    ряд кадра не лип к черте.
+    """
+    top = chrome.status_rows(make_status())
+    assert len(top) >= 3, 'нет места под черту и отступ'
+    assert top[-2] == [RULE], 'перед отступом не черта'
+    assert top[-1] == [], 'отступ перед кадром не пустой ряд'
+    # Строка состояния — над чертой, а не после неё.
+    assert all(row and row != [RULE] for row in top[:-2])
+
+
+def test_status_gap_does_not_shrink_the_frame():
+    """Отступ добавляется к полосе, а не отбирается у кадра.
+
+    Кадр остаётся 400 рядами: полоса растёт вверх, и рабочее поле не
+    должно терять ни одного ряда.
+    """
+    st = make_status()
+    top = chrome.status_rows(st)
+    fb = Framebuffer(SCREEN_WIDTH, 400 + chrome.ROW_H * (len(top) + 6))
+    chrome.render(fb, top, chrome.footer_rows(st), frame_height=400)
+    foot, frame_lo, _frame_hi = bands(top, chrome.footer_rows(st))
+    # `bands` отдаёт границы полос: кадр — между подвалом и верхней
+    # полосой, и отбивка добавляется к полосе, а не выедает кадр.
+    assert frame_lo - foot == 400, 'кадр перестал быть 560×400'
+
+
+def test_status_gap_is_drawn_as_blank_row():
+    """Ряд отступа зажжён пустотой, а черта — сплошной заливкой."""
+    st = make_status()
+    top = chrome.status_rows(st)
+    fb = draw(top, [])
+    hi = fb.height
+    # Ряд отступа — самый нижний из верхней полосы.
+    gap_y0 = hi - len(top) * chrome.ROW_H
+    gap_lit = sum(fb.get(x, gap_y0 + dy)
+                  for x in range(SCREEN_WIDTH) for dy in range(chrome.ROW_H))
+    assert gap_lit == 0, f'отступ чем-то заполнен: {gap_lit} точек'
+    # Черта — рядом над ним: сплошная линия в один ряд во всю ширину.
+    rule_y0 = gap_y0 + chrome.ROW_H
+    mid = rule_y0 + chrome.ROW_H // 2
+    assert sum(fb.get(x, mid) for x in range(SCREEN_WIDTH)) == SCREEN_WIDTH, \
+        'черта не сплошная по ширине'
+    for dy in (0, chrome.ROW_H - 1):
+        assert sum(fb.get(x, rule_y0 + dy)
+                   for x in range(SCREEN_WIDTH)) == 0, \
+            'черта зажгла лишний ряд'
+
+
+def test_top_height_accounts_for_gap():
+    """Высота верхней полосы включает черту и отступ."""
+    st = make_status()
+    top = chrome.status_rows(st)
+    assert chrome.top_height(top) == len(top) * chrome.ROW_H
+    assert chrome.top_height(top) > chrome.top_height(chrome.status_text_rows(st))
 
 
 # ── отрисовка ─────────────────────────────────────────────────────────────
