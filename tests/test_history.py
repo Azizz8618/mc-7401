@@ -399,3 +399,34 @@ def test_top_bits_and_from_bits_round_trip():
     assert fb.top_bits(10) == fb.top_bits(10)[:700]
     assert len(fb.top_bits(10)) == 700
     assert fb.top_bits(0) == b''
+
+
+def test_cursor_hidden_while_scrolling_back(monkeypatch):
+    """При листании истории рамки курсора на экране нет.
+
+    Окно сдвинуто, а рамка осталась бы на месте прежнего курсора —
+    поверх чужой выдачи.  У курсора к истории никакого отношения нет, как
+    и при показе кадра из истории `F5`.
+    """
+    from test_frontend import FakePhoto
+
+    win = make_window(monkeypatch)
+    fill(win.console, 80)
+    win._touch_frame()
+    win._blink_on = True
+
+    def cursor_sides():
+        """Сколько сторон рамки курсора выведено — у рамки их четыре."""
+        photo = FakePhoto()
+        win._cursor_frame_scaled(photo, 0, 0, 1.0)
+        return len(photo.puts)
+
+    assert cursor_sides() == 4, 'у живого кадра курсор не виден'
+    win.scroll_display(-4)
+    assert win.hist.position == 4
+    assert cursor_sides() == 0, 'рамка курсора висит поверх истории'
+    # И на кадре из истории `F5 ОЧИСТКА` курсор тоже не рисуется.
+    win.scroll_display(4)
+    win.clear_screen()
+    win._hist_at = 0
+    assert cursor_sides() == 0, 'рамка курсора на кадре из истории'
