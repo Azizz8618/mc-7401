@@ -47,8 +47,8 @@ from . import chrome
 from . import console as console_mod
 from . import startup
 from .constants import PEN_XOR, SCREEN_HEIGHT, SCREEN_WIDTH
-from .console import (CELL_H, CELL_W, COLS, RASTER_H, ROWS, Console,
-                      put_glyph)
+from .console import (COLS, ROWS, STEP_H, STEP_W, Console, cell_x,
+                      cell_y, put_glyph)
 from .emulator import TerminalEmulator
 from .framebuffer import Framebuffer
 from .history import DEFAULT_LIMIT as DEFAULT_HISTORY, History
@@ -273,10 +273,53 @@ class TerminalWindow:
         canvas.bind('<MouseWheel>', self._on_wheel)
         canvas.bind('<Button-4>', lambda e: self._wheel_step(-1))
         canvas.bind('<Button-5>', lambda e: self._wheel_step(1))
+        # Холст забирает клавиатурный фокус: события клавиш приходят
+        # **виджету под курсором мыши**, а не окну, поэтому без явного
+        # `takefocus` холст фокуса не получал и первое нажатие (`PgUp`,
+        # `PgDn`, любая буква) уходило мимо обработчика.  `takefocus=1`
+        # включает холст в цепочку фокуса клавиатуры (Tab), а
+        # `focus_set` внизу отдаёт ему фокус сразу при открытии окна.
+        canvas.configure(takefocus=1)
+        canvas.bind('<FocusIn>', lambda e: None)
 
         root.bind('<Key>', self._on_key)
+        # Возврат фокуса терминалу при каждом нажатии клавиши мыши.
+        # Оконный менеджер (WM) нередко отдаёт фокус сразу после
+        # `override-redirect`/`fullscreen` — терминал терял клавиатуру,
+        # и PgUp/PgDn с набором переставали работать до щелчка мышью.
+        # Здесь терминал берёт фокус на себя всякий раз, когда окно
+        # получает фокус, а холст — когда по нему кликнули.
+        # `add='+'` обязателен: обычный `bind` заменил бы уже привязанные
+        # `_on_click`/`_on_middle`/`_on_right`, и клики перестали бы
+        # работать вовсе.
+        for button in ('<Button-1>', '<Button-2>', '<Button-3>'):
+            canvas.bind(button, self._take_focus, add='+')
+        root.bind('<FocusIn>', lambda e: self._take_focus(), add='+')
         root.protocol('WM_DELETE_WINDOW', self.close)
+        # Фокус холсту сразу при открытии: иначе первое нажатие уходит
+        # мимо (см. выше).  `focus_force` вместо `focus_set` — он
+        # работает и когда окно ещё не получило фокус от WM.
+        try:
+            root.update_idletasks()
+            canvas.focus_force()
+        except Exception:                            # pragma: no cover
+            pass
         return root
+
+    def _take_focus(self, event=None) -> None:
+        """Отдать клавиатурный фокус холсту терминала.
+
+        Привязана к нажатию кнопки мыши и к `FocusIn` окна **дополнительно**
+        (`add='+'`), поэтому выполняется после основного обработчика и
+        ничего не заменяет.
+        """
+        canvas = self._canvas
+        if canvas is None:
+            return
+        try:
+            canvas.focus_set()
+        except Exception:                            # pragma: no cover
+            pass
 
     def _maximize(self, root) -> bool:
         """Развернуть окно на весь экран.
@@ -491,8 +534,8 @@ class TerminalWindow:
             self._pen_down(event, button=1)
             return
         fx, _, scale = self._frame_geometry()
-        col = max(0, round((event.x - fx) / scale) // CELL_W) if scale else 0
-        row = self._frame_row_img(event.y) // CELL_H
+        col = max(0, round((event.x - fx) / scale) // STEP_W) if scale else 0
+        row = self._frame_row_img(event.y) // STEP_H
         if self._in_chrome(event.y):
             self.last_key = 'ПОДВАЛ'          # клик не по кадру
             self.paint()
@@ -555,8 +598,8 @@ class TerminalWindow:
         fx, fy, scale = self._frame_geometry()
         if not scale:
             return None, None
-        col = round((event.x - fx) / scale) // CELL_W
-        row = self._frame_row_img(event.y) // CELL_H
+        col = round((event.x - fx) / scale) // STEP_W
+        row = self._frame_row_img(event.y) // STEP_H
         if not 0 <= col < COLS or not 0 <= row < ROWS:
             return None, None
         if self._in_chrome(event.y):
@@ -577,8 +620,8 @@ class TerminalWindow:
         # Координата уточняется всегда — перекрестье показывает пиксель,
         # а не знакоместо; перерисовка только при смене знакоместа, иначе
         # движение мыши перерисовывало бы кадр чаще, чем он меняется.
-        cell = (x // CELL_W, y // CELL_H)
-        moved = cell != (self.pen.x // CELL_W, self.pen.y // CELL_H)
+        cell = (x // STEP_W, y // STEP_H)
+        moved = cell != (self.pen.x // STEP_W, self.pen.y // STEP_H)
         self.pen.x, self.pen.y = x, y
         if moved:
             self.paint()
@@ -776,7 +819,7 @@ class TerminalWindow:
         # поэтому снимается — с копии, сам эталон остаётся как есть.
         art.strip_border()
         fb = Framebuffer(SCREEN_WIDTH, SCREEN_HEIGHT)
-        shift = CAPTION_ROWS * CELL_H
+        shift = CAPTION_ROWS * STEP_H
         for y in range(min(art.height, SCREEN_HEIGHT - shift)):
             for x0, x1 in art.row_runs(y):
                 fb.set_span(x0, shift + y, x1)
@@ -814,16 +857,17 @@ class TerminalWindow:
         """Написать надпись заставки — по центру верхних рядов кадра.
 
         Знаки берутся из ПЗУ, как весь остальной текст в кадре: одна
-        типографика на весь экран.  `Y` вверх, поэтому верхний ряд кадра —
-        это `fb.height - CELL_H`.
+        типографика на весь экран.  Позиции — по той же сетке, что и у
+        консоли (`cell_x`/`cell_y`), иначе при масштабе знака 2 и больше
+        надпись встала бы между знакоместами.
         """
         text = self.SPLASH_CAPTION
-        col = max(0, (fb.width // CELL_W - len(text)) // 2)
-        top_y = fb.height - CAPTION_ROWS * CELL_H
+        col = max(0, (COLS - len(text)) // 2)
+        top_y = cell_y(CAPTION_ROWS - 1)
         for n, ch in enumerate(text):
-            if col + n >= fb.width // CELL_W:
+            if col + n >= COLS:
                 break
-            put_glyph(fb, (col + n) * CELL_W, top_y + CELL_H, ch, 'OR')
+            put_glyph(fb, cell_x(col + n), top_y, ch, 'OR')
 
     # ── отмена действия (АВТОНОМНО) ─────────────────────────────────────────
 

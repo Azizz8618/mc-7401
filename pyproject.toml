@@ -265,6 +265,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# Корень проекта — первым в `sys.path`.  Без этого pytest брал пакет
+# `mc7401` из site-packages (установленная копия), а не рабочее дерево:
+# проверки молча шли против **старой** версии и падали на новых
+# величинах (`STEP_H` и подобных), выдавая это за дефект правки.
+pythonpath = ["."]
 
 # Показываем все свойства в diff.
 addopts = [

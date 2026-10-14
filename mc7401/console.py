@@ -59,12 +59,16 @@ GLYPH_SCALE = 1
 #: Допустимые размеры знака текстового слоя.
 GLYPH_MIN, GLYPH_MAX = 1, 4
 
-#: Шаг знакоместа: растер знака, увеличенный в `GLYPH_SCALE` раз, плюс
-#: зазор в `GLYPH_SCALE` точек по горизонтали и `2 * GLYPH_SCALE` по
-#: вертикали (при растре 1:1 — 1 и 2, как и рисует текст сам терминал:
-#: исторический шаг строки `9` равен `chars.text_advance` =
-#: `GLYPH_W * size + 1`).  Без зазора растры слипаются: «М», «Б» и «Н»
-#: в ПЗУ занимают все семь точек по ширине.
+#: Знакомест: растр знака, увеличенный в `GLYPH_SCALE` раз, плюс зазор
+#: в `GLYPH_SCALE` точек по горизонтали и `2 * GLYPH_SCALE` по вертикали
+#: (при растре 1:1 — 1 и 2, как и рисует текст сам терминал: исторический
+#: шаг строки `9` равен `chars.text_advance` = `GLYPH_W * size + 1`).
+#: Без зазора растры слипаются: «М», «Б» и «Н» в ПЗУ занимают все семь
+#: точек по ширине.
+#:
+#: Это **растр знака вместе с его зазором**, но ещё не шаг сетки: при
+#: масштабе 3 и 4 кадр 560×400 не делится на знакомест нацело, и шаг
+#: приходится брать делителем кадра — `STEP_W`/`STEP_H`.
 CELL_W = GLYPH_W * GLYPH_SCALE + GLYPH_SCALE        # 8
 CELL_H = GLYPH_H * GLYPH_SCALE + 2 * GLYPH_SCALE    # 10
 
@@ -91,15 +95,80 @@ def _break_pair(prev, cur) -> bool:
 COLS = SCREEN_WIDTH // CELL_W
 ROWS = SCREEN_HEIGHT // CELL_H
 
+#: Добавка к знакоместу, вписывающая сетку в кадр нацело.  При масштабе
+#: 1 и 2 кадр делится на знакомест без остатка и добавка нулевая; при 3
+#: и 4 знакомест кадр не делит (560 = 20×24 + 80), и шаг берётся
+#: делителем кадра — знаки встают с большим зазором, но ряды выравниваются
+#: и автоскролл не ломает раскладку.  Пересчитывается в `set_glyph_scale`.
+GRID_X = 0
+GRID_Y = 0
+
+#: Сетка **равномерная** (зазор одинаков у всех знакомест), поэтому эти
+#: величины всегда нулевые.  Оставлены как явное «неравномерности нет»:
+#: попытка раздать неделимый остаток только последним знакоместам
+#: ломала автоскролл — сдвинуть кадр вверх можно только на целое
+#: число точек, а строки стояли с разным шагом.
+GRID_LAST_X = 0
+GRID_LAST_Y = 0
+
+#: Шаг сетки — знакомест вместе с добавкой `GRID_X`/`GRID_Y`.  Равен
+#: `CELL_W`/`CELL_H`, пока кадр делится на знакомест нацело (масштаб 1 и 2).
+#: Именно шагом, а не знакоместом, отмеряются позиции (`cell_x`, `cell_y`).
+STEP_W = CELL_W
+STEP_H = CELL_H
+
+#: Таблица «растр знака → знак»; заполняется при первом разборе и
+#: сбрасывается при смене масштаба (см. `set_glyph_scale`).
+_GLYPH_KEYS: Optional[dict[bytes, str]] = None
+
+
+def _invalidate_glyph_table() -> None:
+    """Сбросить кэш таблицы знаков — она привязана к масштабу."""
+    global _GLYPH_KEYS
+    _GLYPH_KEYS = None
+
+
+def _grid_step(total: int, low: int) -> int:
+    """Наименьший делитель `total`, не меньший `low`.
+
+    Таким шагом кадр делится на сетку нацело, и автоскролл (сдвиг на
+    целое число точек) не ломает раскладку: чем мельче шаг, тем больше
+    знаков влезает в кадр.
+    """
+    for d in range(low, total + 1):
+        if total % d == 0:
+            return d
+    return total
+
 
 def set_glyph_scale(scale: int) -> int:
     """Установить размер знака текстового слоя и пересчитать сетку.
 
-    Значение приводится к 1…4.  Пересчитываются шаг знакоместа, размер
-    растра и число колонок и строк кадра: от них зависят и консоль, и
-    служебные строки окна (`chrome`) — они выводятся тем же знаком.
+    Значение приводится к 1…4.  Пересчитываются размер знакоместа, размер
+    растра, **шаг сетки** и число колонок и строк кадра: от них зависят и
+    консоль, и служебные строки окна (`chrome`) — они выводятся тем же
+    знаком.
+
+    Сетка **равномерная и делит кадр нацело**.  Это обязательное условие
+    для автоскролла: кадр уводится вверх на целое число точек, и при
+    неделимом шаге строки съезжают — при масштабе 3 знакомест 24×30, а
+    560×400 на него не делится (23×24 = 552, 13×30 = 390), и ряды
+    расходились уже после первого автоскролла.  Поэтому шаг берётся
+    **делителем кадра**, не меньше знакоместа:
+
+    | масштаб | знакомест | шаг сетки | сетка    |
+    |---------|-----------|-----------|----------|
+    | 1       | 8×10      | 8×10      | 70×40    |
+    | 2       | 16×20     | 16×20     | 35×20    |
+    | 3       | 24×30     | 28×40     | 20×10    |
+    | 4       | 32×40     | 35×40     | 16×10    |
+
+    При 3 и 4 знаки встают с увеличенным зазором (`GRID_X`/`GRID_Y`),
+    но каждый ряд стоит на своём месте, и листание истории склеивается
+    ровно.
     """
     global GLYPH_SCALE, CELL_W, CELL_H, RASTER_W, RASTER_H, COLS, ROWS
+    global GRID_X, GRID_Y, GRID_LAST_X, GRID_LAST_Y, STEP_W, STEP_H
     GLYPH_SCALE = max(GLYPH_MIN, min(GLYPH_MAX, int(scale)))
     # Зазор масштабируется вместе со знаком: одна точка на ряд знака по
     # горизонтали и две по вертикали — при растре 1:1 это знакомест 8×10
@@ -108,8 +177,22 @@ def set_glyph_scale(scale: int) -> int:
     CELL_H = GLYPH_H * GLYPH_SCALE + 2 * GLYPH_SCALE
     RASTER_W = GLYPH_W * GLYPH_SCALE
     RASTER_H = GLYPH_H * GLYPH_SCALE
-    COLS = max(1, SCREEN_WIDTH // CELL_W)
-    ROWS = max(1, SCREEN_HEIGHT // CELL_H)
+    # Шаг — делитель кадра не меньше знакоместа: так сетка вписывается
+    # нацело и автоскролл (сдвиг на целое число точек) не ломает её.
+    STEP_W = _grid_step(SCREEN_WIDTH, CELL_W)
+    STEP_H = _grid_step(SCREEN_HEIGHT, CELL_H)
+    GRID_X = STEP_W - CELL_W          # зазор, добавленный к знакоместу
+    GRID_Y = STEP_H - CELL_H
+    COLS = max(1, SCREEN_WIDTH // STEP_W)
+    ROWS = max(1, SCREEN_HEIGHT // STEP_H)
+    GRID_LAST_X = 0                    # сетка равномерна: всем одинаково
+    GRID_LAST_Y = 0
+    # Таблица знаков обратного чтения (`_glyph_table`) кэшивается ради
+    # скорости, а её ключи — биты растра, то есть **масштаб знака**:
+    # при 1:1 и 2:1 они разные.  Оставив таблицу прежнего масштаба, мы
+    # читали бы кадр, записанный новым, по чужим эталонам — и весь текст,
+    # включая историю выдачи, не читался бы вовсе.  Сбрасываем при смене.
+    _invalidate_glyph_table()
     return GLYPH_SCALE
 
 #: Код `ВК` (возврат каретки) в потоке данных ЭВМ.
@@ -119,6 +202,19 @@ LF = 0x0A
 #: Знаки, закрывающие строку, — и как коды байтов, и как символы:
 #: `write` идёт по байтам, `write_text` — по знакам.
 BREAKS = (CR, LF, '\r', '\n')
+
+
+def cell_x(col: int) -> int:
+    """X левого края знакоместа столбца `col`."""
+    return col * STEP_W
+
+
+def cell_y(row: int) -> int:
+    """Y нижнего края знакоместа ряда `row` (снизу, `Y` вверх).
+
+    Ряд 0 — верх экрана, поэтому `y` считается от нижней кромки.
+    """
+    return (ROWS - 1 - row) * STEP_H
 
 
 def glyph_art(ch: str) -> Optional[tuple[tuple[int, ...], ...]]:
@@ -177,14 +273,18 @@ class Console:
                   row: Optional[int] = None) -> tuple[int, int, int, int]:
         """Прямоугольник растра знака в знакоместе `(x0, y0, x1, y1)`.
 
-        Знакомест — шаг `CELL_W × CELL_H` (16×20); растр знака
+        Знакомест — шаг `CELL_W + GRID_X` по X и `CELL_H + GRID_Y` по Y
+        (при масштабе 1 это 8×10, при 2 — 16×20); растр знака
         `RASTER_W × RASTER_H` (14×16) лежит в его левом нижнем углу,
-        справа и сверху остаётся зазор.  Координаты Y — вверх.
+        справа и сверху остаётся зазор.  Добавки `GRID_X`/`GRID_Y`
+        вписывают сетку в кадр нацело, и без них последний ряд и
+        последний столбец уезжали бы за край (см. `set_glyph_scale`).
+        Координаты Y — вверх.
         """
         c = self.col if col is None else col
         r = self.row if row is None else row
-        x0 = c * CELL_W
-        y0 = (ROWS - 1 - r) * CELL_H
+        x0 = cell_x(c)
+        y0 = cell_y(r)
         return x0, y0, x0 + RASTER_W - 1, y0 + RASTER_H - 1
 
     def cursor_pixels(self) -> tuple[int, int]:
@@ -295,7 +395,11 @@ class Console:
         self.pending_wrap = False
         self.row += 1
         if self.row >= ROWS:
-            gone = self.fb.scroll_up(CELL_H)
+            # Сдвиг на **шаг сетки** `STEP_H`: столько точек занимает
+            # ряд целиком.  Кадр делится на сетку нацело (см.
+            # `set_glyph_scale`), поэтому сдвиг не оставляет зазора и
+            # ряды не съезжают после автоскролла.
+            gone = self.fb.scroll_up(STEP_H)
             self.row = ROWS - 1
             if self.history is not None:
                 self.history.push_line(gone)
@@ -368,9 +472,6 @@ def _alphabet() -> tuple:
 
 ALPHABET = _alphabet()
 
-#: Таблица «растр знака → знак»; заполняется при первом разборе.
-_GLYPH_KEYS: Optional[dict[bytes, str]] = None
-
 
 def _glyph_table() -> dict:
     """Ключ растра знака → сам знак.
@@ -383,12 +484,9 @@ def _glyph_table() -> dict:
     global _GLYPH_KEYS
     if _GLYPH_KEYS is not None:
         return _GLYPH_KEYS
-    step = GLYPH_W + GLYPH_SCALE
     table: dict[bytes, str] = {}
     for ch in ALPHABET:
-        fb = Framebuffer(step * GLYPH_SCALE, GLYPH_H * GLYPH_SCALE)
-        put_glyph(fb, 0, 0, ch, PEN_OR)
-        key = b''.join(fb.row_bytes(y) for y in range(GLYPH_H * GLYPH_SCALE))
+        key = _glyph_key(ch)
         table.setdefault(key, ch)
     _GLYPH_KEYS = table
     return table
@@ -403,13 +501,17 @@ def read_row(fb: Framebuffer, y0: int, cols: Optional[int] = None,
     даёт `blank`.  Нужен для показа истории выдачи и для проверок.
     """
     table = _glyph_table()
-    step = (GLYPH_W + GLYPH_SCALE) * GLYPH_SCALE
-    cols = cols or max(0, fb.width // step)
-    height = GLYPH_H * GLYPH_SCALE
+    # Знаки читаются **по тем же позициям, по каким пишет `cell_rect`**:
+    # формула `(GLYPH_W + GLYPH_SCALE) * GLYPH_SCALE` совпадает со
+    # знакоместом только при `GLYPH_SCALE = 1` (8 = 8), а при 2 даёт
+    # 18 вместо 16 — знаки читались со сдвигом, и при
+    # `[terminal] glyph = 2` весь текст на кадре, включая историю
+    # выдачи, не читался вовсе.
+    height = RASTER_H
     out = []
-    for col in range(cols):
-        x0 = col * step
-        key = b''.join(_row_bits(fb, y0 + dy, x0, step)
+    for col in range(cols or COLS):
+        x0 = cell_x(col)
+        key = b''.join(_row_bits(fb, y0 + dy, x0, RASTER_W)
                        for dy in range(height))
         out.append(table.get(key, blank))
     return ''.join(out)
@@ -422,6 +524,61 @@ def _row_bits(fb: Framebuffer, y: int, x0: int, step: int) -> bytes:
         if fb.get(x0 + u, y):
             out[u >> 3] |= 1 << (7 - (u & 7))
     return bytes(out)
+
+
+def _glyph_key(ch: str) -> bytes:
+    """Ключ знака в таблице обратного чтения: биты растра.
+
+    Растр рисуется **тем же** `put_glyph`, что и кадр, и читается той же
+    `_row_bits`, что `read_row`, — иначе ключ таблицы и ключ чтения
+    разойдутся (разный порядок рядов или разный сдвиг битов), и ни один
+    знак не найдётся: текст на кадре будет пустым.
+
+    Кадр для этого не годится: `Framebuffer` требует ширину, кратную
+    восьми, а растр знака 7×scale такой не является, и биты по строкам
+    съезжают.  Поэтому знак рисуется в буфер битов, а ключ снимается
+    с него же.
+    """
+    rows = _blank_bits()
+    _put_glyph_bits(rows, ch)
+    return b''.join(rows)
+
+
+def _blank_bits() -> list[bytearray]:
+    """Пустой растр знака: `RASTER_H` рядов по `RASTER_W` бит.
+
+    Тот же формат, что у `_row_bits`, — на него строятся ключи таблицы
+    знаков.
+    """
+    nbytes = (RASTER_W + 7) // 8
+    return [bytearray(nbytes) for _ in range(RASTER_H)]
+
+
+def _put_glyph_bits(rows: list[bytearray], ch: str) -> None:
+    """Нарисовать знак в буфер `_blank_bits` — растр, как на кадре.
+
+    Ряды нумеруются **снизу** (как в кадре, `Y` вверх), строки растра
+    идут сверху вниз — так же, как в `put_glyph`.  Порядок обязан
+    совпадать с `_row_bits`, читающим кадр.
+    """
+    mat = glyph_art(ch)
+    if mat is None:
+        return
+    n = GLYPH_SCALE
+    for v, row in enumerate(mat):
+        for dy in range(n):
+            # Та же формула ряда, что в `put_glyph`: строка растра `v`
+            # идёт сверху вниз, а ряд нумеруется снизу вверх.
+            bits = rows[(GLYPH_H - 1 - v) * n + dy]
+            for u in range(GLYPH_W):
+                if not row[u]:
+                    continue
+                x0 = u * n
+                for dx in range(n):
+                    x = x0 + dx
+                    # Тот же бит, что ставит `_row_bits`: старший бит
+                    # байта — самая левая точка.
+                    bits[x >> 3] |= 1 << (7 - (x & 7))
 
 
 def put_glyph(fb: Framebuffer, x0: int, y0: int, ch: str,
@@ -457,4 +614,8 @@ def put_glyph(fb: Framebuffer, x0: int, y0: int, ch: str,
 
 
 __all__ = ['Console', 'CELL_H', 'CELL_W', 'RASTER_H', 'RASTER_W',
-           'GLYPH_SCALE', 'COLS', 'ROWS', 'CR', 'LF', 'glyph_art', 'put_glyph']
+           'GLYPH_SCALE', 'COLS', 'ROWS', 'CR', 'LF', 'glyph_art', 'put_glyph',
+           # Шаг сетки и позиции знакомест: по ним ставится текст, рисуется
+           # заставка и ловится щелчок мышью.  Шире знакоместа, когда кадр
+           # не делится на него нацело (масштаб знака 3 и 4).
+           'STEP_H', 'STEP_W', 'cell_x', 'cell_y', 'set_glyph_scale']

@@ -993,12 +993,16 @@ def test_splash_shows_caption_and_picture(monkeypatch):
     assert fb is not None, 'заставка не собралась'
     # Рисунок на месте: поток КОТ зажигает десятки тысяч точек.
     assert fb.count_set() > 5000, f'рисунок не нарисован: {fb.count_set()} точек'
-    # Подпись — в верхних рядах, над рисунком.
+    # Подпись — в верхних рядах, над рисунком.  Стоит она по сетке
+    # консоли (`cell_y`), поэтому сверху может быть пустой ряд отбивки:
+    # зажигать надо тот ряд, где надпись стоит на самом деле.
     caption = win.SPLASH_CAPTION
     assert caption == 'ДИСПЛЕЙ ЭЛЕКТРОНИКА МС-7401'
-    top = sum(fb.get(x, fb.height - 1 - dy)
+    from mc7401 import console as console_mod
+    cap_y = console_mod.cell_y(window.CAPTION_ROWS - 1)
+    lit = sum(fb.get(x, cap_y + dy)
               for x in range(fb.width) for dy in range(RASTER_H))
-    assert top > 100, f'надпись не зажжена: {top} точек'
+    assert lit > 100, f'надпись не зажжена: {lit} точек на ряду {cap_y}'
 
 
 def test_splash_caption_is_centred_and_above_picture(monkeypatch):
@@ -1714,3 +1718,151 @@ def test_blit_band_matches_the_formula(monkeypatch, band):
                      clip=(1600, 1000))
     assert photo.puts == _formula_puts(fb, 0, 20, 1.42, y_from=y_from,
                                        y_to=y_to, clip=(1600, 1000))
+
+
+# ── клавиатурный фокус окна (живой Tk) ───────────────────────────────────────
+
+#: Сколько знаков набирать в живое окно.  Больше трёх экранов — чтобы
+#: история была глубже окна и листание уходило за пределы кадра.
+LIVE_LINES = 400
+
+
+def _live_window(lines=LIVE_LINES):
+    """Настоящее окно Tk с заполненной историей.
+
+    `None`, если дисплея нет.  Масштаб знака приводится к умолчанию: он
+    глобальный (`console.set_glyph_scale`), и проверки ниже считают ряды
+    окна по нему — при чужом масштабе сетка была бы другой, и тест падал
+    бы в зависимости от порядка запуска.
+    """
+    import tkinter as tk
+    from mc7401 import window as win_mod
+    from mc7401 import console as console_mod
+    try:
+        root = tk.Tk()
+    except Exception:                                # нет дисплея
+        return None, None
+    console_mod.set_glyph_scale(1)
+    win = win_mod.TerminalWindow(None, scale=0, demo=True)
+    try:
+        root.destroy()
+        root = win.build()
+    except Exception:                                # нет Tk на месте
+        return None, None
+    win.fullscreen = False
+    root.geometry('1200x900')
+    win.paint()
+    win.dismiss_splash()
+    for i in range(1, lines):
+        win.console.write(f' stroka {i:03d}'.encode('latin-1') + b'\r\n')
+    win._touch_frame()
+    win.paint()
+    return win, root
+
+
+def test_window_takes_keyboard_focus_on_open():
+    """Открытое окно терминала сразу забирает клавиатурный фокус.
+
+    События клавиш Tk доставляет **виджету под фокусом**, а не окну: без
+    явного `focus_force` на холсте первое нажатие (`PgUp`, `PgDn`, любая
+    буква) уходило мимо обработчика, и листание истории «не работало»,
+    пока оператор не кликнет мышью.  Проверка на живом Tk — фейк фокуса не
+    поймал бы именно эту ошибку.
+    """
+    win, root = _live_window()
+    if win is None:
+        pytest.skip('нет дисплея Tk')
+    try:
+        assert root.focus_get() is win._canvas, (
+            'фокус не у холста терминала — клавиши уйдут мимо')
+    finally:
+        win.quit()
+        root.destroy()
+
+
+def test_page_up_works_on_first_press():
+    """`PgUp` листает историю **с первого** нажатия, без щелчка мышью."""
+    win, root = _live_window()
+    if win is None:
+        pytest.skip('нет дисплея Tk')
+    try:
+        win.hist.back = 0
+        root.update()
+        root.event_generate('<KeyPress>', keysym='Prior', when='now')
+        root.update()
+        assert win.hist.position == win.page_step(), (
+            f'первое PgUp не сработало: назад {win.hist.position}')
+    finally:
+        win.quit()
+        root.destroy()
+
+
+def test_page_down_returns_to_the_frame():
+    """`PgDn` возвращает окно к живому кадру."""
+    win, root = _live_window()
+    if win is None:
+        pytest.skip('нет дисплея Tk')
+    try:
+        for _ in range(2):
+            root.event_generate('<KeyPress>', keysym='Prior', when='now')
+            root.update()
+        back = win.hist.position
+        assert back, 'PgUp не отошёл назад'
+        while win.hist.position:
+            root.event_generate('<KeyPress>', keysym='Next', when='now')
+            root.update()
+        assert win.hist.position == 0, 'PgDn не вернул окно к кадру'
+        assert win.shown_frame() is not None
+    finally:
+        win.quit()
+        root.destroy()
+
+
+def test_mouse_click_still_draws_cursor_after_focus_fix():
+    """Возврат фокуса по клику не затирает обработчик самого клика.
+
+    `_take_focus` привязана к кнопкам **дополнительно** (`add='+'`):
+    обычный `bind` заменил бы `_on_click`/`_on_middle`/`_on_right`, и клики
+    перестали бы работать вовсе.
+    """
+    win, root = _live_window()
+    if win is None:
+        pytest.skip('нет дисплея Tk')
+    try:
+        win.goto_cursor(0, 0)
+        win._canvas.event_generate('<Button-1>', x=200, y=400, when='now')
+        root.update()
+        assert (win.console.col, win.console.row) != (0, 0), (
+            'клик мышью перестал двигать курсор')
+        assert win.last_key in ('МЫШЬ', 'ПОДВАЛ'), win.last_key
+    finally:
+        win.quit()
+        root.destroy()
+
+
+def test_history_view_seam_is_smooth_on_live_window():
+    """На живом окне стык истории и кадра непрерывен при листании."""
+    win, root = _live_window()
+    if win is None:
+        pytest.skip('нет дисплея Tk')
+    try:
+        from mc7401.console import read_row
+        for keysym, expect_back in (('Prior', True), ('Next', False)):
+            root.event_generate('<KeyPress>', keysym=keysym, when='now')
+            root.update()
+            if expect_back:
+                assert win.hist.position, 'PgUp не сработало'
+            view = win.shown_frame()
+            assert view is not None
+            nums = []
+            for n in range(ROWS):
+                text = read_row(view, (ROWS - 1 - n) * CELL_H).strip()
+                nums.append(int(text.split()[1])
+                            if text.startswith('СТРОКА') else None)
+            filled = [x for x in nums if x is not None]
+            assert filled, 'окно листания пустое'
+            gaps = [(a, b) for a, b in zip(filled, filled[1:]) if b != a + 1]
+            assert not gaps, f'разрыв в склейке: {gaps}'
+    finally:
+        win.quit()
+        root.destroy()

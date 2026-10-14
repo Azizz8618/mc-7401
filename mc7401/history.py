@@ -44,7 +44,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .console import CELL_H, read_row
+from . import console as con
+from .console import read_row
+
+#: Шаг знакоместа по вертикали берётся из `console` при каждом обращении
+#: (`con.CELL_H`), а не импортируется значением: `set_glyph_scale`
+#: переприсваивает глобалы `console` уже **после** загрузки этого модуля
+#: (окно вызывает его в `__init__` по `[terminal] glyph`).  Импорт
+#: значением оставлял бы здесь сетку прежнего масштаба — и окно листания
+#: собиралось бы по неверным рядам: склейка истории с кадром рассыпалась
+#: бы при `glyph = 2`.
 
 #: Глубина истории по умолчанию — как в эталоне 15ИЭ.
 DEFAULT_LIMIT = 1000
@@ -164,17 +173,26 @@ class History:
         """
         if not self.lines or self.back <= 0 or frame is None:
             return None
-        rows = rows or frame.height // CELL_H
+        rows = rows or frame.height // con.STEP_H
         k = self.back
         n = len(self.lines)
         from .framebuffer import Framebuffer
-        # Окно — общий поток «история, затем кадр».  Скроллив назад на `k`
+        # Окно — общий поток «история, затем кадр».  Скроллив назад на `k»
         # строк, нижняя строка окна стоит на `k` строк выше низа кадра,
         # то есть поток кончается на позиции `n + кадр - k`.
-        start = n + (frame.height // CELL_H) - k - rows
+        frame_rows = frame.height // con.STEP_H
+        start = n + frame_rows - k - rows
         first = max(0, start)               # ниже начала истории пусто
         from_hist = max(0, min(rows, n - start))     # строк истории в окне
-        top = frame.top_bits(rows - from_hist)       # столько кадра снизу
+        # **Ровно столько точек кадра, сколько нужно на оставшиеся
+        # текстовые ряды окна.**  `top_bits` берёт *точечные* ряды, а
+        # `rows` и `from_hist` — *текстовые*: без умножения на шаг
+        # знакоместа кадр обрезался во столько раз, каков шаг, — при
+        # листании на страницу в окно попадало 12 % кадра, а остальное
+        # заливалось нулями.  Из-за этого и виделась «смазанная склейка»:
+        # история шла подряд, а под ней вместо кадра — пустота, и стык
+        # читался как разрыв.
+        top = frame.top_bits((rows - from_hist) * con.STEP_H)
         if (self._cache is not None and self._cache[0] == k
                 and self._cache[1] == top):
             return self._cache[2]
@@ -184,7 +202,7 @@ class History:
                  for p in range(first, first + from_hist)]
         parts.append(top)
         data = b''.join(parts)
-        pad = rows * CELL_H * (frame.width // 8) - len(data)
+        pad = rows * con.STEP_H * (frame.width // 8) - len(data)
         view = Framebuffer.from_bits(frame.width, frame.height,
                                      data + bytes(pad) if pad > 0 else data)
         self._cache = (k, top, view)
@@ -201,7 +219,7 @@ class History:
         out = []
         for line in self.lines:
             width = len(line[0]) * 8
-            fb = Framebuffer(width, CELL_H)
+            fb = Framebuffer(width, con.STEP_H)
             for dy, row in enumerate(line):
                 fb.put_row_bytes(dy, row)
             out.append(read_row(fb, 0).rstrip())

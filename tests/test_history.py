@@ -141,6 +141,59 @@ def test_view_shows_history_above_the_frame():
     assert rows[3] == read_row(fb, (ROWS - 1) * CELL_H).rstrip()
 
 
+def test_view_fills_the_whole_window_no_seam():
+    """Окно листания заполнено целиком: стык истории и кадра без разрыва.
+
+    `top_bits` берёт **точечные** ряды, а `rows`/`from_hist` — **текстовые**.
+    Без умножения на `CELL_H` кадр обрезался в `CELL_H` раз: при листании
+    на страницу в окно попадало 12 % кадра, остальное заливалось нулями —
+    и «смазанная склейка» была видна как пустота под последней строкой
+    истории.  Проверка идёт по всем рядам окна: ни пустых, ни разрывов.
+
+    Масштаб знака приводится к умолчанию: `CELL_H`/`ROWS` — глобальные
+    величины `console`, и при чужом масштабе проверка считала бы ряды по
+    другой сетке (падало бы в зависимости от порядка запуска тестов).
+    """
+    import mc7401.console as console_mod
+    saved = console_mod.GLYPH_SCALE
+    console_mod.set_glyph_scale(1)
+    try:
+        fb, con, hist = frame_with_history(4 * ROWS + 40)
+        for back in (1, 2, 3, 5, 20, ROWS - 1, ROWS, ROWS + 1, 2 * ROWS):
+            hist.back = back
+            view = hist.view(fb)
+            assert view is not None, back
+            nums = []
+            for n in range(ROWS):
+                text = read_row(view, (ROWS - 1 - n) * CELL_H).strip()
+                nums.append(int(text.split()[1])
+                            if text.startswith('СТРОКА') else None)
+            # Рядов ровно столько, сколько в кадре: окно не обрезано.
+            assert None not in nums, f'back={back}: пустой ряд в окне'
+            # Склейка плавная: номера идут подряд, без повторов и разрывов.
+            gaps = [(i, a, b) for i, (a, b) in enumerate(zip(nums, nums[1:]))
+                    if b != a + 1]
+            assert not gaps, f'back={back}: разрыв в склейке {gaps}'
+    finally:
+        console_mod.set_glyph_scale(saved)
+
+
+def test_view_top_takes_whole_text_rows():
+    """Из кадра в окно берётся ровно столько точек, сколько нужно рядов."""
+    fb, con, hist = frame_with_history(200)
+    stride = fb.width // 8
+    for back in (1, 5, 20, ROWS - 1):
+        hist.back = back
+        n = len(hist.lines)
+        start = n + ROWS - back - ROWS
+        from_hist = max(0, min(ROWS, n - start))
+        want_rows = ROWS - from_hist
+        got = len(fb.top_bits(want_rows * CELL_H))
+        assert got == want_rows * CELL_H * stride, (
+            f'back={back}: взято {got} байт вместо '
+            f'{want_rows * CELL_H * stride}')
+
+
 def test_view_is_none_at_the_frame_or_without_history():
     """У кадра окно листания не собирается."""
     fb, con, hist = frame_with_history(80)

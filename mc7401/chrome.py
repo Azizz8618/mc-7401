@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .console import CELL_H, CELL_W, put_glyph
+from .console import CELL_H, CELL_W, STEP_W, put_glyph
 from .constants import PEN_OR, SCREEN_WIDTH
 from .framebuffer import Framebuffer
 from .panel import (Cell, Diagnostics, Row, RULE, SEP, Status, cell_text,
@@ -68,7 +68,7 @@ def cols() -> int:
     Считается на лету: размер знака задаётся настройкой `[terminal] glyph`
     (`console.set_glyph_scale`), и полоса обязана с ним совпадать.
     """
-    return max(1, SCREEN_WIDTH // CELL_W)
+    return max(1, SCREEN_WIDTH // STEP_W)
 
 
 # ── содержимое ─────────────────────────────────────────────────────────────
@@ -207,24 +207,24 @@ def _row(fb: Framebuffer, row: Row, y0: int, *, pad: bool) -> None:
         for x in range(fb.width):
             fb.apply(x, y0 + ROW_H // 2, PEN_OR)
         return
-    pl = plan(fb.width // CELL_W, colw=CELL_COLS)
+    pl = plan(fb.width // STEP_W, colw=CELL_COLS)
     # Ширину ячейки обрезает только подвал: у колонок она общая, а в
     # строке состояния ячейки идут впритык и «13.10 07:52» не должно
     # превращаться в «13.10 07:».
-    limit = pl.colw if pad else fb.width // CELL_W
+    limit = pl.colw if pad else fb.width // STEP_W
     x = 0
     for n, cell in enumerate(row):
         if n:
             _sep(fb, x, y0)
-            x += len(SEP) * CELL_W
+            x += len(SEP) * STEP_W
         text = cell_text(cell)[:limit]
         for ch in text:
             if x >= fb.width:
                 break
             put_glyph(fb, x, y0, ch, PEN_OR)
-            x += CELL_W
+            x += STEP_W
         if pad:
-            x += max(0, pl.colw - len(text)) * CELL_W
+            x += max(0, pl.colw - len(text)) * STEP_W
 
 
 def _sep(fb: Framebuffer, x: int, y0: int) -> None:

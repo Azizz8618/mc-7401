@@ -11,15 +11,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mc7401.console import (CELL_H, CELL_W, COLS, GLYPH_MAX,           # noqa: E402
                             GLYPH_MIN, GLYPH_SCALE, RASTER_H, RASTER_W,
-                            ROWS, Console, set_glyph_scale)
+                            ROWS, STEP_H, STEP_W, Console, set_glyph_scale)
 
 #: Умолчание модуля: тест на перебор размеров обязан вернуть именно его.
 _DEFAULT_GLYPH_SCALE = GLYPH_SCALE
-from mc7401.constants import GLYPH_H, GLYPH_W, VK               # noqa: E402
+from mc7401.constants import (GLYPH_H, GLYPH_W, SCREEN_HEIGHT,      # noqa: E402
+                             SCREEN_WIDTH, VK)
 from mc7401.framebuffer import Framebuffer                      # noqa: E402
 from mc7401.parser import CommandParser, Op                     # noqa: E402
 
@@ -92,20 +95,99 @@ def test_screen_glyph_size_follows_the_window():
 
 
 def test_glyph_scale_is_configurable():
-    """`[terminal] glyph` меняет и знак, и сетку кадра (1…4)."""
+    """`[terminal] glyph` меняет и знак, и сетку кадра (1…4).
+
+    Сетка обязана **делить кадр нацело**: автоскролл уводит кадр
+    вверх на целое число точек, и при неделимом шаге (24×30 при 3)
+    ряды съезжали бы уже после первого автоскролла.  Поэтому при
+    масштабе 3 и 4 шаг подбирается делителем кадра — 28×40 и 35×40,
+    и сетка выходит 20×10 и 16×10.
+    """
     import mc7401.console as con
     try:
-        for scale, cols, rows in ((1, 70, 40), (2, 35, 20), (3, 23, 13)):
+        for scale, cols, rows in ((1, 70, 40), (2, 35, 20),
+                                  (3, 20, 10), (4, 16, 10)):
             assert set_glyph_scale(scale) == scale
             assert con.GLYPH_SCALE == scale
             assert con.RASTER_W == GLYPH_W * scale
-            assert (con.COLS, con.ROWS) == (cols, rows)
+            assert (con.COLS, con.ROWS) == (cols, rows), \
+                f'масштаб {scale}: сетка {con.COLS}x{con.ROWS}'
+            # Кадр делится на сетку без остатка — иначе автоскролл
+            # оставляет зазор и ряды съезжают.
+            assert (con.COLS * con.STEP_W == SCREEN_WIDTH
+                    and con.ROWS * con.STEP_H == SCREEN_HEIGHT), (
+                f'масштаб {scale}: сетка {con.COLS}x{con.ROWS} '
+                f'не делит кадр {con.COLS * con.STEP_W}x'
+                f'{con.ROWS * con.STEP_H}')
         assert set_glyph_scale(0) == GLYPH_MIN, 'слишком малый — крайнний'
         assert set_glyph_scale(99) == GLYPH_MAX, 'слишком большой — крайнний'
     finally:
         # Вернуть умолчание модуля, а не число из проверки: иначе тесты
         # после этого считают сетку по чужому масштабу.
         set_glyph_scale(_DEFAULT_GLYPH_SCALE)
+
+
+@pytest.mark.parametrize('scale', [1, 2, 3, 4])
+def test_grid_rows_survive_autoscroll(scale):
+    """После автоскролла ряды стоят на своих местах, при любом масштабе.
+
+    Кадр уводится вверх на целое число точек — на `STEP_H`.  Пока шаг
+    не делил кадр (24×30 при масштабе 3, 560×400 не делится), строки
+    съезжали одна на полторы, и нижние ряды кадра пустели уже после
+    нескольких строк выдачи.
+    """
+    import mc7401.console as con
+    saved = con.GLYPH_SCALE
+    try:
+        set_glyph_scale(scale)
+        fb = Framebuffer()
+        con_obj = Console(fb)
+        # Строк больше, чем рядов, — чтобы прошёл автоскролл.  Каждая
+        # строка пишется текстом **без** хвостового перевода: `ПС` после
+        # последней строки увёл бы курсор за нижний край на пустой ряд.
+        for i in range(1, con.ROWS + 5):
+            con_obj.write(f' s{i:03d}'.encode('latin-1'))
+            if i < con.ROWS + 4:
+                con_obj.write(b'\r\n')
+        # Каждая строка должна читаться в своём ряду, без пропусков.
+        # На кадре латинская `s` рисуется знаком СИМ «С» (омоглиф), и
+        # `read_row` отдаёт именно его — это и сверяем.
+        nums = []
+        for row in range(con.ROWS):
+            text = con.read_row(fb, con.cell_y(row)).strip()
+            if text.startswith('С') and text[1:2].isdigit():
+                nums.append(int(text[1:]))
+        # После автоскролла заполнены все ряды подряд: съехавшей была бы
+        # строка, потерявшая место, — её и ищем пропуском в нумерации.
+        assert len(nums) == con.ROWS, (
+            f'масштаб {scale}: заполнено {len(nums)} рядов из {con.ROWS}')
+        assert nums == list(range(nums[0], nums[0] + len(nums))), (
+            f'масштаб {scale}: ряды съехали: {nums}')
+    finally:
+        set_glyph_scale(saved)
+
+
+@pytest.mark.parametrize('scale', [1, 2, 3, 4])
+def test_read_row_matches_what_was_written(scale):
+    """Знак, записанный на кадр, читается обратно тем же знаком.
+
+    Ключи таблицы и `read_row` обязаны строиться одинаково; иначе при
+    `[terminal] glyph = 2` и больше весь текст на кадре — включая
+    историю выдачи — не читался бы вовсе.
+    """
+    import mc7401.console as con
+    saved = con.GLYPH_SCALE
+    try:
+        set_glyph_scale(scale)
+        fb = Framebuffer()
+        text = 'СТРОКА 123'
+        for n, ch in enumerate(text):
+            con.put_glyph(fb, n * con.STEP_W, 0, ch)
+        cols = min(len(text), con.COLS)
+        got = con.read_row(fb, 0, cols)
+        assert got == text[:cols], f'масштаб {scale}: прочитано {got!r}'
+    finally:
+        set_glyph_scale(saved)
 
 
 # ── вывод текста ────────────────────────────────────────────────────────────
