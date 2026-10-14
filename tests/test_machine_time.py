@@ -249,3 +249,53 @@ def test_status_line_falls_back_to_computer_time_when_off(monkeypatch):
     line = ' '.join(win._status_lines())
     assert 'КОМП' in line, line
     assert 'ВРЕМЯ' not in line and '13.10' not in line, line
+
+
+def _screen(win):
+    """Всё, что на кадре, одной строкой — как это видит оператор."""
+    from mc7401 import console as con
+    return ' '.join(con.read_row(win.emu.fb, con.cell_y(r)).strip()
+                    for r in range(con.ROWS)).strip()
+
+
+def test_manual_directive_answer_is_shown_when_polling_is_off(monkeypatch):
+    """`ВРЕ`, набранное оператором, выводится на экран как обычный текст.
+
+    Прятать ответ на вопрос, который задал человек, незачем: он и ждёт
+    его увидеть.  Маскируется только то, что терминал спросил сам.
+    """
+    win, _ = _window(monkeypatch)
+    assert not win.mclock.enabled
+    win.feed(LIVE_REPLY)
+    assert 'ВРЕМЯ' in _screen(win) or 'BPEM' in _screen(win), _screen(win)
+    # И время ЭВМ при этом появляется в строке состояния.
+    assert win.mclock.known
+    assert '13.10 22:06' in ' '.join(win._status_lines())
+
+
+def test_polled_answer_is_masked_when_polling_is_on(monkeypatch):
+    """Ответ на собственный запрос терминала на экран не попадает.
+
+    Этот шум создал терминал, и прятать его — его дело: иначе строка
+    `ВРЕ ДАТА:…` мигает в выдаче задачи каждые `POLL_SECONDS`.
+    """
+    win, _ = _window(monkeypatch, machine_time=True)
+    win.emu.fb.clear()
+    win.feed(LIVE_REPLY)
+    assert 'ВРЕМЯ' not in _screen(win), _screen(win)
+    assert win.mclock.known, 'время ЭВМ должно быть разобрано и здесь'
+    assert '13.10 22:06' in ' '.join(win._status_lines())
+
+
+def test_masking_does_not_swallow_ordinary_output(monkeypatch):
+    """Обычный текст идёт на экран при любом положении выключателя."""
+    from mc7401.chars import display_dks
+    for polling in (False, True):
+        win, _ = _window(monkeypatch, machine_time=polling)
+        win.emu.fb.clear()
+        win.feed(b'OBRAZEC\r\n')
+        shown = _screen(win)
+        assert 'OBRAZEC' in shown.replace(' ', ''), (
+            f'machine_time={polling}: обычный текст не дошёл до экрана, '
+            f'на экране {shown!r}')
+        assert display_dks(0x4F) == 'O'
