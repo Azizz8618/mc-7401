@@ -12,13 +12,19 @@ from datetime import datetime
 from pathlib import Path
 
 from .constants import SCREEN_HEIGHT, SCREEN_WIDTH
+from .version import VERSION, short as version_short
 
 MODEL = 'Электроника МС 7401'
+
+#: Версия эмулятора на заставке — под моделью.  Знаки ПЗУ СИМ не знают
+#: точки как знака версии, поэтому метка пишется как `вер. 1-1-0`.
+VERSION_LINE = f'  эмулятор {version_short()}'
 
 TITLE_LINES = [
     '',
     f'  {MODEL}',
     f'  растровый графический терминал  {SCREEN_WIDTH}×{SCREEN_HEIGHT}',
+    VERSION_LINE,
     '',
 ]
 
@@ -89,5 +95,5 @@ def hint_text() -> str:
             '↑↓←→ сдвиг  + - масштаб')
 
 
-__all__ = ['MODEL', 'build', 'hint_text', 'TITLE_LINES',
-           'WELCOME', 'picture_path', 'DEFAULT_PICTURE']
+__all__ = ['MODEL', 'VERSION', 'VERSION_LINE', 'build', 'hint_text',
+           'TITLE_LINES', 'WELCOME', 'picture_path', 'DEFAULT_PICTURE']

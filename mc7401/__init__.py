@@ -33,8 +33,7 @@ from .emulator import TerminalEmulator, TerminalState, Window
 from .framebuffer import Framebuffer
 from .parser import Command, CommandParser, Op
 from .reader import CommandStreamReader, Event, EventKind
-
-__version__ = "1.0.0"
+from .version import VERSION as __version__
 
 __all__ = [
     'AR2', 'S0', 'S1', 'VK',

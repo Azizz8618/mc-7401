@@ -16,6 +16,10 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# Версия пакета читается из `mc7401/version.py` (`[project] dynamic`).
+[tool.setuptools.dynamic]
+version = {attr = "mc7401.version.VERSION"}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Метаданные пакета
@@ -23,7 +27,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mc7401-emulator"
-version = "1.0.0"
+# Версия берётся из `mc7401/version.py` — единственного источника.
+# Дублировать число здесь было бы значит забыть обновить одно из двух:
+# пакет собирался бы со старой версией, а программа показывала бы новую.
+dynamic = ["version"]
 description = "Эмулятор растрового графического терминала «Электроника МС 7401»"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -47,7 +47,7 @@ from . import chrome
 from . import console as console_mod
 from . import startup
 from .constants import PEN_XOR, SCREEN_HEIGHT, SCREEN_WIDTH
-from .console import (COLS, ROWS, STEP_H, STEP_W, Console, cell_x,
+from .console import (COLS, ROWS, RASTER_H, STEP_H, STEP_W, Console, cell_x,
                       cell_y, put_glyph)
 from .emulator import TerminalEmulator
 from .framebuffer import Framebuffer
@@ -59,6 +59,7 @@ from .reader import CommandStreamReader, EventKind
 from .select import Selection
 from .session import MODE_LOCAL, Session
 from .undo import LIMIT as DEFAULT_UNDO, Undo
+from .version import short as version_short, window_title
 
 log = logging.getLogger('mc7401.window')
 
@@ -242,7 +243,7 @@ class TerminalWindow:
     def build(self):
         import tkinter as tk
         root = tk.Tk()
-        root.title(startup.MODEL)
+        root.title(window_title())
         root.configure(bg=BG)
         self._tk = root
         if self.fullscreen:
@@ -853,6 +854,12 @@ class TerminalWindow:
     #: Подпись заставки — по требованию: надпись «ДИСПЛЕЙ …» над рисунком.
     SPLASH_CAPTION = 'ДИСПЛЕЙ ЭЛЕКТРОНИКА МС-7401'
 
+    #: Версия эмулятора под надписью.  Без неё по снимку экрана не
+    #: отличить новую сборку от старой: заставка одна и та же, а правки
+    #: в выводе не видно.  Точку в номере ПЗУ не рисует — метка идёт
+    #: через дефис.
+    SPLASH_VERSION = f'эмулятор {version_short()}'
+
     def _splash_caption(self, fb: Framebuffer) -> None:
         """Написать надпись заставки — по центру верхних рядов кадра.
 
@@ -860,14 +867,26 @@ class TerminalWindow:
         типографика на весь экран.  Позиции — по той же сетке, что и у
         консоли (`cell_x`/`cell_y`), иначе при масштабе знака 2 и больше
         надпись встала бы между знакоместами.
+
+        Перед выводом надпись **затирает своё место**: рисунок сдвинут
+        вверх и уходит под неё, и без затирания между знаками оставался
+        бы рисунок — надпись читалась бы рвано, а версия эмулятора тем
+        более (цифры тонкие).
         """
-        text = self.SPLASH_CAPTION
-        col = max(0, (COLS - len(text)) // 2)
-        top_y = cell_y(CAPTION_ROWS - 1)
-        for n, ch in enumerate(text):
-            if col + n >= COLS:
+        top_row = CAPTION_ROWS - 1
+        for row in range(min(2, CAPTION_ROWS)):
+            y0 = cell_y(top_row - row)
+            fb.erase_rows(y0, y0 + RASTER_H)
+        for row, text in ((0, self.SPLASH_CAPTION),
+                          (1, self.SPLASH_VERSION)):
+            if row >= CAPTION_ROWS:
                 break
-            put_glyph(fb, cell_x(col + n), top_y, ch, 'OR')
+            col = max(0, (COLS - len(text)) // 2)
+            y = cell_y(CAPTION_ROWS - 1 - row)
+            for n, ch in enumerate(text):
+                if col + n >= COLS:
+                    break
+                put_glyph(fb, cell_x(col + n), y, ch, 'OR')
 
     # ── отмена действия (АВТОНОМНО) ─────────────────────────────────────────
 
@@ -1535,8 +1554,10 @@ class TerminalWindow:
 
 
 #: Сколько рядов кадра занимает надпись заставки — рисунок начинается под
-#: ней.  Два ряда: надпись и пустой ряд под ней, как на заставке 15ИЭ.
-CAPTION_ROWS = 2
+#: ней.  Три ряда: надпись, версия эмулятора и пустой ряд под ними, как на
+#: заставке 15ИЭ.  Версия нужна, чтобы по экрану было видно, какая сборка
+#: запущена.
+CAPTION_ROWS = 3
 
 #: Значения `[display] splash`, при которых заставки нет.
 NO_SPLASH = ('none', '-', 'нет', 'off')

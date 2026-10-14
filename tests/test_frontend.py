@@ -1866,3 +1866,80 @@ def test_history_view_seam_is_smooth_on_live_window():
     finally:
         win.quit()
         root.destroy()
+
+
+# ── версия эмулятора ────────────────────────────────────────────────────────
+
+def test_version_is_a_single_source():
+    """Номер версии объявлен один раз — в `mc7401.version`.
+
+    Дублировать его в `pyproject.toml` было бы значит забыть обновить
+    одно из двух: пакет собирался бы со старой версией, а программа
+    показывала бы новую.
+    """
+    import re
+    import mc7401
+    from mc7401 import version
+    assert version.VERSION == mc7401.__version__
+    assert re.fullmatch(r'\d+\.\d+\.\d+', version.VERSION), version.VERSION
+    # `pyproject.toml` не должен хранить число рядом с описанием пакета.
+    root = Path(__file__).resolve().parent.parent
+    text = (root / 'pyproject.toml').read_text(encoding='utf-8')
+    assert 'dynamic = ["version"]' in text, 'версия не читается из модуля'
+    assert re.search(r'^version\s*=\s*"', text, re.M) is None, \
+        'в pyproject.toml версия объявлена вручную'
+
+
+def test_window_title_carries_the_version():
+    """Заголовок окна содержит версию — её видно в панели задач."""
+    from mc7401 import version
+    title = version.window_title()
+    assert version.VERSION in title, title
+    assert 'МС 7401' in title, 'в заголовке потерялась модель терминала'
+
+
+def test_splash_shows_the_version(monkeypatch):
+    """Заставка кадра называет версию: по снимку экрана видно сборку.
+
+    Рисунок сдвинут под надписью, и без затирания цифры версии читались
+    бы поверх него рвано — поэтому надпись стирает своё место.
+    """
+    from mc7401 import console as console_mod
+    from mc7401 import version
+    win = splash_window(monkeypatch)
+    fb = win.splash_frame()
+    assert fb is not None, 'заставка не собралась'
+    # Версия стоит вторым рядом под надписью, знаками ПЗУ.
+    y = console_mod.cell_y(window.CAPTION_ROWS - 2)
+    text = console_mod.read_row(fb, y).strip()
+    assert 'эмулятор' in text, f'версии нет на заставке: {text!r}'
+    # Номер на заставке — из того же источника, что и в заголовке окна.
+    assert version.short().split()[-1] in text, (
+        f'номер версии не читается: {text!r}')
+
+
+def test_splash_caption_clears_its_rows(monkeypatch):
+    """Надпись и версия затирают своё место — рисунка под ними не остаётся.
+
+    Иначе рисунок проглядывал бы между знаками, и надпись читалась бы
+    рвано; для версии с тонкими цифрами это особенно заметно.
+    """
+    from mc7401 import console as console_mod
+    win = splash_window(monkeypatch)
+    fb = win.splash_frame()
+    assert fb is not None
+    # В каждом знакоместе надписи может быть только знак ПЗУ: биты,
+    # выпадающие из таблицы знаков, принадлежат рисунку.
+    for row in (0, 1):
+        y = console_mod.cell_y(window.CAPTION_ROWS - 1 - row)
+        outside = 0
+        col = max(0, (console_mod.COLS - len(win.SPLASH_CAPTION)) // 2)
+        for n in range(console_mod.COLS):
+            if col <= n < col + len(win.SPLASH_CAPTION):
+                continue
+            x0 = console_mod.cell_x(n)
+            for dy in range(console_mod.RASTER_H):
+                outside += sum(fb.get(x0 + u, y + dy)
+                               for u in range(console_mod.RASTER_W))
+        assert outside == 0, (
+            f'рисунок остался под надписью в ряду {row}: {outside} точек')
