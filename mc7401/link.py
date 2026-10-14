@@ -649,16 +649,38 @@ class TerminalSession:
         #: строки на ДКС — ПР, а ETX для линии — просто знак.
         self.eol = eol
 
-    def send_keys(self, text: str, *, eol: Optional[int] = None) -> None:
+    def send_keys(self, text: str, *, eol: Optional[int] = None,
+                  set_name: Optional[str] = None) -> None:
         """Отправить ввод с клавиатуры (ДКС сам делает эхо).
 
-        Линия ДКС семибитная (КОИ-7): знаки кодируются по правилам 15ИЭ
-        (`chars.encode_input`), а не КОИ-8Р — русские буквы идут в строку
-        `0x60…0x7E`.  В конец добавляется символ конца строки (`self.eol`,
+        Текст кодируется по правилам 15ИЭ (`chars.encode_input`) в наборе
+        `set_name` (по умолчанию — набор ввода сеанса, Н2/КОИ-7): русские
+        буквы идут в строку `0x60…0x7E`, строчная латинная — заглавной.
+        В конец добавляется символ конца строки (`self.eol`,
         настраивается `[line] eol`); `eol=0` — не добавлять.
+
+        Набранное сеансом (`session.type_key`/`send`) сюда **не** берут:
+        оно уже покодировано, и повторное кодирование искажает знаки —
+        для отправки готовых байт есть `send_bytes`.
         """
         code = self.eol if eol is None else eol
-        data = chars.encode_input(text)
+        data = chars.encode_input(text, set_name=set_name or chars.INPUT_SET)
+        if code and not data.endswith(bytes((code,))):
+            data += bytes((code,))
+        self.link.send(data)
+
+    def send_bytes(self, data: bytes, *, eol: Optional[int] = None) -> None:
+        """Отправить **уже покодированные** байты ввода.
+
+        Сеанс кодирует знаки сам (`chars.encode_input` по набору ввода),
+        и линия должна получить ровно их.  Раньше байты проходили через
+        `send_keys` строкой latin-1 и кодировались второй раз: русская
+        «с» (0x73 в Н2) доходила до ЭВМ как `0xD3`, а там уже как `S` —
+        команда ОС Диспак уходила в никуда.
+        """
+        if not data:
+            return
+        code = self.eol if eol is None else eol
         if code and not data.endswith(bytes((code,))):
             data += bytes((code,))
         self.link.send(data)

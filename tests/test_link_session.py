@@ -183,7 +183,7 @@ def koi7(text: str) -> bytes:
     """
     out = bytearray()
     for ch in text:
-        ru = chars.RUS7.find(ch.upper())
+        ru = chars.RUS8.find(ch.upper())
         if ru >= 0:
             out.append(0x60 + ru)
         elif ch.isalpha() and ch.isascii():
@@ -334,12 +334,30 @@ def test_iac_escaped_iac_does_not_end_subnegotiation():
 # ── дефект: ввод кодировался КОИ-8Р вместо семибитной КОИ-7 ───────────────
 
 def test_send_keys_uses_koi7_input_rules():
-    """Русские знаки идут в строку 0x60…0x7E, конец строки — ПР."""
+    """Русские знаки кодируются по КОИ-7, конец строки — ПР.
+
+    Набор ввода по умолчанию — Н2 (набор линии ДКС): «СЕТ» — это
+    `0x73 0x65 0x74` (`b'set'`), потому что строка `0x60…0x7E` в КОИ-7
+    занята кириллицей, а регистр сворачивает машина.
+    """
     link = FakeLink()
     ses = TerminalSession(link)
     ses.send_keys('СЕТ')
     assert link.sent == [b'set\r']
-    assert all(b < 0x80 for b in link.sent[0])   # линия ДКС семибитная
+
+
+def test_send_bytes_does_not_recode_input():
+    """Готовые байты сеанса уходят на линию как есть.
+
+    Повторное кодирование (latin-1 → КОИ-7) превращало русскую «с» в
+    `S`, а команду ОС Диспак — в чужую: `send_bytes` не кодирует.
+    """
+    link = FakeLink()
+    ses = TerminalSession(link)
+    ses.send_bytes(b'set', eol=0)
+    assert link.sent == [b'set']
+    ses.send_bytes(b'set')                # конец строки из настройки
+    assert link.sent[-1] == b'set\r'
 
 
 def test_send_keys_eol_comes_from_parameter():

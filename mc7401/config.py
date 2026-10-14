@@ -71,20 +71,35 @@ def parse_eol(value: Optional[str], default: int = 0o015) -> int:
     return code
 
 
-def parse_echo(value, default=None):
-    """Значение `[terminal] echo`: `True`, `False` или `None` (по режиму).
+def parse_echo(value, default=False):
+    """Значение `[terminal] echo`: `True` или `False` (вкл/выкл).
 
-    `auto`/`по режиму`/пусто — `None`: эхо пересчитывается при смене
-    режима сеанса.  Прочие значения разбираются как булевы, и непонятное
-    не молча превращается в «печатать», а остаётся прежним: лишнее эхо
-    заметнее его отсутствия.
+    Режим «авто» упразднён: эхо не зависит от режима сеанса,
+    а только от положения Ф6.
     """
     if value is None:
         return default
     text = str(value).strip().lower()
-    if text in ('auto', 'mode', 'по режиму', ''):
-        return None
     return configparser.ConfigParser.BOOLEAN_STATES.get(text, default)
+
+
+def parse_charset(value: Optional[str], default: Optional[str] = None) -> str:
+    """Значение `[terminal] charset` → имя набора ввода.
+
+    Принимаются `'n2'` (Н2, КОИ-7) и `'koi8r'` (КОИ-8Р), а также легаси-
+    имена старых наборов 15ИЭ `'n0'`/`'n1'`/`'n2'` — все они приводятся к
+    набору линии ДКС `'n2'`.  Непонятное значение не берётся молча:
+    остаётся прежнее (`default`).
+    """
+    from .chars import INPUT_SET, SETS
+    if default is None:
+        default = INPUT_SET
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ('n0', 'n1'):
+        return INPUT_SET
+    return text if text in SETS else default
 
 
 def clamp_glyph(value: int) -> int:
@@ -141,18 +156,18 @@ machine_time = false
 [terminal]
 # Режим сеанса: host (С ЭВМ) или local (АВТОНОМНО).
 mode = host
-# Набор знаков: n2 — Н2 (КОИ-7), набор команд №2 VT-52 (по умолчанию);
-#              koi8r — КОИ-8Р (кириллица в 0x60…0x7F).
-# Клавиша `z` переключает набор по кругу.
+# Набор ввода с клавиатуры:
+#   n2    — Н2 (КОИ-7), набор линии ДКС: семибитный, и строчная
+#          латинская уходит заглавной (на ДКС строка 0x61…0x7A —
+#          кириллица, и `cat` вернулось бы как «ЦАТ»).
+#   koi8r — КОИ-8Р: восьмибитный, латиница в обоих регистрах.
+# Клавиша F8 «НАБОР» переключает набор на ходу.
 charset = n2
 # Локальное эхо набора: терминал сам печатает каждый знак.
-#   auto  — по режиму сеанса (по умолчанию): в С ЭВМ эхо делает ЭВМ,
-#           в АВТОНОМНО — терминал.  Совпадённое давало «лишнее эхо
-#           каждого символа»: знак выходил на экран дважды.
-#   true  — всегда печатать самому (например, линия молчит).
+#   true  — печатать самому (например, линия молчит).
 #   false — никогда (пароль не печатается).
-# Клавиша `e` (F6) переключает эхо вручную до смены режима.
-echo = auto
+# Клавиша `e` (Ф6) переключает эхо вкл/выкл.
+echo = false
 # Размер знака текстового слоя кадра: во сколько раз растр знакогенератора
 # (7×8 точек) увеличен на кадре.  1 — как в ПЗУ: знакомест 8×10,
 # сетка 70×40 (**по умолчанию**).  2 — вдвое крупнее: растр 14×16,
@@ -240,6 +255,8 @@ class Config:
     machine_time: bool = False
     # [terminal]
     mode: str = 'host'
+    #: Набор ввода: 'n2' (Н2, КОИ-7) | 'koi8r' (КОИ-8Р).  По умолчанию
+    #: Н2 — набор линии ДКС (клавиша F8 «НАБОР» переключает).
     charset: str = 'n2'
     #: Локальное эхо набора.  `None` — **по режиму сеанса**: в С ЭВМ
     #: эхо делает ЭВМ (иначе знак выходит на экран дважды), в
@@ -319,7 +336,9 @@ class Config:
                                              fallback=self.machine_time)
         if p.has_section('terminal'):
             self.mode = p.get('terminal', 'mode', fallback=self.mode)
-            self.charset = p.get('terminal', 'charset', fallback=self.charset)
+            self.charset = parse_charset(
+                p.get('terminal', 'charset', fallback=None),
+                self.charset)
             self.echo = parse_echo(p.get('terminal', 'echo', fallback=None),
                                   self.echo)
             self.pen = p.getboolean('terminal', 'pen', fallback=self.pen)
@@ -360,7 +379,8 @@ class Config:
 
     def summary(self) -> str:
         """Краткая сводка для сообщения при запуске."""
-        bits = [f'набор {self.charset}',
+        from .chars import SET_SHORT
+        bits = [f'набор {SET_SHORT.get(self.charset, self.charset)}',
                 f'режим {self.mode}',
                 'эхо вкл' if self.echo else 'эхо выкл',
                 f'линия {self.endpoint}']

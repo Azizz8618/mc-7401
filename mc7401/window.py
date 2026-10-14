@@ -46,6 +46,7 @@ from pathlib import Path
 from . import chrome
 from . import console as console_mod
 from . import startup
+from .chars import SET_SHORT, encode_input
 from .constants import PEN_XOR, SCREEN_HEIGHT, SCREEN_WIDTH
 from .console import Console, cell_x, cell_y, put_glyph
 from .emulator import TerminalEmulator
@@ -135,13 +136,10 @@ class TerminalWindow:
         self.session = Session()
         if config is not None:
             # Настройки сеанса — как в `tui.py`: режим, набор знаков, эхо.
-            # Режим задаётся через `set_mode`, а не присваиванием: так
-            # эхо пересчитывается по нему (`echo = auto` — в С ЭВМ эхо
-            # делает ЭВМ, и локальное печатало бы знак второй раз).
             self.session.set_mode(getattr(config, 'mode', self.session.mode))
             self.session.set_charset(
                 getattr(config, 'charset', self.session.charset_set))
-            self.session.set_echo(getattr(config, 'echo', None))
+            self.session.set_echo(getattr(config, 'echo', False))
         self.best, self.best_n = self.emu.fb.copy(), 0
         self.running = True
         self._tk = None
@@ -440,7 +438,7 @@ class TerminalWindow:
             else:
                 out = self.session.send(line_end=self.eol)
             if out:
-                self.driver.send_keys(out.decode('latin-1'))
+                self.driver.send_bytes(out, eol=0)
         self._touch_frame()
         self.paint()
         return 'break'
@@ -456,7 +454,7 @@ class TerminalWindow:
         self.last_key = 'ВК'
         if self.driver is not None:
             if self.session.mode == 'host':
-                self.driver.send_keys('\x08')
+                self.driver.send_bytes(b'\x08', eol=0)
             elif self.session.buffer:
                 self.session.buffer.pop()
         self._touch_frame()
@@ -1113,25 +1111,27 @@ class TerminalWindow:
             self.last_key = 'ЭХО'
             self.paint()
             return 'break'
-        if key == 'F8':                       # НАБОР
-            want = 'koi8r' if self.session.charset_set == 'n2' else 'n2'
-            self.session.set_charset(want)
-            self.emu.state.font = want
-            self.last_key = 'НАБОР'
+        if key == 'F8':                       # НАБОР: Н2 (КОИ-7) ↔ КОИ-8Р
+            # В Н2 (набор линии ДКС) строчная латинская набирается
+            # заглавной; в КОИ-8Р — как нажата.  Переключение видно в
+            # ячейке `НАБ=` подвала.
+            name = self.session.toggle_charset()
+            self.last_key = 'НАБОР ' + SET_SHORT.get(name, name)
+            self._dirty = True
             self.paint()
             return 'break'
         if key == 'F9':                       # СЕТЬ: АВТОНОМНО ↔ С ЭВМ
             out = self.session.toggle_mode()
             self.last_key = 'СЕТЬ'
             if out and self.driver is not None:
-                self.driver.send_keys(out.decode('latin-1'))
+                self.driver.send_bytes(out, eol=0)
             self.paint()
             return 'break'
         if key == 'F10':                      # ПЕРЕДАЧА
             out = self.session.send(line_end=self.eol)
             self.last_key = 'ПЕРЕДАЧА'
             if out and self.driver is not None:
-                self.driver.send_keys(out.decode('latin-1'))
+                self.driver.send_bytes(out, eol=0)
             self.paint()
             return 'break'
         if key == 'F12':                       # УПР.СИМВ: образные знаки УП
@@ -1173,14 +1173,18 @@ class TerminalWindow:
             return 'break'
         if ch and ch.isprintable():
             # Набор прямо на экране: знак уходит в линию и рисуется
-            # глифом СИМ в позиции курсора (эхо, КОИ-8Р).
+            # глифом СИМ в позиции курсора (эхо).  Эхо рисует знак **так,
+            # как его покажет терминал** (`session.echo_char`): в Н2
+            # строчная латинская уходит заглавной, и на экране она тоже
+            # должна быть заглавной — иначе оператор правит не тот текст,
+            # который ушёл на ЭВМ.
             self.wake_cursor()
             out = self.session.type_key(ch)
             if out and self.driver is not None:
-                self.driver.send_keys(out.decode('latin-1'))
+                self.driver.send_bytes(out, eol=0)
             if self.session.echo:
-                self.console.put_char(ch)
-            self.last_key = self._last_label(ch)
+                self.console.put_char(self.session.echo_char(ch))
+            self.last_key = self._last_label(ch, out)
             self._touch_frame()
             self.paint()
             return 'break'
@@ -1517,11 +1521,18 @@ class TerminalWindow:
                     self.status(), clock=self.mclock.stamp(),
                     clock_stale=self.mclock.stale)]
 
-    def _last_label(self, key: str) -> str:
-        """«ПОСЛ:» — код выданного знака и сам знак (`≡144 'd'`)."""
+    def _last_label(self, key: str, out: bytes = b'') -> str:
+        """«ПОСЛ:» — код выданного знака и сам знак (`≡104 'D'`).
+
+        Код — тот, что **ушёл на линию** (`session.type_key`), а не
+        восьмеричный КОИ-8Р нажатой клавиши: в наборе Н2 строчная
+        латинская выдаётся заглавной, и подпись должна говорить именно
+        об этом (`a` → `≡104 'D'`).
+        """
         if len(key) == 1 and key.isprintable():
-            code = key.encode('koi8-r', errors='replace')[0]
-            return f'≡{code:o} {key!r}'
+            code = out[0] if len(out) == 1 else encode_input(key)[0]
+            shown = self.session.echo_char(key)
+            return f'≡{code:o} {shown!r}'
         return key[:12]
 
     # ── цикл ────────────────────────────────────────────────────────────────
@@ -1626,7 +1637,7 @@ class TerminalWindow:
         if self.driver is None or not self.mclock.enabled:
             return
         try:
-            self.driver.send_keys(TIME_QUERY.decode('latin-1'))
+            self.driver.send_bytes(TIME_QUERY, eol=0)
         except Exception as exc:                     # noqa: BLE001
             log.debug('запрос времени не ушёл: %s', exc)
 

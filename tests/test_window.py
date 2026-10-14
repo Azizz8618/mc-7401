@@ -40,6 +40,9 @@ class FakeDriver:
     def send_keys(self, text: str) -> None:
         self.sent.append(text)
 
+    def send_bytes(self, data: bytes, *, eol=None) -> None:
+        self.sent.append(data.decode('latin-1'))
+
     def close(self) -> None:
         self.closed = True
 
@@ -341,8 +344,10 @@ def test_letters_are_free_for_text(app):
     for key in 'exzLSq':
         app.handle_key(key)
     assert app.input_line == 'exzLSq'
+    # Набор ввода — Н2 (КОИ-7): строчная латинская уходит заглавной,
+    # и `input_line` её хранит как нажатую (`chars.KOI7_LAT_UPPER`).
     assert [s.encode('latin-1') for s in app.driver.sent] == [
-        b'e', b'x', b'z', b'L', b'S', b'q']
+        b'E', b'X', b'Z', b'L', b'S', b'Q']
 
 
 def test_function_keys_do_not_type(app):
@@ -486,6 +491,9 @@ def test_probe_enables_graphics_with_reply(monkeypatch):
         def send_keys(self, t):
             pass
 
+        def send_bytes(self, data, *, eol=None):
+            pass
+
         def close(self):
             pass
 
@@ -520,6 +528,9 @@ def test_probe_failure_reports_fallback(monkeypatch):
             return b''
 
         def send_keys(self, t):
+            pass
+
+        def send_bytes(self, data, *, eol=None):
             pass
 
         def close(self):

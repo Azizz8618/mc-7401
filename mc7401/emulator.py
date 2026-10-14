@@ -23,7 +23,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import chars
-#: Набор русских знаков МС 7401 (из двух: Н2/КОИ-7 и КОИ-8Р).
+#: Страница знаков ПЗУ русского шрифта (`S0`) — КОИ-8Р.  Набор **ввода**
+#: с клавиатуры тут ни при чём (см. `chars.SETS`).
 RUSSIAN_SET = 'koi8r'
 
 from .constants import (
@@ -85,8 +86,10 @@ class TerminalState:
     y: int = 0
     pen: str = PEN_OR
     line_type: int = 1
-    #: Набор знаков: 'n0' | 'n1' | 'n2'; по умолчанию Н2 (VT-52),
-    #: как в терминале 15ИЭ.  `S0` включает Н1, `S1` — Н2.
+    #: Страница знаков ПЗУ: `'koi8r'` — по умолчанию, как в терминале
+    #: 15ИЭ; `S0` (0o160) включает русскую, `S1` (0o161) — международскую.
+    #: Это **выдача**, а не набор ввода: на то, что оператор набирает с
+    #: клавиатуры, она не влияет (см. `chars.SETS`).
     font: str = chars.DEFAULT_SET
     text_size: int = 0
     text_direction: int = 0
@@ -504,7 +507,7 @@ class TerminalEmulator:
         for b in payload:
             if b == END:                        # признак конца текста
                 break
-            if b in (S0, S1):                   # S0 — КОИ-8Р, S1 — Н2
+            if b in (S0, S1):                   # S0 — русская страница, S1 — латинская
                 name = chars.set_for_code(b)
                 if name is not None:
                     self.state.font = name

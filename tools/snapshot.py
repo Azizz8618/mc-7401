@@ -397,13 +397,12 @@ class LineSource:
     def send(self, text: str) -> None:
         """Напечатать строку на линии — тем же путём, что и окно.
 
-        `LiveDriver.send_keys` ждёт строку и кодирует её в КОИ-8Р сам,
-        а знаки набора Н2 лежат в диапазоне 0x40…0x7E, где КОИ-8Р
-        совпадает с КОИ-7: так передаётся ровно то, что нажал оператор.
+        Набор ввода — Н2 (КОИ-7): знаки кодируются сеансом и уходят на
+        линию как есть (`send_bytes` не кодирует их второй раз).
         """
         from mc7401.chars import encode_input
         wire = encode_input(text, set_name='n2') + b'\r'
-        self.driver.send_keys(wire.decode('latin-1'))
+        self.driver.send_bytes(wire, eol=0)
 
     def keys(self, win, out: Path, *, scale: int) -> None:
         """Клавиатура как есть: `Ctrl-\\` — снимок, `Ctrl-q` — выход."""

@@ -102,12 +102,17 @@ def test_every_line_code_has_a_sign():
 # ── набор с клавиатуры: знак → код → знак ───────────────────────────────────
 
 def test_cyrillic_round_trips_through_the_line():
-    """Русская буква, набранная на клавиатуре, приходит обратно той же."""
+    """Русская буква, набранная на клавиатуре, приходит обратно той же.
+
+    Проверяется набор **Н2 (КОИ-7)** — тот, в котором ходит линия ДКС:
+    знак уходит кодом строки `0x60…0x7E`, а `display_dks` читает её как
+    кириллицу заглавными (строка ДКС регистронезависима).
+    """
     wrong = []
     for ch in DCOI:
         if ch in chars.CYR_SUBSTITUTED:
             continue                        # в ПЗУ этих знаков нет
-        code = encode_input(ch, set_name='n2')
+        code = encode_input(ch)
         back = display_dks(code[0]) if len(code) == 1 else ''
         if back.upper() != ch.upper():
             wrong.append((ch, code.hex(), back))
@@ -117,8 +122,10 @@ def test_cyrillic_round_trips_through_the_line():
 def test_latin_round_trips_in_koi8r_charset():
     """В наборе КОИ-8Р латиница идёт на линию своим кодом.
 
-    Набор Н2 — это ДКОИ: там один код означает и `a`, и «А», поэтому
-    латиница в нём не представима и набирается только в КОИ-8Р (F8 НАБОР).
+    В Н2 (КОИ-7) её представить нельзя: строка `0x61…0x7A` занята
+    кириллицей, поэтому строчные латинские набираются **заглавными**
+    (`chars.KOI7_LAT_UPPER`).  Полноценная латиница в обоих регистрах
+    доступна в КОИ-8Р — оператор переходит на него клавишей F8 НАБОР.
     """
     wrong = []
     for ch in ASCII_LINE:
@@ -126,6 +133,54 @@ def test_latin_round_trips_in_koi8r_charset():
         if len(code) != 1 or apply_set(code[0], 'koi8r') != ord(ch) & 0x7F:
             wrong.append((ch, code.hex()))
     assert not wrong, f'латиница идёт не тем кодом: {wrong[:10]}'
+
+
+def test_koi7_lowercase_latin_becomes_uppercase():
+    """Таблица КОИ-7: строчная латинская набирается заглавной.
+
+    На линии ДКС (`set ttyN dks,raw`) нет строчных латинских: код
+    `0x63` приходит от машины как «Ц», `0x6E` — как «Н».  Единственный
+    способ набрать латиницу — заглавная строка `0x41…0x5A`.
+    """
+    assert chars.KOI7_LAT_UPPER['a'] == 'A'
+    assert chars.KOI7_LAT_UPPER['z'] == 'Z'
+    assert len(chars.KOI7_LAT_UPPER) == 26
+    assert len(chars.KOI7_CODE_UPPER) == 26
+    for low, up in zip(chars.LAT_LOWER, chars.LAT_UPPER):
+        assert chars.KOI7_CODE_UPPER[ord(low)] == ord(up)
+        assert chars.KOI7_LAT_UPPER[low] == up
+        # На линию уходит код заглавной, и знакогенератор читает его как
+        # ту же букву латиницы.
+        code = encode_input(low)[0]
+        assert code == ord(up), f'{low!r} ушла кодом {code:o}'
+        assert display_dks(code) == up
+
+
+def test_koi7_keeps_uppercase_latin_digits_and_punctuation():
+    """Заглавные латинские, цифры и знаки в Н2 не трогаются."""
+    for ch in 'ABCXYZ0189.,-/:;()!?':
+        assert encode_input(ch) == ch.encode('ascii')
+
+
+def test_koi8r_keeps_latin_case_and_cyrillic_eight_bit():
+    """В КОИ-8Р (F8 НАБОР) латиница обоих регистров и кириллица 0xC0…0xFF."""
+    assert encode_input('a', set_name='koi8r') == b'a'
+    assert encode_input('A', set_name='koi8r') == b'A'
+    assert encode_input('п', set_name='koi8r') == b'\xf0'
+    assert encode_input('П', set_name='koi8r') == b'\xd0'
+
+
+def test_input_label_shows_what_the_terminal_will_show():
+    """Локальное эхо рисует знак таким, каким его покажет терминал.
+
+    В Н2 `cat` встаёт как `CAT`, в КОИ-8Р — как `cat`.  Иначе оператор
+    правил бы на экране не тот текст, который ушёл на ЭВМ.
+    """
+    assert chars.input_label('c') == 'C'
+    assert chars.input_label('c', set_name='koi8r') == 'c'
+    assert chars.input_label('п') == 'П'          # строка ДКС без регистра
+    assert chars.input_label('п', set_name='koi8r') == 'п'
+    assert chars.input_label('\r') == ''          # управляющий не рисуется
 
 
 def test_hard_sign_is_a_documented_substitute():

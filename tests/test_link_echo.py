@@ -199,12 +199,16 @@ def test_prompt_gives_up_after_max_tries(monkeypatch):
 
 
 def test_send_keys_records_echo(monkeypatch):
-    """Отданные знаки попадают в очередь ожидаемого эха."""
+    """Отданные знаки попадают в очередь ожидаемого эха.
+
+    Набор ввода — Н2 (КОИ-7): строчная латинская уходит **заглавной**
+    (`ab` → `AB`), и в очередь эха кладётся ровно то, что ушло в линию.
+    """
     drv, line = _driver(monkeypatch)
     drv.send_keys('ab')
-    assert line.sent == [b'ab']
-    assert bytes(drv._echo.pending) == b'ab'
+    assert line.sent == [b'AB']
+    assert bytes(drv._echo.pending) == b'AB'
     # эхо срезается из приёма
     assert drv.poll(0) == b''
-    line.rx.append(b'ab')
+    line.rx.append(b'AB')
     assert drv.poll(0) == b''

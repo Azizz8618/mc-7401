@@ -42,26 +42,21 @@ class Session:
     buffer: list[str] = field(default_factory=list)
     #: Локальное эхо набираемого: терминал печатает знак сам.
     #:
-    #: Нужно только там, где **никто другой не echoes**.  В режиме
-    #: С ЭВМ эхо делает ЭВМ (ОС Диспак возвращает каждый знак), и
-    #: вместе с локальным эхом знак выходил бы на экран дважды —
-    #: «лишнее эхо каждого символа».  В АВТОНОМНО эха больше ниоткуда,
-    #: и без него набор не видно.  Поэтому по умолчанию эхо **следует
-    #: за режимом** (`_echo_follows`), а клавиша «ЭХО» (F6) задаёт его
-    #: вручную — например, чтобы не печатать пароль.
+    #: Ф6 (ЭХО) — вкл/выкл.  Режим «авто» упразднён: эхо не зависит
+    #: от режима сеанса, а только от положения Ф6.
     echo: bool = False
-    #: Эхо не задано вручную и следует за режимом сеанса.
-    _echo_follows: bool = True
-    #: Русская раскладка (ФОН/ПОЗ) живёт только в наборе Н1 — в Н0 и Н2
-    #: её нет, иначе позиционная таблица съедала бы знаки международной
-    #: строки.  Это тоже из 15ИЭ.
+    #: Русская раскладка (ФОН/ПОЗ) — как в терминале 15ИЭ.
     layout: Optional[str] = None
-    #: Текущий набор знаков: 'n2' (Н2, КОИ-7) | 'koi8r' (КОИ-8Р).
-    charset_set: str = 'n2'
+    #: Набор **ввода**: 'n2' (Н2, КОИ-7) | 'koi8r' (КОИ-8Р).
+    #:
+    #: Н2 — набор линии ДКС: семибитный, и в нём строчная латинская
+    #: уходит заглавной (`chars.KOI7_LAT_UPPER`), иначе набранное вернулось
+    #: бы кириллицей.  КОИ-8Р оператор выбирает сам (F8 «НАБОР»), когда
+    #: нужен регистр латиницы.
+    charset_set: str = chars.INPUT_SET
 
     def __post_init__(self) -> None:
         self._check_layout()
-        self._apply_echo()
 
     # ── режим ───────────────────────────────────────────────────────────────
 
@@ -77,7 +72,6 @@ class Session:
         out = self.send(line_end=0) if mode == MODE_HOST else b''
         self.mode = mode
         self._check_layout()
-        self._apply_echo()
         return out
 
     def toggle_mode(self) -> bytes:
@@ -91,7 +85,6 @@ class Session:
             return self.set_mode(MODE_HOST)
         self.mode = MODE_LOCAL
         self._check_layout()
-        self._apply_echo()
         return b''
 
     # ── набор ───────────────────────────────────────────────────────────────
@@ -150,52 +143,53 @@ class Session:
             return b''
         return b'S' + bytes((VK,))
 
-    def echo_for_mode(self) -> bool:
-        """Эхо, уместное для текущего режима сеанса.
-
-        В **С ЭВМ** — выключено: эхо делает ЭВМ, и локальное эхо
-        выводило бы каждый знак дважды.  В **АВТОНОМНО** — включено:
-        больше никто не echoes, и без него набор не видно.
-        """
-        return self.mode == MODE_LOCAL
-
-    def _apply_echo(self) -> None:
-        """Обновить эхо по режиму — пока оно не задано вручную."""
-        if self._echo_follows:
-            self.echo = self.echo_for_mode()
-
-    def set_echo(self, value: Optional[bool]) -> bool:
-        """Задать эхо вручную.
-
-        `None` — вернуть «следует за режимом»: значение снова будет
-        пересчитываться при каждой смене режима (F9).
-        """
-        self._echo_follows = value is None
-        if self._echo_follows:
-            self._apply_echo()
-        else:
-            self.echo = bool(value)
+    def set_echo(self, value: bool) -> bool:
+        """Задать эхо вручную (Ф6)."""
+        self.echo = bool(value)
         return self.echo
 
     def toggle_echo(self) -> bool:
-        """Переключить эхо вручную (F6) — на пароль и обратно."""
+        """Переключить эхо (Ф6) — на пароль и обратно."""
         return self.set_echo(not self.echo)
 
     # ── набор знаков и раскладка ────────────────────────────────────────────
 
     def set_charset(self, name: str) -> None:
-        """Переключить набор знаков: `S0` → КОИ-8Р, `S1` → Н2."""
-        from .chars import SETS
+        """Переключить набор **ввода**: Н2 (КОИ-7) или КОИ-8Р.
+
+        Легаси-значения 'n0'/'n1' (старые наборы 15ИЭ) нормализуются в
+        'n2' — набор линии ДКС, чтобы старые конфиги не ломали запуск.
+        """
+        from .chars import INPUT_SET, SETS
+        if name in ('n0', 'n1'):
+            name = INPUT_SET
         if name not in SETS:
-            raise ValueError(f'неизвестный набор: {name!r}')
+            name = INPUT_SET
         self.charset_set = name
         self._check_layout()
 
+    def toggle_charset(self) -> str:
+        """F8 «НАБОР»: Н2 (КОИ-7) ↔ КОИ-8Р; вернуть новый набор.
+
+        В Н2 строчная латинская набирается заглавной (на линии ДКС
+        строчных латинских нет), в КОИ-8Р — как нажата.
+        """
+        from .chars import INPUT_SET, SETS
+        i = SETS.index(self.charset_set)
+        self.set_charset(SETS[(i + 1) % len(SETS)])
+        return self.charset_set
+
+    def echo_char(self, ch: str) -> str:
+        """Знак так, как его покажет терминал в текущем наборе.
+
+        Локальное эхо рисует **это** (`chars.input_label`): в Н2
+        `cat` встанет как `CAT`, ровно тем, что вернёт машина.
+        """
+        return chars.input_label(ch, set_name=self.charset_set)
+
     def _check_layout(self) -> None:
-        """Русская раскладка есть только в русском наборе КОИ-8Р."""
-        if self.charset_set != 'koi8r':
-            self.layout = None
-        elif self.layout is None:
+        """Русская раскладка есть в обоих наборах ввода."""
+        if self.layout is None:
             self.layout = self.default_layout()
 
     @staticmethod

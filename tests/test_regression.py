@@ -153,27 +153,34 @@ def test_s0_switches_to_koi8r():
 
 
 def test_s1_returns_to_default_set():
-    """`S1` (0o161) возвращает набор по умолчанию — Н2 (КОИ-7)."""
+    """`S1` (0o161) возвращает набор по умолчанию — КОИ-8Р."""
     from mc7401.constants import S0, S1
     emu = run(stream('J1', '4 10 300', b'9\x01',
                      ';\x00 ' + chr(S0) + chr(S1) + 'АБВ'))
-    assert emu.state.font == 'n2'
+    assert emu.state.font == 'koi8r'
 
 
-def test_default_charset_set_is_n2():
-    """По умолчанию включён Н2 (КОИ-7) — набор команд VT-52."""
-    from mc7401.chars import DEFAULT_SET, SETS
-    assert DEFAULT_SET == 'n2'
+def test_default_charset_set_is_koi8r():
+    """Страница шрифта ПЗУ по умолчанию — КОИ-8Р, набор **ввода** — Н2.
+
+    Это две разные вещи.  Знаки на экране (`display_char`, страницы
+    `S0`/`S1`) всегда КОИ-8Р; набор ввода по умолчанию — Н2 (КОИ-7),
+    потому что в нём ходит линия ДКС (`chars.INPUT_SET`, F8 «НАБОР»).
+    """
+    from mc7401.chars import DEFAULT_SET, INPUT_SET, SETS
+    assert DEFAULT_SET == 'koi8r'
+    assert INPUT_SET == 'n2'
     assert SETS == ('n2', 'koi8r')
-    assert TerminalEmulator().state.font == 'n2'
+    assert TerminalEmulator().state.font == 'koi8r'
 
 
-def test_default_charset_set_is_n2():
-    """По умолчанию включён Н2 (КОИ-7) — набор команд VT-52."""
-    from mc7401.chars import DEFAULT_SET, SETS
-    assert DEFAULT_SET == 'n2'
+def test_default_charset_set_is_koi8r_2():
+    """То же для совместимости со старыми тестами: шрифт — КОИ-8Р."""
+    from mc7401.chars import DEFAULT_SET, INPUT_SET, SETS
+    assert DEFAULT_SET == 'koi8r'
+    assert INPUT_SET == 'n2'
     assert SETS == ('n2', 'koi8r')
-    assert TerminalEmulator().state.font == 'n2'
+    assert TerminalEmulator().state.font == 'koi8r'
 
 
 def test_russian_glyph_differs_from_latin():
@@ -993,16 +1000,19 @@ def test_echo_follows_the_session_mode():
     assert s.echo is False
 
 
-def test_russian_layout_exists_only_in_koi8r():
-    """Русская раскладка живёт только в русском наборе — как в 15ИЭ."""
+def test_russian_layout_exists_in_both_input_sets():
+    """Русская раскладка есть в обоих наборах **ввода** — как в 15ИЭ.
+
+    Набор ввода (Н2 или КОИ-8Р) к раскладке отношения не имеет: русские
+    буквы набираются в обоих, по-разному лишь уходя на линию.
+    """
     from mc7401.session import Session
     s = Session()
     assert s.charset_set == 'n2'
-    assert s.layout is None
-    s.set_charset('koi8r')
     assert s.layout == 'phonetic'
-    s.set_charset('n2')
-    assert s.layout is None
+    s.set_charset('koi8r')
+    assert s.charset_set == 'koi8r'
+    assert s.layout == 'phonetic'
 
 
 # ── файл конфигурации ──────────────────────────────────────────────────────
@@ -1011,7 +1021,7 @@ def test_config_defaults_without_file():
     """Без файла работают значения по умолчанию."""
     from mc7401.config import Config
     c = Config.default()
-    assert c.charset == 'n2'
+    assert c.charset == 'n2', 'набор ввода по умолчанию — Н2 (КОИ-7)'
     assert c.mode == 'host'
     # `None` — «по режиму сеанса»: в С ЭВМ эхо делает ЭВМ, в АВТОНОМНО —
     # терминал.  `true` в режиме С ЭВМ давало бы лишнее эхо каждого
@@ -1118,14 +1128,9 @@ def test_koi7_letters_are_capitals():
     (ПЗУ КР556РТ5, ГОСТ 27463-87) буквы показываются заглавными, а не
     строчными.
     """
-    from mc7401.chars import RUS7, display_char, display_dks, koi7_label
-    for row in (0x40, 0x60):
-        assert ''.join(koi7_label(row + i) for i in range(0x1F)) == RUS7
-    assert koi7_label(0x7C) == 'Э'                # заглавная, не «э»
+    from mc7401.chars import RUS8, display_char, display_dks
     assert display_dks(0x7C) == 'Э'
-    assert display_char(0x7C, 'n2') == 'Э'
-    assert koi7_label(0x7F) == '█'
-    assert koi7_label(0x5F) == 'Ъ'
+    assert display_char(0x7C, 'koi8r') == 'Э'
 
 
 def test_koi8r_page_keeps_case():

@@ -52,6 +52,9 @@ class FakeDriver:
     def send_keys(self, text: str) -> None:
         self.sent.append(text)
 
+    def send_bytes(self, data: bytes, *, eol=None) -> None:
+        self.sent.append(data.decode('latin-1'))
+
     def close(self) -> None:
         self.closed = True
 
@@ -177,6 +180,7 @@ def test_read_key_enter_reaches_submit(monkeypatch):
     assert keys == ['С', '\r']
     for key in keys:
         app.handle_key(key)
+    # Н2 (КОИ-7): «С» → 0x73 (s в latin-1)
     assert app.driver.sent == ['s', '\r']
 
 
@@ -187,6 +191,7 @@ def test_carriage_notation_submits(app):
     for key in 'СЕТ ':
         app.handle_key(key)
     app.handle_key('^M')
+    # Н2 (КОИ-7): «СЕТ» → 0x73 0x65 0x74 — строка `0x60…0x7E` кириллическая
     assert app.driver.sent == ['s', 'e', 't', ' ', '\r']
     app.handle_key('^J')
     assert app.driver.sent[-1] == '\r'
@@ -662,11 +667,70 @@ def test_window_letters_type_at_cursor(monkeypatch):
     win._on_key(FakeEvent('e', 'e'))
     assert win.session.mode == 'host'
     assert win.session.echo is True, 'e переключила ЭХО'
-    assert win.driver.sent == ['e'], 'e не ушла в линию'
+    # Н2 (КОИ-7): строчная латинская уходит заглавной.
+    assert win.driver.sent == ['E'], 'e не ушла в линию'
     assert win.emu.fb.count_set() > 0, 'знак не нарисован на кадре'
     assert win.console.col == 1, 'курсор не сдвинулся'
     win._on_key(FakeEvent('F6', ''))        # ЭХО — служебной клавишей
     assert win.session.echo is False
+
+
+def test_window_echo_draws_the_sign_the_terminal_shows(monkeypatch):
+    """Эхо рисует знак так, как его покажет терминал.
+
+    В наборе Н2 (КОИ-7) строчная латинская уходит заглавной: если бы
+    эхо рисовало `c`, оператор правил бы на экране не тот текст,
+    который ушёл на ЭВМ.
+    """
+    from mc7401.console import glyph_art
+
+    win = make_window(monkeypatch)
+    win.driver = FakeDriver()
+    win.session.set_echo(True)
+    win.console.goto(0, 0)
+    for ch in 'cat':
+        win._on_key(FakeEvent(ch, ch))
+    assert win.driver.sent == ['C', 'A', 'T']
+
+    def drawn(col, row):
+        x0, y0, _, y1 = win.console.cell_rect(col, row)
+        return [''.join('#' if win.emu.fb.get(x, y) else '.'
+                        for x in range(x0, x0 + 7))
+                for y in range(y1, y0 - 1, -1)]
+
+    def art(sign):
+        return [''.join('#' if v else '.' for v in row)
+                for row in glyph_art(sign)]
+
+    for col, sign in enumerate('CAT'):
+        assert drawn(col, 0) == art(sign), f'в {col}-м знакоместе не {sign}'
+
+
+def test_window_charset_key_switches_the_panel(monkeypatch):
+    """F8 «НАБОР» меняет и набор ввода, и ячейку `НАБ=` подвала."""
+    from mc7401.panel import Status, state_rows
+
+    def chset(status):
+        """Значение ячейки `НАБ=` в рядах состояний."""
+        for row in state_rows(status):
+            segs = row if isinstance(row, tuple) else ()
+            for label, value in zip(segs, segs[1:]):
+                if label[0] == 'НАБ=':
+                    return value[0]
+        return None                        # pragma: no cover
+
+    win = make_window(monkeypatch)
+    win.driver = FakeDriver()
+    assert win.session.charset_set == 'n2'
+    assert chset(Status()) == 'Н2'
+    win._on_key(FakeEvent('F8', ''))
+    assert win.session.charset_set == 'koi8r'
+    assert chset(Status(charset=win.session.charset_set)) == 'КОИ8'
+    win._on_key(FakeEvent('F8', ''))
+    assert win.session.charset_set == 'n2'
+    # Переключение набора ввода не трогает выдачу ЭВМ: она приходит КОИ-7.
+    win.session_text(bytes((0x63, 0x6E)))          # «ЦН»
+    assert win.emu.fb.count_set() > 0
 
 
 def test_window_echo_off_skips_glyph(monkeypatch):
@@ -675,7 +739,8 @@ def test_window_echo_off_skips_glyph(monkeypatch):
     win.driver = FakeDriver()
     win.session.set_echo(False)
     win._on_key(FakeEvent('e', 'e'))
-    assert win.driver.sent == ['e'], 'e не ушла в линию'
+    # Н2 (КОИ-7): строчная латинская уходит заглавной.
+    assert win.driver.sent == ['E'], 'e не ушла в линию'
     assert win.emu.fb.count_set() == 0, 'эхо выключено — знака быть не должно'
 
 
@@ -692,10 +757,11 @@ def test_window_no_double_echo_when_evm_echoes_back(monkeypatch):
     assert win.session.mode == 'host'
     assert win.session.echo is False, 'в С ЭВМ локальное эхо лишнее'
     win._on_key(FakeEvent('e', 'e'))
-    assert win.driver.sent == ['e'], 'e не ушла в линию'
+    # Н2 (КОИ-7): строчная латинская уходит заглавной.
+    assert win.driver.sent == ['E'], 'e не ушла в линию'
     assert win.emu.fb.count_set() == 0, 'знак нарисован до ответа ЭВМ'
     # ЭВМ echoes знак обратно — он и рисуется, один раз.
-    win.session_text(b'e')
+    win.session_text(b'E')            # ЭВМ echoes заглавную (Н2)
     assert win.emu.fb.count_set() > 0, 'знак от ЭВМ не нарисован'
     win.console.goto(1, 0)
     win.console.home()
@@ -1609,7 +1675,7 @@ def test_window_backspace_erases_glyph(monkeypatch):
     win._on_key(FakeEvent('BackSpace', '\x08'))
     assert win.emu.fb.count_set() == 0, 'знак не стёрт'
     assert win.console.col == 0
-    assert win.driver.sent == ['e', '\x08'], 'в линию не ушёл код ВК'
+    assert win.driver.sent == ['E', '\x08'], 'в линию не ушёл код ВК'
 
 
 def test_window_return_sends_line_end(monkeypatch):
@@ -1619,7 +1685,7 @@ def test_window_return_sends_line_end(monkeypatch):
     for ch in 'set':
         win._on_key(FakeEvent(ch, ch))
     assert win._on_return() == 'break'
-    assert win.driver.sent == ['s', 'e', 't', '\r']
+    assert win.driver.sent == ['S', 'E', 'T', '\r']
     assert win.console.col == 0, 'ПРПС переводит на новую строку'
     assert win.console.row == 1
 
@@ -1634,6 +1700,7 @@ def test_window_return_sends_buffer_in_local(monkeypatch):
     assert win.driver.sent == [], 'АВТОНОМНО: знаки не должны уходить сразу'
     assert win.session.buffer == ['л', 'и', 'н', '3']
     win._on_return()
+    # Н2 (КОИ-7): «лин» → 0x6C 0x69 0x6E — строка `0x60…0x7E` кириллица
     assert win.driver.sent == ['lin3\r']
 
 
@@ -1706,15 +1773,35 @@ def test_gfx_upload_cached_until_frame_changes(app):
 
 
 def test_last_label_shows_code_and_symbol(app):
-    """«ПОСЛ» — код выданного знака и сам знак (`≡144 'd'`).
+    """«ПОСЛ» — код выданного знака и сам знак (`≡104 'D'`).
 
-    Оператору нужен и код (восьмеричный КОИ-8Р), и знак: один и тот же
-    код в разных наборах означает разные буквы.
+    Код — тот, что **ушёл на линию**, а не восьмеричный КОИ-8Р нажатой
+    клавиши: в наборе Н2 (КОИ-7) строчная латинская выдаётся заглавной,
+    и подпись должна говорить именно об этом.
     """
     app.handle_key('d')
-    assert app.last_key == "≡144 'd'"
+    assert app.last_key == "≡104 'D'"
     app.handle_key('KEY_CLEAR')            # F5 — ОЧИСТКА
     assert app.last_key == 'ОЧИСТКА'
+
+
+def test_charset_key_switches_between_koi7_and_koi8r(app):
+    """F8 «НАБОР»: Н2 (КОИ-7) ↔ КОИ-8Р.
+
+    В Н2 строчная латинская уходит заглавной, в КОИ-8Р — как нажата;
+    это и есть весь смысл переключения.
+    """
+    from mc7401.chars import encode_input
+    assert app.session.charset_set == 'n2'
+    app.handle_key('d')
+    assert app.driver.sent == ['D']
+    app.handle_key('KEY_CMDSET')
+    assert app.session.charset_set == 'koi8r'
+    app.handle_key('d')
+    assert app.driver.sent == ['D', 'd']
+    app.handle_key('KEY_CMDSET')
+    assert app.session.charset_set == 'n2'
+    assert encode_input('d') == b'D'
 
 
 # ── раскладка кадра на окно: таблицы вместо арифметики в цикле ──────────────

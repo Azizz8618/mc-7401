@@ -33,6 +33,7 @@ from typing import Callable, Optional
 from .emulator import TerminalEmulator
 from . import panel
 from . import startup
+from .chars import SET_SHORT, encode_input
 from .config import Config
 from .pen import LightPen
 from .link import EchoStrip, LinkError
@@ -267,6 +268,9 @@ class Driver:
     def send_keys(self, text: str) -> None:
         pass
 
+    def send_bytes(self, data: bytes, *, eol: Optional[int] = None) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -293,6 +297,10 @@ class FileDriver(Driver):
     def send_keys(self, text: str) -> None:
         log.info('клавиатура: %r (поток из файла, отправка не требуется)',
                  text)
+
+    def send_bytes(self, data: bytes, *, eol: Optional[int] = None) -> None:
+        log.info('клавиатура: %r (поток из файла, отправка не требуется)',
+                 data)
 
 
 class LiveDriver(Driver):
@@ -412,7 +420,22 @@ class LiveDriver(Driver):
         self.send_keys('\r')                 # ПРПС = ПР = конец строки
 
     def send_keys(self, text: str) -> None:
-        data = text.encode('koi8-r', errors='replace')
+        """Отправить **готовый текст** (управляющие клавиши, события пера).
+
+        Набранное оператором сюда не берётся: его кодирует сеанс
+        (`session.type_key` → `chars.encode_input`), и линия должна
+        получить ровно эти байты — для этого `send_bytes`.
+        """
+        data = encode_input(text)
+        self._echo.sent(data)
+        self.link.send(data)
+
+    def send_bytes(self, data: bytes, *, eol: Optional[int] = None) -> None:
+        """Отправить уже покодированный ввод — как есть, без перекодировки."""
+        if not data:
+            return
+        if eol:
+            data += bytes((eol,))
         self._echo.sent(data)
         self.link.send(data)
 
@@ -482,9 +505,6 @@ class TerminalApp:
         self.session = Session()
         #: Настройки из файла конфигурации.
         self.config = config or Config.default()
-        # Режим — через `set_mode`, а не присваиванием: так эхо
-        # пересчитывается по нему (`echo = auto`: в С ЭВМ эхо делает ЭВМ,
-        # и локальное печатало бы каждый знак второй раз).
         self.session.set_mode(self.config.mode)
         self.session.set_charset(self.config.charset)
         self.session.set_echo(self.config.echo)
@@ -536,6 +556,8 @@ class TerminalApp:
         self._got_data = False
         #: Последняя нажатая клавиша — строка «ПОСЛ:» подвала.
         self.last_key = ''
+        #: Байты последнего набора, ушедшие на линию — для «ПОСЛ:».
+        self._last_out: bytes = b''
         #: Эхо набираемого: то, что ввёл оператор, видно на экране
         #: (клавиша ЭХО снимает вывод — чтобы не печатать пароли).
         self.echo_buf = ''
@@ -1204,11 +1226,15 @@ class TerminalApp:
             self.session.toggle_echo()
             self.message = ('эхо включено' if self.session.echo
                             else 'эхо выключено — пароль не печатается')
-        elif key == KEY_CMDSET:                  # F8 — НАБОР
-            want = 'koi8r' if self.session.charset_set == 'n2' else 'n2'
-            self.session.set_charset(want)
-            self.emu.state.font = want
-            self.message = 'набор: ' + self.session.panel()
+        elif key == KEY_CMDSET:                  # F8 — НАБОР: Н2 ↔ КОИ-8Р
+            # В Н2 (набор линии ДКС) строчная латинская уходит
+            # заглавной, в КОИ-8Р — как нажата; выдача ЭВМ от этого
+            # не меняется.
+            name = self.session.toggle_charset()
+            note = ('латиница только заглавными' if name == 'n2'
+                    else 'латиница в обоих регистрах')
+            self.message = 'набор: ' + SET_SHORT.get(name, name) + \
+                           ' — ' + note
 
         # ── экран и ввод ──
         # Стрелка указывает, куда движется кадр: `vp.x`/`vp.y` — смещение
@@ -1262,26 +1288,34 @@ class TerminalApp:
         elif key and len(key) == 1 and key.isprintable():
             # Свободный ввод, как на 15ИЭ: в режиме С ЭВМ знак уходит в
             # линию немедленно, в АВТОНОМНО копится в буфер до ПЕРЕДАЧА.
+            # Эхо показывает знак **так, как его покажет терминал**
+            # (`session.echo_char`): в Н2 строчная латинская уходит
+            # заглавной, и в эхо она тоже должна быть заглавной.
             self.input_line += key
             if self.session.echo:
-                self.echo_buf += key      # ЭХО: набранное видно на экране
+                self.echo_buf += self.session.echo_char(key)
             out = self.session.type_key(key)
+            self._last_out = out
             if out:
                 self._send_raw(out)
             self.splash = False
         else:
             return
-        self.last_key = self._last_label(key)
+        self.last_key = self._last_label(key, self._last_out)
 
-    def _last_label(self, key: str) -> str:
-        """«ПОСЛ:» — код выданного знака и сам знак (`≡144 'd'`).
+    def _last_label(self, key: str, out: bytes = b'') -> str:
+        """«ПОСЛ:» — код выданного знака и сам знак (`≡104 'D'`).
 
-        Код — восьмеричный КОИ-8Р (`≡NNN`, как в описании терминала);
-        для служебных клавиш показывается их имя.
+        Код — тот, что **ушёл на линию** (`session.type_key`), а не
+        восьмеричный КОИ-8Р нажатой клавиши: в наборе Н2 строчная
+        латинская выдаётся заглавной, и подпись должна говорить именно
+        об этом (`a` → `≡104 'D'`).  Для служебных клавиш показывается
+        их имя.
         """
         if len(key) == 1 and key.isprintable():
-            code = key.encode('koi8-r', errors='replace')[0]
-            return f'≡{code:o} {key!r}'
+            code = out[0] if len(out) == 1 else encode_input(key)[0]
+            shown = self.session.echo_char(key)
+            return f'≡{code:o} {shown!r}'
         return SESSION_KEYS.get(key, key)[:12]
 
     #: SGR-последовательность мыши: `\x1b[<b;x;yM` / `\x1b[<b;x;ym`.
@@ -1467,14 +1501,14 @@ class TerminalApp:
                         '(ПЕРЕДАЧА)')
 
     def _send_raw(self, data: bytes) -> None:
-        """Отдать байты линии.
+        """Отдать байты линии — ровно те, что покодировал сеанс.
 
-        `send_keys` ждёт строку latin-1: каждый байт проходит насквозь
-        (latin-1 → koi8-r), поэтому кодировку набираемого набора знаков
-        менять здесь нельзя.
+        Кодировать их второй раз нельзя: в наборе Н2 русская «с» — это
+        `0x73`, и повторное кодирование (latin-1 → КОИ-7) превратило бы
+        её в `S`, а команду ОС Диспак — в чужую.
         """
         if data:
-            self.driver.send_keys(data.decode('latin-1'))
+            self.driver.send_bytes(data, eol=0)
 
     # ── главный цикл ────────────────────────────────────────────────────────
 
@@ -1580,6 +1614,9 @@ class BuiltinDriver(Driver):
 
     def send_keys(self, text: str) -> None:
         log.info('пробный поток: ввод %r не требуется', text)
+
+    def send_bytes(self, data: bytes, *, eol: Optional[int] = None) -> None:
+        log.info('пробный поток: ввод %r не требуется', data)
 
 
 def _default_stream() -> Optional[Path]:

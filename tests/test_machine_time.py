@@ -194,6 +194,9 @@ class _Recorder:
     def send_keys(self, text):
         self.sent.append(text)
 
+    def send_bytes(self, data, *, eol=None):
+        self.sent.append(data.decode('latin-1'))
+
     def close(self):
         pass
 

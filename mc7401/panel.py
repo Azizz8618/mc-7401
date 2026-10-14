@@ -33,7 +33,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Sequence
 
-from .chars import SET_LABELS
+from . import chars
+from .chars import SET_LABELS, SET_SHORT
 from .pen import MODE_DRAW, MODE_SELECT
 
 #: Разделитель ячеек подвала.
@@ -143,8 +144,9 @@ class Status:
 
     #: `'host'` (С ЭВМ) или `'local'` (АВТОНОМНО).
     mode: str = 'host'
-    #: Имя набора знаков: `'n2'` | `'koi8r'`.
-    charset: str = 'n2'
+    #: Набор **ввода** с клавиатуры: `'n2'` (Н2, КОИ-7) | `'koi8r'`
+    #: (КОИ-8Р).  Клавиша F8 «НАБОР» переключает.
+    charset: str = chars.INPUT_SET
     #: Строка состояния линии: имя источника или `адрес:порт`.
     line: str = EMPTY
     #: Тип линии из баннера: «ДКС» или «КВУ».  **Не выдумывается**: если
@@ -293,7 +295,10 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
     return [
         cell('РЖМ=', 'СЭВМ' if st.mode == 'host' else 'АВТО',
              'on' if st.mode == 'host' else 'local'),
-        cell('НАБ=', 'КОИ8' if st.charset == 'koi8r' else 'Н2'),
+        cell('НАБ=', SET_SHORT.get(st.charset, st.charset),
+             # Н2 (КОИ-7) — набор линии ДКС, обычное состояние; КОИ-8Р
+             # оператор выбрал сам, и это подсвечено.
+             'state' if st.charset == chars.INPUT_SET else 'on'),
         cell('ЛИН=', (st.link_kind or 'НЕТ') if st.banner else EMPTY,
              'state' if st.banner else 'err'),
         cell('ЭХО=', 'ВКЛ' if st.echo else 'ВЫКЛ',
