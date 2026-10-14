@@ -60,6 +60,7 @@ from .select import Selection
 from .session import MODE_LOCAL, Session
 from .undo import LIMIT as DEFAULT_UNDO, Undo
 from .version import short as version_short, window_title
+from .machine_time import MachineClock, TIME_QUERY
 
 log = logging.getLogger('mc7401.window')
 
@@ -177,6 +178,12 @@ class TerminalWindow:
         #: Кадр или состояние изменились — окно пора перерисовать.
         self._dirty = True
         self._clock_at = 0.0
+        #: Время **ЭВМ**, а не компьютера: берётся директивой `ВРЕ` и идёт
+        #: само между опросами.  Время хоста в строке состояния стояло
+        #: мимо: на стенде ЭВМ отвечала `ВРЕМЯ:22.04`, а баннер линии в
+        #: тот же момент несла `19:45`, и сверять работу по часам
+        #: терминала было не с чем.
+        self.mclock = MachineClock()
         #: Фаза мигания курсора: рамка знакоместа гаснет и вспыхивает.
         self._blink_on = True
         self._blink_at = 0.0
@@ -206,6 +213,11 @@ class TerminalWindow:
         # работать, и пустой экран с рисунком больше не нужен.
         self.dismiss_splash()
         if not _is_commands(data):
+            # Ответ на `ВРЕ` разбираем **до** вывода на экран: иначе
+            # строка `ДАТА:… ВРЕМЯ:…` печаталась бы как обычный текст.
+            if self.mclock.feed(data):
+                self._dirty = True
+                return
             self.session_text(data)
             return
         self.reader.feed(data)
@@ -365,7 +377,8 @@ class TerminalWindow:
         у настоящего 15ИЭ.
         """
         st = self.status()
-        return (chrome.status_rows(st),
+        return (chrome.status_rows(st, clock=self.mclock.stamp(),
+                                   clock_stale=self.mclock.stale),
                 chrome.footer_rows(st, help_=self.show_help, diag=self.diag))
 
     def chrome_px(self) -> int:
@@ -1454,7 +1467,9 @@ class TerminalWindow:
         """Верхняя строка состояния текстом — для проверок."""
         from . import panel
         return [panel.render_plain(row)
-                for row in chrome.status_rows(self.status())]
+                for row in chrome.status_rows(
+                    self.status(), clock=self.mclock.stamp(),
+                    clock_stale=self.mclock.stale)]
 
     def _last_label(self, key: str) -> str:
         """«ПОСЛ:» — код выданного знака и сам знак (`≡144 'd'`)."""
@@ -1519,6 +1534,12 @@ class TerminalWindow:
                 data = self.driver.poll(0.05)
                 if data:
                     self.feed(data)
+                # Время ЭВМ: раз в `POLL_SECONDS` спрашиваем директивой
+                # `ВРЕ`.  Ответ придёт обычным обходом и разберётся в
+                # `feed`; здесь только отправка.  Без линии не спрашиваем:
+                # ЭВМ за ней не стоит, а слать в никуда нельзя.
+                if self.mclock.due():
+                    self._ask_machine_time()
             now = time.monotonic()
             if now - self._blink_at >= self.CURSOR_BLINK_MS / 1000:
                 self._blink_at = now
@@ -1535,6 +1556,20 @@ class TerminalWindow:
                     self._tk.after(self.TICK_MS, self._tick)
                 except Exception:                    # noqa: BLE001
                     self.running = False             # окно уже разобрано
+
+    def _ask_machine_time(self) -> None:
+        """Спросить время ЭВМ директивой `ВРЕ` (с `ПРПС`).
+
+        Директива **печатается на экране**: ОС отвечает строкой
+        `ДАТА:ДД.ММ.ГГ ВРЕМЯ:ЧЧ.ММ.СС` прямо в потоке, и оператор видит
+        ответ — так же, как на настоящем терминале.
+        """
+        if self.driver is None:
+            return
+        try:
+            self.driver.send_keys(TIME_QUERY.decode('latin-1'))
+        except Exception as exc:                     # noqa: BLE001
+            log.debug('запрос времени не ушёл: %s', exc)
 
     def _note_fault(self, exc: BaseException) -> None:
         """Показать сбой в подвале и один раз отключить линию.

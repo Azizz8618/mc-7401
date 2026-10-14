@@ -207,7 +207,7 @@ class Status:
 # ── верхняя строка состояния ───────────────────────────────────────────────
 
 def status_line(st: Status, *, now: Optional[datetime] = None,
-                full: bool = True) -> list[Cell]:
+                 full: bool = True, clock: str = '', clock_stale: bool = False) -> list[Cell]:
     """Строка состояния линии — у верхней кромки кадра, поверх него.
 
     Слева направо: тип линии, номер ЭВМ, номер терминала, канал, режим
@@ -241,9 +241,17 @@ def status_line(st: Status, *, now: Optional[datetime] = None,
     # видно сразу, выбрана одна строка или пол-экрана.
     if st.selection:
         out.append(mk(('ВЫД=', 'label'), (st.selection, 'state')))
-    stamp = (now or datetime.now()).strftime(
-        '%d.%m.%Y %H:%M:%S' if full else '%d.%m %H:%M')
-    out.append(mk((stamp, 'diag')))
+    # Время берётся у **ЭВМ** (`clock`), а не у компьютера: на стенде
+    # ЭВМ на директиву `ВРЕ` отвечала `ВРЕМЯ:22.04.15`, а баннер линии
+    # в тот же момент несел `19:45` — сверять работу по часам терминала
+    # было не с чем.  Часы компьютера подставляются только когда ЭВМ
+    # молчит, и тогда помечаются меткой `КОМП`, чтобы спутать нельзя.
+    if clock:
+        out.append(mk((clock, 'warn' if clock_stale else 'diag')))
+    else:
+        stamp = (now or datetime.now()).strftime(
+            '%d.%m %H:%M' if not full else '%d.%m.%Y %H:%M:%S')
+        out.append(mk((f'КОМП {stamp}', 'warn')))
     return out
 
 

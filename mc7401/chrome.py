@@ -79,7 +79,8 @@ def cols() -> int:
 STATUS_GAP: list[Row] = [[RULE], []]
 
 
-def status_rows(st: Status) -> list[Row]:
+def status_rows(st: Status, *, clock: str = '',
+                clock_stale: bool = False) -> list[Row]:
     """Всё, что стоит **над** кадром: строка состояния, черта и отступ.
 
     Порядок и содержание — как в эталоне 15ИЭ: тип линии, ЭВМ, терминал,
@@ -95,7 +96,9 @@ def status_rows(st: Status) -> list[Row]:
     перед рабочей областью».  Ряды возвращаются готовыми, поэтому
     `top_height` и `render_status` ничего не знают про отступ.
     """
-    cells: list[Cell] = list(panel_status_line(st, full=False))
+    cells: list[Cell] = list(panel_status_line(st, full=False,
+                                              clock=clock,
+                                              clock_stale=clock_stale))
     width = cols()
     rows: list[Row] = []
     cur: Row = []
@@ -112,14 +115,16 @@ def status_rows(st: Status) -> list[Row]:
     return rows + [list(r) for r in STATUS_GAP]
 
 
-def status_text_rows(st: Status) -> list[Row]:
+def status_text_rows(st: Status, *, clock: str = '',
+                    clock_stale: bool = False) -> list[Row]:
     """Только строка состояния — без черты и отступа.
 
     Нужна там, где верхняя полоса нужна для проверки содержимого, а не
     для рисования: `len` такой полосы иначе сбился бы на два ряда
     отбивки.
     """
-    return status_rows(st)[:-len(STATUS_GAP)] if STATUS_GAP else status_rows(st)
+    full = status_rows(st, clock=clock, clock_stale=clock_stale)
+    return full[:-len(STATUS_GAP)] if STATUS_GAP else full
 
 
 def footer_rows(st: Status, *, help_: bool = True,
