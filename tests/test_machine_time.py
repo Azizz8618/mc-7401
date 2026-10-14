@@ -68,16 +68,45 @@ def test_directive_is_koi7_vre_and_needs_return():
 
 def test_clock_starts_unknown_and_stamps_nothing():
     """Пока ЭВМ не ответила, времени нет — подставлять время хоста нельзя."""
-    c = MachineClock()
+    c = MachineClock(enabled=True)
     assert not c.known
     assert c.stamp() == ''
     assert c.stale
-    assert c.due(), 'первый опрос должен быть сразу'
+    assert c.due(), 'первый опрос включённых часов должен быть сразу'
+
+
+def test_clock_is_silent_by_default():
+    """По умолчанию ЭВМ не спрашивают: директива печатается на экране.
+
+    Запрос уходит в линию сам и виден в выдаче — а на экране может идти
+    выдача задачи, и строка `ВРЕ ДАТА:…` сбивает её чтение.  Поэтому
+    выключатель по умолчанию выключен, и «пора спросить» не наступает
+    никогда, сколько бы времени ни шли часы.
+    """
+    c = MachineClock()
+    assert not c.enabled
+    assert not c.due(), 'выключенные часы не просят ЭВМ'
+    assert c.stamp() == ''
+    # И через «много периодов» — молчат.
+    c._at = time.monotonic() - 100 * c.POLL_SECONDS
+    assert not c.due(), 'выключенные часы не должны оживать со временем'
+
+
+def test_disabled_clock_still_reads_a_manual_directive():
+    """Если `ВРЕ` набрал оператор, ответ разбирается и время видно.
+
+    Выключатель запрещает терминалу **спрашивать самому**, а не
+    разбирать ответ: вопрос задал человек, и молчать было бы глупо.
+    """
+    c = MachineClock()
+    assert c.feed(LIVE_REPLY)
+    assert c.stamp() == '13.10 22:06', c.stamp()
+    assert not c.due(), 'и после ответа выключенные часы не просят'
 
 
 def test_clock_advances_by_itself_between_polls():
     """Между опросами время идёт само, а не с системных часов."""
-    c = MachineClock()
+    c = MachineClock(enabled=True)
     assert c.feed(LIVE_REPLY)
     assert c.known and not c.stale
     first = c.now()
@@ -94,7 +123,7 @@ def test_clock_advances_by_itself_between_polls():
 
 def test_clock_polls_once_per_period():
     """Опрос не частится: часы идут сами, линия не засоряется."""
-    c = MachineClock()
+    c = MachineClock(enabled=True)
     c.feed(LIVE_REPLY)
     assert not c.due(), 'сразу после ответа опроса быть не должно'
     c._at -= c.POLL_SECONDS + 1          # как будто прошёл период
@@ -121,3 +150,102 @@ def test_status_line_shows_machine_time(monkeypatch):
     # Без ответа ЭВМ время компьютера помечается, чтобы спутать нельзя.
     text2 = panel.render_plain(chrome.status_rows(st)[0])
     assert 'КОМП' in text2, text2
+
+
+# ── выключатель: настройка, окно, линия ────────────────────────────────────
+
+def test_machine_time_is_off_by_default():
+    """По умолчанию ЭВМ не спрашивают."""
+    from mc7401.config import Config
+    assert Config.default().machine_time is False
+
+
+def test_machine_time_setting_is_read_from_the_file(tmp_path):
+    """`[line] machine_time = true` включает запрос."""
+    from mc7401.config import Config
+    path = tmp_path / 'mc7401.ini'
+    path.write_text('[line]\nmachine_time = true\n', encoding='utf-8')
+    assert Config.load(path).machine_time is True
+    path.write_text('[line]\nmachine_time = false\n', encoding='utf-8')
+    assert Config.load(path).machine_time is False
+
+
+def test_template_ships_the_option_switched_off():
+    """В шаблоне настроек опция есть и выключена — иначе молча сработает."""
+    from mc7401.config import SAMPLE
+    line = [ln for ln in SAMPLE.splitlines()
+            if ln.strip().startswith('machine_time')]
+    assert line, 'в шаблоне настроек нет machine_time'
+    assert line[0].split('=', 1)[1].strip() == 'false', line[0]
+
+
+class _Recorder:
+    """Линия, которая только запоминает, что в неё отправили."""
+
+    name = 'запись'
+    greeting = b''
+
+    def __init__(self):
+        self.sent: list[str] = []
+
+    def poll(self, t=0.05):
+        return b''
+
+    def send_keys(self, text):
+        self.sent.append(text)
+
+    def close(self):
+        pass
+
+
+def _window(monkeypatch, **cfg_kw):
+    from test_frontend import FakeCanvas, FakePhoto, FakeRoot, FakeText
+    from mc7401 import window as window_mod
+    from mc7401.config import Config
+    cfg = Config.default()
+    for key, value in cfg_kw.items():
+        setattr(cfg, key, value)
+    driver = _Recorder()
+    win = window_mod.TerminalWindow(driver, scale=0, config=cfg)
+    win._canvas = FakeCanvas(1200, 900)
+    win._image_id = 1
+    win.lbl_status = FakeText()
+    win.lbl_panel = FakeText()
+    win._tk = FakeRoot()
+    return win, driver
+
+
+def test_window_sends_nothing_to_the_line_by_default(monkeypatch):
+    """Без настройки терминал не отправляет в линию ничего.
+
+    Директива `ВРЕ` печатается на экране и мешает читать выдачу задачи,
+    поэтому по умолчанию она не отправляется вовсе — даже если линия
+    подключена и часы тикают.
+    """
+    win, driver = _window(monkeypatch)
+    assert not win.mclock.enabled
+    for _ in range(5):
+        win._ask_machine_time()
+    assert not driver.sent, f'в линию ушло: {driver.sent!r}'
+
+
+def test_window_sends_the_directive_when_asked(monkeypatch):
+    """С настройкой `machine_time = true` директива уходит."""
+    from mc7401.machine_time import TIME_QUERY
+    win, driver = _window(monkeypatch, machine_time=True)
+    assert win.mclock.enabled
+    win._ask_machine_time()
+    assert driver.sent == [TIME_QUERY.decode('latin-1')], driver.sent
+
+
+def test_status_line_falls_back_to_computer_time_when_off(monkeypatch):
+    """Пока ЭВМ не спрашивают, в строке состояния время компьютера.
+
+    И обязательно с меткой `КОМП`: без неё время хоста выдавало бы себя
+    за время ЭВМ, а расходятся они на стенде на два с лишним часа.
+    """
+    win, _ = _window(monkeypatch)
+    assert win.mclock.stamp() == ''
+    line = ' '.join(win._status_lines())
+    assert 'КОМП' in line, line
+    assert 'ВРЕМЯ' not in line and '13.10' not in line, line
