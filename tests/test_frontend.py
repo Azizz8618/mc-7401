@@ -945,12 +945,13 @@ def test_undo_is_whole_stroke_not_per_segment(monkeypatch):
 
 
 def test_undo_works_in_host_mode_too_but_says_so(monkeypatch):
-    """В режиме С ЭВМ отменять нечего, и терминал об этом говорит."""
+    """В режиме С ЭВМ отмена работает для локальных действий пера."""
     win = make_window(monkeypatch)
     win.session.set_mode('host')
-    assert not win.undo_last(), 'отмена сработала в режиме С ЭВМ'
+    win._undo_push('штрих')
+    assert win.undo_last(), 'отмена не сработала для пера в режиме С ЭВМ'
     log = str(list(win.diag.entries))
-    assert 'АВТОНОМНО' in log, 'не сказано, почему отмена не сработала'
+    assert 'штрих' in log, 'не сказано, что отменили'
 
 
 def test_undo_on_empty_history_reports(monkeypatch):

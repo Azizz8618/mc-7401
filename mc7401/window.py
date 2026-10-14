@@ -150,6 +150,10 @@ class TerminalWindow:
         self.pen.enabled = bool(getattr(config, 'pen', False))
         #: Инструмент пера — перебирается клавишей F3.
         self.pen_tool = DEFAULT_TOOL
+        #: Тип линии пера — перебирается клавишей F3 с Shift.
+        self.pen_line_type = 1
+        #: Толщина пера — перебирается клавишей F3 с Ctrl.
+        self.pen_width = 1
         #: История выдачи: кадры, ушедшие по `F5 ОЧИСТКА`; колесо и
         #: PgUp/PgDn листают её (`_hist_at` — индекс, None = текущий кадр).
         self._history: list[Framebuffer] = []
@@ -204,7 +208,7 @@ class TerminalWindow:
         for ev in self.reader.pop():
             if ev.kind is EventKind.COMMAND:
                 self.emu.execute(self.emu.parser.parse(ev.data))
-                n = self.emu.fb.count_set()
+                n = self.emu.fb._count              # O(1) вместо count_set()
                 if n > self.best_n:               # кадр оператора
                     self.best, self.best_n = self.emu.fb.copy(), n
             else:
@@ -231,7 +235,7 @@ class TerminalWindow:
 
     def _touch_frame(self) -> None:
         """Локальное изменение кадра (текст, эхо) — оно и есть текущее."""
-        self.best, self.best_n = self.emu.fb.copy(), self.emu.fb.count_set()
+        self.best, self.best_n = self.emu.fb.copy(), self.emu.fb._count
 
     # ── окно ────────────────────────────────────────────────────────────────
 
@@ -826,28 +830,19 @@ class TerminalWindow:
     def _undo_push(self, what: str) -> None:
         """Запомнить кадр перед локальным действием.
 
-        История ведётся только в режиме **АВТОНОМНО**: там действия
-        остаются локальными, и отменять их имеет смысл.  В режиме С ЭВМ
-        действие уже ушло по линии — отменять нечего, и молчаливая
-        история только вводила бы в заблуждение.
+        В режиме **АВТОНОМНО** отменяются все действия.  В режиме
+        **С ЭВМ** отменяются только локальные действия пера (штрих,
+        стирание): они видны на кадре и не ушли на ЭВМ — отмена
+        возвращает кадр до штриха.
         """
-        if self.session.mode == MODE_LOCAL:
-            self.undo.push(self.emu.fb, what)
+        self.undo.push(self.emu.fb, what)
 
     def undo_last(self) -> bool:
         """Отменить последнее действие (`Ctrl-Z`).
 
-        Возвращает `True`, если было что отменить.  В режиме С ЭВМ
-        команда не выполняется: там действие ушло на ЭВМ, и «отмена»
-        означала бы тихую ложь оператору.
+        В режиме АВТОНОМНО отменяются все действия. В режиме С ЭВМ
+        отменяются только локальные действия пера (штрих, стирание).
         """
-        if self.session.mode != MODE_LOCAL:
-            self.diag.add('отмена только в АВТОНОМНО — действие ушло на ЭВМ',
-                          'warn')
-            self.last_key = 'ОТМЕНА'
-            self._dirty = True
-            self.paint()
-            return False
         step = self.undo.pop()
         if step is None:
             self.diag.add('отменять нечего', 'info')
@@ -968,8 +963,20 @@ class TerminalWindow:
                 self.last_key = 'ИНСТР'
                 self.paint()
                 return 'break'
-            self.pen_tool = self.pen.next_tool()
-            self.diag.add('инструмент пера: ' + self.pen_tool)
+            if getattr(event, 'state', 0) & 0x8:  # Shift+F3 — тип линии
+                self.pen_line_type = (self.pen_line_type + 1) % 8
+                self.pen.line_type = self.pen_line_type
+                self.diag.add(f'тип линии: {self.pen_line_type}')
+            elif getattr(event, 'state', 0) & 0x4:  # Ctrl+F3 — толщина
+                widths = [1, 2, 3]
+                idx = widths.index(self.pen_width) if self.pen_width in widths else 0
+                self.pen_width = widths[(idx + 1) % len(widths)]
+                self.pen.width = self.pen_width
+                self.diag.add(f'толщина пера: {self.pen_width}')
+            else:
+                self.pen_tool = self.pen.next_tool()
+                self.pen.tool = self.pen_tool
+                self.diag.add('инструмент пера: ' + self.pen_tool)
             self.last_key = 'ИНСТР'
             self.paint()
             return 'break'
@@ -981,8 +988,10 @@ class TerminalWindow:
             self.paint()
             return 'break'
         if key == 'F7':                       # снять выделение
-            if self.sel.clear() or True:
+            if self.sel.clear():
                 self.diag.add('выделение снято')
+            else:
+                self.diag.add('выделения нет', 'info')
             self.last_key = 'ВЫДЕЛ'
             self._dirty = True
             self.paint()
@@ -1310,6 +1319,8 @@ class TerminalWindow:
             pen=self.pen.enabled,
             pen_tool=self.pen.tool,
             pen_mode=self.pen.mode if self.pen.selecting else '',
+            pen_line_type=self.pen_line_type,
+            pen_width=self.pen_width,
             selection=self.sel.label() if not self.sel.empty() else '',
             undo=len(self.undo),
             undo_ready=self.session.mode == MODE_LOCAL,

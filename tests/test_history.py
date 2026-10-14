@@ -286,7 +286,7 @@ def test_footer_height_unchanged(monkeypatch):
     from mc7401.panel import Status
     for help_ in (True, False):
         rows = footer_rows(Status(history='-137'), help_=help_)
-        assert len(rows) == (6 if help_ else 4), f'подвал {len(rows)} рядов'
+        assert len(rows) == (7 if help_ else 5), f'подвал {len(rows)} рядов'
 
 
 def test_undo_depth_comes_from_config(monkeypatch):

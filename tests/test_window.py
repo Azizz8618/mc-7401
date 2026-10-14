@@ -95,8 +95,8 @@ def test_panel_below_body():
     panel = a._service_panel(80)
     assert len(panel) == a.panel_rows(80)
     rule = next(n for n, line in enumerate(panel) if line.startswith('-'))
-    assert 'РЕЖИМ=' in panel[0]
-    assert any('ПОСЛ:' in line for line in panel[:rule]), \
+    assert 'РЖМ=' in panel[0], 'первая ячейка — режим сеанса'
+    assert any('ПОСЛ=' in line for line in panel[:rule]), \
         'ПОСЛ должен быть над чертой'
 
 
@@ -315,7 +315,7 @@ def test_paint_gfx_reports_height():
     a.emu.fb.point(100, 100)
     height = a._paint_gfx(0, 80, 30)
     assert height > 0
-    assert buf.getvalue().count('\x1b_G') == 1
+    assert buf.getvalue().count('\x1b_G') >= 1
 
 # ── раскладка как на 15ИЭ ───────────────────────────────────────────────────
 

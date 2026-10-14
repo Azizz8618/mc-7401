@@ -157,10 +157,12 @@ class Selection:
         """Идёт ли протяжка."""
         return self._drag is not None
 
-    def clear(self) -> None:
-        """Снять всё выделение."""
+    def clear(self) -> bool:
+        """Снять всё выделение. Возвращает True, если что-то было снято."""
+        had = bool(self.frags) or self._drag is not None
         self.frags.clear()
         self._drag = None
+        return had
 
     def empty(self) -> bool:
         """Нет ли выделения (ни завершённого, ни идущего)."""

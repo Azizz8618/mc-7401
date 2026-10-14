@@ -166,6 +166,10 @@ class Status:
     pen_tool: str = 'штрих'
     #: Режим пера: `'рисование'` | `'выделение'` (клавиша F4).
     pen_mode: str = ''
+    #: Тип линии пера (0…7, как в терминале).
+    pen_line_type: int = 1
+    #: Толщина пера в точках.
+    pen_width: int = 1
     #: Размер выделения мышью, как на 15ИЭ: `СТР 1фр 1с 12зн`.
     selection: str = ''
     #: Сколько действий можно отменить (`Ctrl-Z`, только АВТОНОМНО).
@@ -290,6 +294,12 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
              'on' if st.pen else 'off'),
         cell('ИНСТ=', PEN_TOOLS.get(st.pen_tool, st.pen_tool)
              if st.pen and not st.pen_mode else EMPTY),
+        cell('ЛИН=', str(st.pen_line_type) if st.pen and not st.pen_mode
+             else EMPTY,
+             'on' if st.pen else 'off'),
+        cell('ТОЛ=', str(st.pen_width) if st.pen and not st.pen_mode
+             else EMPTY,
+             'on' if st.pen else 'off'),
         cell('ОТМ=', str(st.undo) if st.undo else (EMPTY if st.undo_ready
                                                  else 'НЕТ'),
              'on' if st.undo else 'off'),

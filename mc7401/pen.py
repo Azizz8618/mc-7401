@@ -49,7 +49,7 @@ _MOUSE_RE = re.compile(r'^\x1b\[<(\d+);(\d+);(\d+)([Mm])$')
 #: источниках не найдено; заменяется, как только появится описание.
 PEN_PREFIX = '\x1b['
 
-#: Инструменты пера: подпись в подвале → (клавиша терминала, рисует штрих).
+#: Инструменты пера: подпись в подвале → (перо терминала, рисует штрих).
 #: `PEN_ERASE` и `PEN_XOR` — те же перо, что и у команд `*` и `≠`.
 TOOLS: dict[str, tuple[str, bool]] = {
     'штрих': (PEN_OR, True),
@@ -59,6 +59,25 @@ TOOLS: dict[str, tuple[str, bool]] = {
 }
 #: Порядок перебора клавишей F3.
 TOOL_ORDER = ('штрих', 'точка', 'стирание', 'инверсия')
+
+#: Типы линий пера: 8-разрядные шаблоны (как в терминале).
+LINE_PATTERNS: dict[int, tuple[int, ...]] = {
+    0: (1, 1, 1, 1, 1, 1, 1, 1),      # сплошная
+    1: (1, 1, 1, 1, 1, 1, 1, 1),      # сплошная тонкая
+    2: (1, 1, 1, 0, 1, 1, 1, 0),      # штриховая
+    3: (1, 1, 0, 0, 1, 1, 0, 0),      # пунктирная
+    4: (1, 1, 1, 0, 0, 0, 1, 0),      # штрих-пунктирная
+    5: (1, 0, 0, 0, 1, 0, 0, 0),      # точечная
+    6: (0, 0, 0, 0, 0, 0, 0, 0),      # отключена
+    7: (1, 1, 0, 0, 0, 0, 0, 0),      # редкая штриховая
+}
+
+#: Виды пера: толщина и стиль.
+PEN_WIDTHS: dict[str, int] = {
+    'тонкое': 1,
+    'обычное': 2,
+    'толстое': 3,
+}
 #: Инструмент по умолчанию.
 DEFAULT_TOOL = TOOL_ORDER[0]
 
@@ -116,6 +135,10 @@ class LightPen:
         #: Режим пера: `MODE_DRAW` — рисует по кадру, `MODE_SELECT` —
         #: выделяет текст, как мышь 15ИЭ.  Перебирается клавишей F4.
         self.mode = MODE_DRAW
+        #: Тип линии — индекс в `LINE_PATTERNS` (0…7).
+        self.line_type = 1
+        #: Толщина пера в точках.
+        self.width = 1
 
     # ── режим ───────────────────────────────────────────────────────────────
 
@@ -226,7 +249,10 @@ class LightPen:
         идемпотентным относительно `_last`: без нажатой кнопки штрих не
         продлевается (только запоминается точка отрыва), с нажатой —
         рисуется линия от предыдущей позиции к текущей.  Инструмент
-        «точка» вместо линии ставит одиночную точку.
+        «точка» вместо линии ставит одиночную точка.
+
+        Толщина пера (`width`) рисует параллельные линии вокруг основной,
+        тип линии (`line_type`) применяет 8-разрядный шаблон.
         """
         kind, draws_line = TOOLS.get(self.tool, (PEN_OR, True))
         if not self.down:
@@ -238,30 +264,56 @@ class LightPen:
         dx, dy = self.x - x0, self.y - y0
         steps = max(abs(dx), abs(dy))
         if not draws_line:
-            fb.apply(self.x, self.y, kind)
+            self._plot_thick(fb, self.x, self.y, kind)
             self._last = (self.x, self.y)
             return True
         if steps == 0:
             return False
+        pattern = LINE_PATTERNS.get(self.line_type,
+                                    (1, 1, 1, 1, 1, 1, 1, 1))
         for i in range(1, steps + 1):
-            fb.apply(x0 + round(dx * i / steps), y0 + round(dy * i / steps),
-                     kind)
+            if pattern[i & 7]:
+                px = x0 + round(dx * i / steps)
+                py = y0 + round(dy * i / steps)
+                self._plot_thick(fb, px, py, kind)
         self._last = (self.x, self.y)
         return True
 
+    def _plot_thick(self, fb: Framebuffer, x: int, y: int,
+                    pen: str) -> None:
+        """Нарисовать точку с учётом толщины пера.
+
+        Толщина 1 — одна точка, 2 — квадрат 2×2, 3 — квадрат 3×3 и т.д.
+        """
+        w = max(1, self.width)
+        if w == 1:
+            fb.apply(x, y, pen)
+            return
+        r = w // 2
+        for dy in range(-r, w - r):
+            for dx in range(-r, w - r):
+                fb.apply(x + dx, y + dy, pen)
+
     def dot(self, fb: Framebuffer, *, pen: Optional[str] = None) -> None:
         """Одиночная точка пером `pen` (по умолчанию — инструментом)."""
-        fb.apply(self.x, self.y, pen or self.pen_kind)
+        self._plot_thick(fb, self.x, self.y, pen or self.pen_kind)
 
     def line_to(self, fb: Framebuffer, x: int, y: int,
                 *, pen: Optional[str] = None) -> None:
-        """Провести линию от текущей точки пера к `(x, y)` — команда `7`."""
+        """Провести линию от текущей точки пера к `(x, y)` — команда `7`.
+
+        С учётом толщины пера и типа линии.
+        """
         kind = pen or self.pen_kind
         x0, y0 = self.x, self.y
         steps = max(abs(x - x0), abs(y - y0))
+        pattern = LINE_PATTERNS.get(self.line_type,
+                                    (1, 1, 1, 1, 1, 1, 1, 1))
         for i in range(steps + 1):
-            fb.apply(x0 + round((x - x0) * i / max(1, steps)),
-                     y0 + round((y - y0) * i / max(1, steps)), kind)
+            if pattern[i & 7]:
+                px = x0 + round((x - x0) * i / max(1, steps))
+                py = y0 + round((y - y0) * i / max(1, steps))
+                self._plot_thick(fb, px, py, kind)
         self.x = max(0, min(self.fb.width - 1, x))
         self.y = max(0, min(self.fb.height - 1, y))
         self._last = (self.x, self.y)
@@ -277,4 +329,5 @@ class LightPen:
 
 
 __all__ = ['PenEvent', 'LightPen', 'PEN_PREFIX', 'TOOLS', 'TOOL_ORDER',
-           'DEFAULT_TOOL', 'MODE_DRAW', 'MODE_SELECT', 'MODE_ORDER']
+           'DEFAULT_TOOL', 'MODE_DRAW', 'MODE_SELECT', 'MODE_ORDER',
+           'LINE_PATTERNS', 'PEN_WIDTHS']
