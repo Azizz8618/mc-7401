@@ -1166,14 +1166,39 @@ def test_ctrl_q_exits_with_x11_control_code(monkeypatch):
     assert not win.running, 'Ctrl-q не закрыл терминал'
 
 
-def test_f12_exits(monkeypatch):
-    """F12 — выход, назначенная клавиша, без модификаторов."""
+def test_f11_exits(monkeypatch):
+    """F11 — выход, назначенная клавиша, без модификаторов.
+
+    Раньше выход был на F11 и F12 сразу; F12 освободился под
+    «УПР.СИМВ» (F12), а выход остался на F11.
+    """
     win = make_window(monkeypatch)
     win.driver = CountingDriver()
-    assert win._on_key(FakeEvent('F12')) == 'break'
+    assert win._on_key(FakeEvent('F11')) == 'break'
     assert not win.running
     assert win.driver is None, 'линия не отпущена'
     assert win._tk.quit_calls == 1
+
+
+def test_f12_toggles_ctrl_glyphs_and_does_not_exit(monkeypatch):
+    """F12 — «УПР.СИМВ»: переключает показ и **не** выходит.
+
+    В 15ИЭ F7 — «УПР.СИМВ», а F12 там и был выходом.  Здесь F7 занят
+    снятием выделения, поэтому режим достался F12, а выход ушёл на F11;
+    смешивать две разные вещи на одной клавише нельзя.
+    """
+    win = make_window(monkeypatch)
+    win.driver = CountingDriver()
+    assert not win.console.show_ctrl
+    assert win._on_key(FakeEvent('F12')) == 'break'
+    assert win.console.show_ctrl, 'режим не включился'
+    assert win.running, 'F12 не должен выходить'
+    assert win.driver is not None, 'линия отпущена'
+    assert win._tk.quit_calls == 0
+    assert win._on_key(FakeEvent('F12')) == 'break'
+    assert not win.console.show_ctrl, 'режим не выключился'
+    # В подвале режим виден, а не только тем, что знаки замигали.
+    assert win.status().ctrl_glyphs in (True, False)
 
 
 def test_ctrl_c_centres_cursor(monkeypatch):

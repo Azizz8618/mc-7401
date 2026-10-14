@@ -217,7 +217,7 @@ class TerminalWindow:
         # Данные от ЭВМ — тоже повод снять заставку: терминал начал
         # работать, и пустой экран с рисунком больше не нужен.
         self.dismiss_splash()
-        if not _is_commands(data):
+        if not _is_commands(data, show_ctrl=self.console.show_ctrl):
             # Ответ на `ВРЕ` прячется **только тогда, когда спрашивал
             # терминал**: этот шум он создал сам, и прятать его — его
             # дело.  Если `ВРЕ` набрал оператор, ответ идёт на экран как
@@ -1134,7 +1134,21 @@ class TerminalWindow:
                 self.driver.send_keys(out.decode('latin-1'))
             self.paint()
             return 'break'
-        if key in ('F12', 'F11'):              # ВЫХОД
+        if key == 'F12':                       # УПР.СИМВ: образные знаки УП
+            # Режим мигания Видеотона-340, как в 15ИЭ.  Выключенный
+            # режим ничего не меняет: управляющие коды не видны и места
+            # не занимают, выдача читается как обычно.
+            self.console.show_ctrl = not self.console.show_ctrl
+            if not self.console.show_ctrl:
+                # Выключаем — погасить всё, что горит, иначе образные
+                # знаки остались бы на кадре навсегда.
+                self.console.repaint_ctrl(lit=False)
+                self.console.clear_ctrl()
+            self.last_key = 'УПРС'
+            self._dirty = True
+            self.paint()
+            return 'break'
+        if key == 'F11':                       # ВЫХОД
             self.quit()
             return 'break'
         if getattr(event, 'state', 0) & 0x4 and _ctrl_letter(event):
@@ -1442,6 +1456,9 @@ class TerminalWindow:
             # Положение окна в истории выдачи: пусто у живого кадра,
             # `-N` — на сколько строк окно отошло назад.
             history=f'-{self.hist.position}' if self.hist.position else '',
+            # Показ образных знаков управляющих кодов (F12): режим виден
+            # в подвале, а не только тем, что знаки замигали на кадре.
+            ctrl_glyphs=self.console.show_ctrl,
         )
 
     def _line_info(self) -> Line:
@@ -1573,6 +1590,12 @@ class TerminalWindow:
             if now - self._blink_at >= self.CURSOR_BLINK_MS / 1000:
                 self._blink_at = now
                 self._blink_on = not self._blink_on
+                # Образные знаки управляющих кодов мигают вместе с
+                # курсором: на ВТ-340 признак `ATTR_CTRL` всегда идёт
+                # вместе с `ATTR_BLINK`, иначе знак не отличить от
+                # обычного текста.
+                if self.console.show_ctrl:
+                    self.console.repaint_ctrl(lit=self._blink_on)
                 self._dirty = True
             if self._dirty or now - self._clock_at >= 1.0:
                 self._clock_at = now
@@ -1665,7 +1688,7 @@ def _ctrl_letter(event) -> Optional[str]:
 TEXT_CTRL = frozenset((0x08, 0x09, 0x0A, 0x0D))
 
 
-def _is_commands(data: bytes) -> bool:
+def _is_commands(data: bytes, *, show_ctrl: bool = False) -> bool:
     """Поток команд терминала или текст ОС Диспак?
 
     Решает, куда пойдёт пакет: в разбор графики или на экран как текст.
@@ -1685,10 +1708,19 @@ def _is_commands(data: bytes) -> bool:
       это только `ВК`, `ПС`, `ЗБ` и `ТАБ`.
 
     Текст с любыми буквами и цифрами остаётся текстом.
+
+    **Последний пункт отключается при `show_ctrl`** — включённом
+    «УПР.СИМВ».  Без этого образные знаки управляющих кодов были бы
+    недостижимы: пакет с `НП` (`0x01`) уходил в разбор графики целиком,
+    и текстовый слой их не видел вовсе.  Рамки это не ломает: поток
+    графики опознаётся первыми двумя пунктами, а лишний критерий был
+    запасным — на эталонных потоках он ни разу не сработал один.
     """
     from .constants import AR2, VK
     if bytes((AR2,)) + b'F' in data or b'/' + bytes((VK,)) in data:
         return True
+    if show_ctrl:
+        return False
     return any(b < 0x20 and b not in TEXT_CTRL for b in data)
 
 
