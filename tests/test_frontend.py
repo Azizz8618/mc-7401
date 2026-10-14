@@ -507,10 +507,10 @@ class FakeRoot:
         return done
 
 
-def make_window(monkeypatch, *, scale=0, size=(560, 460)):
+def make_window(monkeypatch, *, scale=0, size=(560, 460), config=None):
     monkeypatch.setitem(sys.modules, 'tkinter',
                         types.SimpleNamespace(PhotoImage=FakePhoto))
-    win = window.TerminalWindow(None, scale=scale)
+    win = window.TerminalWindow(None, scale=scale, config=config)
     win._canvas = FakeCanvas(*size)
     win._image_id = 1
     win.lbl_status = FakeText()
@@ -1975,3 +1975,158 @@ def test_splash_caption_clears_its_rows(monkeypatch):
                                for u in range(console_mod.RASTER_W))
         assert outside == 0, (
             f'рисунок остался под надписью в ряду {row}: {outside} точек')
+
+
+# ── попадание указателя в знакомест ──────────────────────────────────────────
+
+def _cell_point(win, col, row):
+    """Экранные координаты центра знакоместа `(col, row)`.
+
+    Ряд 0 — **верх** экрана (`console.cell_y`: `y = (ROWS-1-row)*STEP_H`),
+    поэтому на экране ряд идёт сверху вниз, как его и отдаёт
+    `_frame_row_img`.
+    """
+    from mc7401.console import STEP_H, STEP_W
+    fx, fy, scale = win._frame_geometry()
+    return (fx + int((col + 0.5) * STEP_W * scale),
+            fy + int((row + 0.5) * STEP_H * scale))
+
+
+@pytest.mark.parametrize('col,row', [(0, 0), (5, 8), (10, 20), (30, 8),
+                                     (69, 0), (0, 39), (69, 39)])
+def test_pointer_hits_the_intended_cell(monkeypatch, col, row):
+    """Указатель попадает ровно в то знакоместо, куда показывает."""
+    win = make_window(monkeypatch, size=(1200, 900))
+    win.pen.enabled = True
+    x, y = _cell_point(win, col, row)
+    assert win._cell_at(FakeClick(x, y)) == (col, row), (
+        f'указатель в знакоместо ({col},{row}) попал в '
+        f'{win._cell_at(FakeClick(x, y))}')
+
+
+def test_click_puts_cursor_in_the_clicked_row(monkeypatch):
+    """Клик мышью ставит курсор в тот ряд, где кликнули."""
+    win = make_window(monkeypatch, size=(1200, 900))
+    win.pen.enabled = False                 # курсор, а не перо
+    for row in (0, 10, 20, 39):
+        x, y = _cell_point(win, 5, row)
+        win._on_click(FakeClick(x, y))
+        assert win.console.row == row, (
+            f'клик по ряду {row} поставил курсор в {win.console.row}')
+
+
+@pytest.mark.parametrize('glyph', [1, 2, 3, 4])
+def test_pointer_hits_the_cell_at_every_glyph_scale(monkeypatch, glyph):
+    """Попадание указателя верно при любом масштабе знака.
+
+    `set_glyph_scale` переприсваивает геометрию сетки в `console`, и
+    окно вызывает его в `__init__` по `[terminal] glyph` — **после**
+    того, как модули успели импортировать эти имена.  Импорт значением
+    оставлял в `window`, `chrome` и `select` сетку прежнего масштаба:
+    при `glyph` = 2 указатель промахивался мимо знакоместа, а подвал
+    рисовался вдвое ниже текста кадра.
+    """
+    from mc7401 import console as console_mod
+    saved = console_mod.GLYPH_SCALE
+    try:
+        cfg = Config.default()
+        cfg.glyph = glyph
+        win = make_window(monkeypatch, size=(1200, 900), config=cfg)
+        win.pen.enabled = True
+        for col, row in ((0, 0), (3, 2), (console_mod.COLS - 1,
+                                            console_mod.ROWS - 1)):
+            x, y = _cell_point(win, col, row)
+            assert win._cell_at(FakeClick(x, y)) == (col, row), (
+                f'масштаб {glyph}: попали в '
+                f'{win._cell_at(FakeClick(x, y))}, ждали {(col, row)}')
+    finally:
+        console_mod.set_glyph_scale(saved)
+
+
+@pytest.mark.parametrize('glyph', [1, 2, 3, 4])
+def test_chrome_follows_the_glyph_scale(monkeypatch, glyph):
+    """Служебные полосы совпадают по высоте и ширине с текстом кадра."""
+    from mc7401 import chrome, console as console_mod
+    saved = console_mod.GLYPH_SCALE
+    try:
+        cfg = Config.default()
+        cfg.glyph = glyph
+        make_window(monkeypatch, size=(1200, 900), config=cfg)
+        assert chrome.ROW_H == console_mod.CELL_H, (
+            f'масштаб {glyph}: высота служебного ряда '
+            f'{chrome.ROW_H} при знакоместе {console_mod.CELL_H}')
+        assert chrome.cols() == console_mod.COLS, (
+            f'масштаб {glyph}: полоса на {chrome.cols()} знакомест, '
+            f'а сетка кадра {console_mod.COLS}')
+    finally:
+        console_mod.set_glyph_scale(saved)
+
+
+@pytest.mark.parametrize('glyph', [1, 2, 3, 4])
+def test_selection_counts_along_the_current_grid(monkeypatch, glyph):
+    """Размер выделения считается по сетке текущего масштаба.
+
+    Ширина сетки стояла аргументом по умолчанию, то есть вычислялась
+    при определении функции — и оставалась от прежнего масштаба.
+    """
+    from mc7401 import console as console_mod
+    from mc7401.select import Selection
+    saved = console_mod.GLYPH_SCALE
+    try:
+        console_mod.set_glyph_scale(glyph)
+        sel = Selection()
+        sel.begin(0, 0)
+        sel.drag(0, console_mod.COLS - 1)
+        sel.end()
+        assert sel.stats()[2] == console_mod.COLS, (
+            f'масштаб {glyph}: посчитано {sel.stats()[2]} знакомест, '
+            f'а ширина сетки {console_mod.COLS}')
+    finally:
+        console_mod.set_glyph_scale(saved)
+
+
+def test_frame_stays_put_when_a_selection_starts(monkeypatch):
+    """Начало выделения не двигает кадр.
+
+    Ячейка `ВЫД=` появлялась в верхней строке состояния и добавляла ей
+    ряд — полоса становилась выше, кадр съезжал вниз и сжимался (`fy` и
+    `scale` пересчитывались), и тот же пиксель экрана начинал
+    соответствовать другому знакоместу.  Выделение начиналось ровно в
+    тот момент, когда кадр уезжал из-под курсора, и выпадало на соседний
+    ряд.  Высота верхней полосы теперь зарезервирована по худшему случаю.
+    """
+    win = make_window(monkeypatch, size=(1400, 1000))
+    win.pen.enabled = True
+    win.paint()
+    before = (win._frame_geometry(), win.footer_px(),
+              len(win.chrome_parts()[0]))
+    x, y = _cell_point(win, 1, 3)
+    win._on_key(FakeEvent('F4', ''))                 # режим выделения
+    win._pen_down(FakeClick(x, y), button=1)
+    win._on_drag(FakeClick(*_cell_point(win, 9, 3)))
+    after = (win._frame_geometry(), win.footer_px(),
+             len(win.chrome_parts()[0]))
+    assert after == before, (
+        f'кадр сдвинулся при начале выделения: {before} → {after}')
+
+
+def test_upper_strip_has_a_reserved_height(monkeypatch):
+    """Верхняя полоса занимает одно и то же число рядов при любом наборе.
+
+    Резерв считается по худшему случаю — все ячейки на месте, значения
+    предельной длины.
+    """
+    from mc7401 import chrome
+    from mc7401.panel import Status
+    width = chrome.cols()
+    reserved = chrome.reserved_status_rows(width)
+    for st in (Status(),                                        # всё пусто
+               Status(link_kind='ДКС', banner=True, machine=3,
+                      terminal=21, channel='01', wire='RAW'),     # линия есть
+               Status(selection='СТР 1фр 1с 9зн'),              # выделение
+               Status(selection='КОЛ 9фр 39с 999зн', machine=3)): # всё сразу
+        for clock in ('', '13.10 22:07'):
+            rows = chrome.status_rows(st, clock=clock)
+            assert len(rows) == reserved + len(chrome.STATUS_GAP), (
+                f'полоса {len(rows)} рядов вместо {reserved} — кадр '
+                f'будет прыгать; состояние {st}')

@@ -36,8 +36,15 @@ select.py — выделение текста мышью, как в термин
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
-from .console import COLS
+#: Ширина сетки знакомест берётся из `console` при каждом обращении:
+#: `set_glyph_scale` переприсваивает `console.COLS` уже **после** загрузки
+#: этого модуля (окно вызывает его в `__init__` по `[terminal] glyph`).
+#: Значение по умолчанию в сигнатуре вычислялось бы при определении
+#: функции — то есть осталось бы от прежнего масштаба знака, и размер
+#: выделения в строке состояния считался бы не по той сетке.
+from . import console
 
 #: Вид выделения, как в строке состояния 15ИЭ.
 KIND_LINE = 'СТР'          # строчное
@@ -168,7 +175,7 @@ class Selection:
         """Нет ли выделения (ни завершённого, ни идущего)."""
         return not self.frags and self._drag is None
 
-    def stats(self, cols: int = COLS) -> tuple[int, int, int]:
+    def stats(self, cols: Optional[int] = None) -> tuple[int, int, int]:
         """Размер выделения: `(фрагментов, строк, знаков)`.
 
         Идущая протяжка считается наравне с завершённой: пока оператор
@@ -176,6 +183,8 @@ class Selection:
         знакомест: у строчного выделения промежуточные строки берутся
         целиком, и без ширины их длина не считается.
         """
+        if cols is None:
+            cols = console.COLS
         frags = list(self.frags)
         if self._drag is not None:
             frags.append(self._drag_fragment())

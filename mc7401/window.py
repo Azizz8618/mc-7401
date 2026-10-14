@@ -47,8 +47,7 @@ from . import chrome
 from . import console as console_mod
 from . import startup
 from .constants import PEN_XOR, SCREEN_HEIGHT, SCREEN_WIDTH
-from .console import (COLS, ROWS, RASTER_H, STEP_H, STEP_W, Console, cell_x,
-                      cell_y, put_glyph)
+from .console import Console, cell_x, cell_y, put_glyph
 from .emulator import TerminalEmulator
 from .framebuffer import Framebuffer
 from .history import DEFAULT_LIMIT as DEFAULT_HISTORY, History
@@ -551,8 +550,9 @@ class TerminalWindow:
             self._pen_down(event, button=1)
             return
         fx, _, scale = self._frame_geometry()
-        col = max(0, round((event.x - fx) / scale) // STEP_W) if scale else 0
-        row = self._frame_row_img(event.y) // STEP_H
+        col = (max(0, round((event.x - fx) / scale)
+                // console_mod.STEP_W) if scale else 0)
+        row = self._cell_row(event)
         if self._in_chrome(event.y):
             self.last_key = 'ПОДВАЛ'          # клик не по кадру
             self.paint()
@@ -566,6 +566,22 @@ class TerminalWindow:
         _, fy, scale = self._frame_geometry()
         frame_h = int(round(SCREEN_HEIGHT * scale))
         return not (fy <= y < fy + frame_h)
+
+    def _cell_row(self, event) -> int:
+        """Ряд знакомест кадра под указателем (0 — верх кадра).
+
+        Отражения здесь нет, и это стоит сказать явно: `_frame_row_img`
+        отдаёт ряд **сверху вниз**, а координата `Y` в кадре растёт
+        **вверх**, и соблазн отразить велик.  Но и сетка нумеруется
+        сверху вниз: `console.cell_y(0)` — верх экрана, а сам `cell_y`
+        считает `y = (ROWS - 1 - row) * STEP_H`.  Ряд от указателя уже
+        в том же порядке, поэтому и нужен как есть.
+
+        Делится на `STEP_H` — шаг **сетки**, а не `CELL_H`.  При
+        `[terminal] glyph` = 3 знакомест 24×30, а сетка идёт с шагом
+        28×40: деление на `CELL_H` уводило бы указатель на соседний ряд.
+        """
+        return self._frame_row_img(event.y) // console_mod.STEP_H
 
     def _pen_down(self, event, *, button: int = 1) -> None:
         """Нажатие пера: выделение (режим выделения) или штрих."""
@@ -615,9 +631,9 @@ class TerminalWindow:
         fx, fy, scale = self._frame_geometry()
         if not scale:
             return None, None
-        col = round((event.x - fx) / scale) // STEP_W
-        row = self._frame_row_img(event.y) // STEP_H
-        if not 0 <= col < COLS or not 0 <= row < ROWS:
+        col = round((event.x - fx) / scale) // console_mod.STEP_W
+        row = self._cell_row(event)
+        if not 0 <= col < console_mod.COLS or not 0 <= row < console_mod.ROWS:
             return None, None
         if self._in_chrome(event.y):
             return None, None
@@ -637,8 +653,9 @@ class TerminalWindow:
         # Координата уточняется всегда — перекрестье показывает пиксель,
         # а не знакоместо; перерисовка только при смене знакоместа, иначе
         # движение мыши перерисовывало бы кадр чаще, чем он меняется.
-        cell = (x // STEP_W, y // STEP_H)
-        moved = cell != (self.pen.x // STEP_W, self.pen.y // STEP_H)
+        cell = (x // console_mod.STEP_W, y // console_mod.STEP_H)
+        moved = cell != (self.pen.x // console_mod.STEP_W,
+                          self.pen.y // console_mod.STEP_H)
         self.pen.x, self.pen.y = x, y
         if moved:
             self.paint()
@@ -764,7 +781,7 @@ class TerminalWindow:
         (`scroll_view(±_view_h − 1)`): одна строка остаётся на виду, чтобы
         оператор не терял место, где остановился.  Здесь так же.
         """
-        return max(1, ROWS - 1)
+        return max(1, console_mod.ROWS - 1)
 
     def scroll_history(self, direction: int) -> int:
         """Листать **историю строк**: `-1` — назад, `1` — к кадру.
@@ -838,7 +855,7 @@ class TerminalWindow:
         # поэтому снимается — с копии, сам эталон остаётся как есть.
         art.strip_border()
         fb = Framebuffer(SCREEN_WIDTH, SCREEN_HEIGHT)
-        shift = CAPTION_ROWS * STEP_H
+        shift = CAPTION_ROWS * console_mod.STEP_H
         for y in range(min(art.height, SCREEN_HEIGHT - shift)):
             for x0, x1 in art.row_runs(y):
                 fb.set_span(x0, shift + y, x1)
@@ -894,15 +911,15 @@ class TerminalWindow:
         top_row = CAPTION_ROWS - 1
         for row in range(min(2, CAPTION_ROWS)):
             y0 = cell_y(top_row - row)
-            fb.erase_rows(y0, y0 + RASTER_H)
+            fb.erase_rows(y0, y0 + console_mod.RASTER_H)
         for row, text in ((0, self.SPLASH_CAPTION),
                           (1, self.SPLASH_VERSION)):
             if row >= CAPTION_ROWS:
                 break
-            col = max(0, (COLS - len(text)) // 2)
+            col = max(0, (console_mod.COLS - len(text)) // 2)
             y = cell_y(CAPTION_ROWS - 1 - row)
             for n, ch in enumerate(text):
-                if col + n >= COLS:
+                if col + n >= console_mod.COLS:
                     break
                 put_glyph(fb, cell_x(col + n), y, ch, 'OR')
 
@@ -982,7 +999,7 @@ class TerminalWindow:
         7401.  Инверсия растра знакоместа даёт заметную подсветку и на
         тексте, и на графике под ним.
         """
-        cells = self.sel.cells(COLS)
+        cells = self.sel.cells(console_mod.COLS)
         if not cells:
             return
         for col, row in cells:
@@ -1120,7 +1137,8 @@ class TerminalWindow:
                 self.quit()
                 return 'break'
             if low == 'c':                     # ЦЕНТР
-                self.goto_cursor(COLS // 2, ROWS // 2)
+                self.goto_cursor(console_mod.COLS // 2,
+                                  console_mod.ROWS // 2)
             elif low == 'z':                   # ОТМЕНА (АВТОНОМНО)
                 self.undo_last()
             else:

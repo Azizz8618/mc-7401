@@ -66,7 +66,8 @@ DEFAULT_ENDPOINT = '127.0.0.1:4202-4223'
 
 
 from .reader import CommandStreamReader, EventKind
-from .console import GLYPH_SCALE, set_glyph_scale
+from . import console as console_mod
+from .console import set_glyph_scale
 from .panel import Diagnostics, Status
 from .screen import ScreenRenderer, Viewport
 from .constants import VK
@@ -492,7 +493,8 @@ class TerminalApp:
         self.graphics = self.config.graphics or graphics
         self.eol = getattr(self.config, 'eol', DEFAULT_EOL)
         #: Размер знака текстового слоя кадра — `[terminal] glyph`.
-        set_glyph_scale(getattr(self.config, 'glyph', GLYPH_SCALE))
+        set_glyph_scale(getattr(self.config, 'glyph',
+                                console_mod.GLYPH_SCALE))
         #: Диагностика — журнал сообщений, последнее идёт под подвалом.
         self.diag = Diagnostics()
         #: Ряды-легенды подвала (`[terminal] help`, как `--no-help` в 15ИЭ).

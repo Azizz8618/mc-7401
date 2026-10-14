@@ -33,15 +33,26 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .console import CELL_H, CELL_W, STEP_W, put_glyph
+from . import console
+from .console import put_glyph
 from .constants import PEN_OR, SCREEN_WIDTH
 from .framebuffer import Framebuffer
 from .panel import (Cell, Diagnostics, Row, RULE, SEP, Status, cell_text,
-                    cell_width, columns, footer as panel_footer, plan,
+                    cell_width, columns, footer as panel_footer, mk, plan,
                     status_line as panel_status_line)
 
 #: Высота строки служебных строк — та же, что у текстового слоя кадра.
-ROW_H = CELL_H
+#:
+#: Берётся из `console` при каждом обращении, а не один раз при импорте:
+#: `set_glyph_scale` переприсваивает `console.CELL_H` уже **после** загрузки
+#: этого модуля — окно вызывает его в `__init__` по `[terminal] glyph`.
+#: Константа, вычисленная при импорте, осталась бы от прежнего масштаба
+#: знака, и служебные полосы рисовались бы вдвое ниже текста кадра и
+#: налезали бы на него.  Поэтому `ROW_H` — вычисляемое поле модуля
+#: (см. `__getattr__` в конце файла), а внутри модуля — через `row_h()`.
+def row_h() -> int:
+    """Высота ряда служебных строк в точках — текущий размер знака."""
+    return console.CELL_H
 #: Ширина ячейки подвала в знакоместах СИМ.  Полоса — 70 знакомест, и
 #: колонки должны быть широкими, чтобы значение влезало рядом с
 #: меткой: на девяти знакоместах «ПЕРО=ВЫД» или «ОТМЕНА=Ctrl-z»
@@ -68,7 +79,7 @@ def cols() -> int:
     Считается на лету: размер знака задаётся настройкой `[terminal] glyph`
     (`console.set_glyph_scale`), и полоса обязана с ним совпадать.
     """
-    return max(1, SCREEN_WIDTH // STEP_W)
+    return max(1, SCREEN_WIDTH // console.STEP_W)
 
 
 # ── содержимое ─────────────────────────────────────────────────────────────
@@ -77,6 +88,66 @@ def cols() -> int:
 #: как на 15ИЭ.  Отступ нужен, чтобы верхний ряд рабочего поля не лип к
 #: черте: на настоящем терминале кадр отделён от служебных строк.
 STATUS_GAP: list[Row] = [[RULE], []]
+
+
+def _wrap_cells(cells: list[Cell], width: int) -> list[Row]:
+    """Разложить ячейки по рядам полосы — жадно, по ширине."""
+    rows: list[Row] = []
+    cur: Row = []
+    used = 0
+    for cell in cells:
+        w = cell_width(cell)
+        if cur and used + len(SEP) + w > width:
+            rows.append(cur)
+            cur, used = [], 0
+        used += (len(SEP) if cur else 0) + w
+        cur.append(cell)
+    if cur:
+        rows.append(cur)
+    return rows
+
+
+#: Заполнитель зарезервированного ряда.
+#:
+#: Ряд резерва должен быть **непустым**: пустые ряды над чертой читались
+#: бы дырами в полосе, да и требование «строка состояния, затем черта»
+#: проверяется как «все ряды над чертой непусты».  Рисовать в нём
+#: нечего — знакоместо пробела.
+_RESERVE_CELL: Cell = mk((' ', 'label'))
+#: Резерв рядов строки состояния по ширине полосы: считается один раз.
+_RESERVED: dict[int, int] = {}
+
+
+def reserved_status_rows(width: int) -> int:
+    """Сколько рядов занимает строка состояния **в худшем случае**.
+
+    Набор её ячеек условен: `ЭВМ=`, `ТЕРМ=`, `КАН=`, `РЕЖ=`, `ВЫД=` и
+    время появляются и исчезают по ходу работы.  Раньше высота считалась
+    по факту, и каждая появившаяся ячейка могла добавить ряд: кадр от
+    того съезжал вниз и сжимался (`fy` и `scale` пересчитывались), а
+    выделение мышью начиналось **именно** в тот момент — картинка
+    уезжала из-под курсора прямо в начале протяжки, и выделение
+    выпадало на соседний ряд.  Подвал тоже скакал, когда в журнал
+    писалась строка с отметкой времени.
+
+    Поэтому высота резервируется по худшему случаю — все ячейки на
+    месте, значения предельной длины, — и строка состояния занимает
+    одно и то же число рядов всегда.  Пустые ряды дорисовываются и
+    ничего не занимают на экране.
+    """
+    if width not in _RESERVED:
+        clock = '99.99 99:99:99'
+        worst = Status(link_kind='ДКС', banner=True, machine=99,
+                       terminal=999, channel='999', wire='ЖОПЕСЪ',
+                       selection='КОЛ 9фр 39с 999зн')
+        lost = Status(link_kind='', banner=False, machine=0, terminal=0,
+                      channel='', wire='', selection=worst.selection)
+        n = 0
+        for st in (worst, lost):
+            cells = list(panel_status_line(st, full=False, clock=clock))
+            n = max(n, len(_wrap_cells(cells, width)))
+        _RESERVED[width] = max(1, n)
+    return _RESERVED[width]
 
 
 def status_rows(st: Status, *, clock: str = '',
@@ -100,18 +171,11 @@ def status_rows(st: Status, *, clock: str = '',
                                               clock=clock,
                                               clock_stale=clock_stale))
     width = cols()
-    rows: list[Row] = []
-    cur: Row = []
-    used = 0
-    for cell in cells:
-        w = cell_width(cell)
-        if cur and used + len(SEP) + w > width:
-            rows.append(cur)
-            cur, used = [], 0
-        used += (len(SEP) if cur else 0) + w
-        cur.append(cell)
-    if cur:
-        rows.append(cur)
+    rows = _wrap_cells(cells, width)
+    # Добиваем до резерва: кадр обязан стоять на месте при любом наборе
+    # ячеек — см. `reserved_status_rows`.
+    while len(rows) < reserved_status_rows(width):
+        rows.append([_RESERVE_CELL])
     return rows + [list(r) for r in STATUS_GAP]
 
 
@@ -148,12 +212,12 @@ def footer_rows(st: Status, *, help_: bool = True,
 
 def chrome_height(top: list[Row], bottom: list[Row]) -> int:
     """Высота полосы служебных строк в точках — оба конца вместе."""
-    return (len(top) + len(bottom)) * ROW_H
+    return (len(top) + len(bottom)) * row_h()
 
 
 def top_height(top: list[Row]) -> int:
     """Высота строки состояния над кадром в точках."""
-    return len(top) * ROW_H
+    return len(top) * row_h()
 
 
 # ── отрисовка ──────────────────────────────────────────────────────────────
@@ -169,10 +233,10 @@ def render_status(fb: Framebuffer, top: list[Row]) -> None:
     Пустой ряд ничего не рисует, а полоса стирается целиком, поэтому
     отступ остаётся чистым: верхний ряд рабочего поля не липнет к черте.
     """
-    h = len(top) * ROW_H
+    h = len(top) * row_h()
     fb.erase_rows(fb.height - h, fb.height)
     for n, row in enumerate(top):
-        _row(fb, row, fb.height - (n + 1) * ROW_H, pad=False)
+        _row(fb, row, fb.height - (n + 1) * row_h(), pad=False)
 
 
 def render_footer(fb: Framebuffer, bottom: list[Row]) -> None:
@@ -182,10 +246,10 @@ def render_footer(fb: Framebuffer, bottom: list[Row]) -> None:
     снизу, он читался бы перевёрнутым (сначала легенда, потом
     состояния).
     """
-    h = len(bottom) * ROW_H
+    h = len(bottom) * row_h()
     fb.erase_rows(0, h)
     for n, row in enumerate(bottom):
-        _row(fb, row, h - (n + 1) * ROW_H, pad=True)
+        _row(fb, row, h - (n + 1) * row_h(), pad=True)
 
 
 def render(fb: Framebuffer, top: list[Row], bottom: list[Row],
@@ -210,39 +274,54 @@ def _row(fb: Framebuffer, row: Row, y0: int, *, pad: bool) -> None:
     """
     if row == [RULE]:
         for x in range(fb.width):
-            fb.apply(x, y0 + ROW_H // 2, PEN_OR)
+            fb.apply(x, y0 + row_h() // 2, PEN_OR)
         return
-    pl = plan(fb.width // STEP_W, colw=CELL_COLS)
+    pl = plan(fb.width // console.STEP_W, colw=CELL_COLS)
     # Ширину ячейки обрезает только подвал: у колонок она общая, а в
     # строке состояния ячейки идут впритык и «13.10 07:52» не должно
     # превращаться в «13.10 07:».
-    limit = pl.colw if pad else fb.width // STEP_W
+    limit = pl.colw if pad else fb.width // console.STEP_W
     x = 0
     for n, cell in enumerate(row):
         if n:
             _sep(fb, x, y0)
-            x += len(SEP) * STEP_W
+            x += len(SEP) * console.STEP_W
         text = cell_text(cell)[:limit]
         for ch in text:
             if x >= fb.width:
                 break
             put_glyph(fb, x, y0, ch, PEN_OR)
-            x += STEP_W
+            x += console.STEP_W
         if pad:
-            x += max(0, pl.colw - len(text)) * STEP_W
+            x += max(0, pl.colw - len(text)) * console.STEP_W
 
 
 def _sep(fb: Framebuffer, x: int, y0: int) -> None:
     """Разделитель « | » ячейкой подвала."""
-    mid = ROW_H // 2
+    mid = row_h() // 2
     for dx, dy in ((0, mid - 3), (0, mid + 3), (0, mid),
-                   (CELL_W - 1, mid - 3), (CELL_W - 1, mid + 3),
-                   (CELL_W - 1, mid)):
+                   (console.CELL_W - 1, mid - 3),
+                   (console.CELL_W - 1, mid + 3),
+                   (console.CELL_W - 1, mid)):
         fb.apply(x + dx, y0 + dy, PEN_OR)
     for k in range(1, 3):
         fb.apply(x + k, y0 + mid, PEN_OR)
 
 
-__all__ = ['cols', 'ROW_H', 'CELL_COLS', 'STATUS_GAP', 'status_rows',
+def __getattr__(name: str):
+    """`ROW_H` следует за текущим размером знака.
+
+    Имя остаётся в `__all__` и читается снаружи — `window.footer_px` и
+    проверки обращаются к `chrome.ROW_H`, — но вычисляется при каждом
+    обращении, а не схватывается один раз при импорте.  `ROW_H` —
+    синоним `console.CELL_H`, и после `set_glyph_scale` он меняется.
+    """
+    if name == 'ROW_H':
+        return row_h()
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+__all__ = ['cols', 'row_h', 'ROW_H', 'CELL_COLS', 'STATUS_GAP', 'status_rows',
+           'reserved_status_rows',
            'status_text_rows', 'footer_rows', 'chrome_height', 'top_height',
            'render', 'render_status', 'render_footer']
