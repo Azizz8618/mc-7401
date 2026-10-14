@@ -1018,9 +1018,10 @@ class TerminalWindow:
             self.pen.enabled = not self.pen.enabled
             self.pen.down = False
             self.pen._last = None
-            self.diag.add('перо включено — мышь рисует' if self.pen.enabled
-                          else 'перо выключено', 'ok' if self.pen.enabled
-                          else 'info')
+            # В журнал не пишем: состояние пера и так видно в ячейке
+            # `ПЕРО=`.  Запись в журнал добавляла строку последним рядом
+            # подвала, а подвал оттого рос на ряд — и нажатие на
+            # служебную клавишу дёргало весь кадр.
             self.last_key = 'ПЕРО'
             self.paint()
             return 'break'
@@ -1034,32 +1035,30 @@ class TerminalWindow:
             if getattr(event, 'state', 0) & 0x8:  # Shift+F3 — тип линии
                 self.pen_line_type = (self.pen_line_type + 1) % 8
                 self.pen.line_type = self.pen_line_type
-                self.diag.add(f'тип линии: {self.pen_line_type}')
             elif getattr(event, 'state', 0) & 0x4:  # Ctrl+F3 — толщина
                 widths = [1, 2, 3]
                 idx = widths.index(self.pen_width) if self.pen_width in widths else 0
                 self.pen_width = widths[(idx + 1) % len(widths)]
                 self.pen.width = self.pen_width
-                self.diag.add(f'толщина пера: {self.pen_width}')
             else:
                 self.pen_tool = self.pen.next_tool()
                 self.pen.tool = self.pen_tool
-                self.diag.add('инструмент пера: ' + self.pen_tool)
+            # Инструмент, тип линии и толщина видны в ячейках
+            # `ИНСТ=`, `ТИП=` и `ТОЛ=` — в журнал они не пишутся.
             self.last_key = 'ИНСТР'
             self.paint()
             return 'break'
         if key == 'F4':                       # РЕЖИМ пера
             mode = self.pen.toggle_mode()
-            self.diag.add('режим пера: ' + mode)
             self.last_key = 'РЕЖИМ'
             self._dirty = True
             self.paint()
             return 'break'
         if key == 'F7':                       # снять выделение
-            if self.sel.clear():
-                self.diag.add('выделение снято')
-            else:
-                self.diag.add('выделения нет', 'info')
+            # Размер выделения виден в строке состояния (`ВЫД=`), а в
+            # подвал не пишем ничего: строка журнала появлялась
+            # последней строкой подвала, и на F7 «вылезали нижние часы».
+            self.sel.clear()
             self.last_key = 'ВЫДЕЛ'
             self._dirty = True
             self.paint()
@@ -1069,9 +1068,7 @@ class TerminalWindow:
             return 'break'
         if key == 'F6':                       # ЭХО
             self.session.toggle_echo()
-            self.diag.add('эхо включено' if self.session.echo
-                          else 'эхо выключено — пароль не печатается',
-                          'info')
+            # Эхо видно в ячейке `ЭХО=`; в журнал не пишем — см. F7.
             self.last_key = 'ЭХО'
             self.paint()
             return 'break'

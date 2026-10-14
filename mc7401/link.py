@@ -238,8 +238,15 @@ class EchoStrip:
 
 #: «TTY DEVICE, LINE N» — номер терминала на линии.
 BANNER_LINE_NO = re.compile(r'TTY\s+DEVICE,?\s*LINE\s+(\d+)', re.IGNORECASE)
-#: Модель и номер ЭВМ в баннере: «ЭВМ-3», «the БЭСМ-6 simulator».
-BANNER_MACHINE = re.compile(r'(?:ЭВМ|БЭСМ|ЕС)\s*-?\s*(\d+)', re.IGNORECASE)
+#: Номер ЭВМ — **только** из явной формы «ЭВМ-3» или «ЭС-3».
+#:
+#: Раньше сюда входило и `БЭСМ`, и баннер эмулятора
+#: «Connected to the БЭСМ-6 simulator TTY device, line 10» давал
+#: `machine = 6` — то есть **модель** выдавалась за номер ЭВМ.  На живой
+#: линии в строке состоянии стояло «ЭВМ=6», и это ни о чём не говорило.
+#: Номер ЭВМ приходит из приветствия ОС («ЭВМ-3,Т017») — его разбирает
+#: `OS_GREETING_MACHINE` ниже.
+BANNER_MACHINE = re.compile(r'(?:ЭВМ|ЕС)\s*-?\s*(\d+)', re.IGNORECASE)
 #: Режим линии: `Encoding is …`.
 BANNER_MODE = (('raw', 'RAW'), ('utf-?8', 'UNICODE'),
                ('koi-?7', 'JCUKEN'), ('jcuken', 'JCUKEN'))
@@ -299,6 +306,24 @@ def _tolerant(pattern: str) -> str:
         i += 1
     return ''.join(out)
 
+
+#: Номер ЭВМ в приветствии ОС Диспак: «ЭВМ-3,Т017» → 3.
+#:
+#: Линия ДКС шлёт приветствие кодами КОИ-7, и кириллица приходит
+#: **латинскими омоглифами**: на месте «ЭВМ» приходят байты `7C 42 4D`,
+#: то есть `ЭBM` — «Э» кириллическая (0x7C), а «В» и «М» латинские.
+#: Образец терпит омоглифы (`_tolerant`), иначе номер ЭВМ с живой линии
+#: не читался бы вовсе: `ЭBM` не совпадает с `ЭВМ`.
+#: В образце кириллица стоит там, где омоглифа нет, и **латиницей** —
+#: где он возможен: `_tolerant` расширяет только ASCII-буквы, поэтому
+#: «ВМ» и «Т» записаны как `BM` и `T`.  «Э» и «ЕС» — без омоглифов.
+OS_GREETING_MACHINE = re.compile(
+    _tolerant(r'ЭBM\s*-?\s*(\d+)\s*[,;]') + '|'
+    + _tolerant(r'ЕС\s*-?\s*(\d+)\s*[,;]'), re.IGNORECASE)
+#: Номер терминала там же: «ЭВМ-3,Т017» → 17.  Кириллическая «Т» по
+#: линии приходит латинской `T` (0x54) — тоже омоглиф.
+OS_GREETING_TERMINAL = re.compile(
+    _tolerant(r'[,;]\s*T\s*-?\s*(\d+)'), re.IGNORECASE)
 
 #: Маркер линии ДКС в баннере.  Терпим к омоглифам: линия шлёт приветствие
 #: кодами КОИ-7 и переводит латиницу в заглавные, так что на экране это
@@ -443,8 +468,13 @@ def parse_greeting(data: bytes) -> LineInfo:
         # Баннер пришёл, но ДКС не объявлена: обычный tty телетайпа.
         info.kind = 'КВУ' if _is_banner(data) else ''
 
-    for pattern, attr in ((BANNER_LINE_NO, 'terminal'),
-                          (BANNER_MACHINE, 'machine')):
+    # Номер ЭВМ сперва ищем в приветствии ОС («ЭВМ-3,Т017») — там он
+    # настоящий; из баннера линии берём только явную форму «ЭВМ-N», а
+    # «БЭСМ-6 simulator» в счёт не идёт: это модель, а не номер.
+    for pattern, attr in ((OS_GREETING_MACHINE, 'machine'),
+                          (BANNER_MACHINE, 'machine'),
+                          (OS_GREETING_TERMINAL, 'terminal'),
+                          (BANNER_LINE_NO, 'terminal')):
         for text in texts:
             m = pattern.search(text)
             if m:

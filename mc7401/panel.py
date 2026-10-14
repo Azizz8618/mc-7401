@@ -573,13 +573,19 @@ class Diagnostics:
         return items[-n:] if n > 0 else items
 
     def lines(self, n: int) -> list[Cell]:
-        """Сообщения ячейками подвала: `ЧЧ:ММ:СС ВАЖНО текст`."""
+        """Сообщения ячейками подвала: `ВАЖНО текст`.
+
+        **Без метки времени.**  Строка журнала идёт последней строкой
+        подвала, и время на ней читалось как «часы внизу» — тем более
+        что это время компьютера, а не ЭВМ.  Часы в подвале уже есть
+        (строка состояния), а для разбора журнал хранит отметки сам
+        (`recent`, `entries`).
+        """
         out: list[Cell] = []
         for stamp, kind, text in self.recent(n):
             style = 'err' if kind == 'err' else ('warn' if kind == 'warn'
                                                  else 'diag')
-            out.append(mk((stamp + ' ', 'diag'),
-                          (KINDS.get(kind, 'СВЕД') + ' ', style),
+            out.append(mk((KINDS.get(kind, 'СВЕД') + ' ', style),
                           (_short(text, COLW * 2), style)))
         return out
 

@@ -120,18 +120,43 @@ BANNER = ('\n\r\nConnected to the БЭСМ-6 simulator TTY device, line 3\r\n\n'
 
 
 def test_banner_yields_line_number_machine_and_mode():
-    """Баннер SIMH — источник типа линии, ЭВМ, терминала и режима.
+    """Баннер SIMH — источник типа линии, терминала и режима.
 
-    Без разбора номера ЭВМ строка состояния оставалась без него, а
-    линия, объявленная «Connected to DKS», выглядела бы как обычный
-    tty телетайпа.
+    **Номера ЭВМ в баннере нет**: «the БЭСМ-6 simulator» — это модель
+    машины, а не номер ЭВМ.  Раньше отсюда бралось `machine = 6`, и в
+    строке состоянии стояло «ЭВМ=6» — цифра, которая ни о чём не
+    говорила.  Настоящий номер приходит из приветствия ОС
+    («ЭВМ-3,Т017»), см. `test_os_greeting_gives_machine_and_terminal`.
     """
     info = parse_greeting(BANNER)
     assert info.kind == 'ДКС'
-    assert info.machine == 6
+    assert info.machine == 0, 'модель «БЭСМ-6» не должна идти в номер ЭВМ'
     assert info.terminal == 3
     assert info.wire == 'RAW'
     assert info.seen
+
+
+def test_os_greeting_gives_machine_and_terminal():
+    """Приветствие ОС «ЭВМ-3,Т017» — источник номера ЭВМ и терминала.
+
+    Линия ДКС шлёт его кодами КОИ-7, и кириллица приходит **латинскими
+    омоглифами**: на месте «ЭВМ» идут байты `7C 42 4D`, то есть `ЭBM`.
+    Разбор обязан терпеть омоглифы — иначе номер ЭВМ с живой линии не
+    читался бы вовсе.
+    """
+    from mc7401.chars import display_dks
+    wire = bytes([0x7C, 0x42, 0x4D, 0x2D, 0x33, 0x2C, 0x54, 0x30, 0x31, 0x37])
+    assert ''.join(display_dks(b) for b in wire) == 'ЭBM-3,T017'
+    info = parse_greeting(wire)
+    assert info.machine == 3
+    assert info.terminal == 17
+
+
+def test_os_greeting_utf8_gives_machine_and_terminal():
+    """То же приветствие в UTF-8 читается так же."""
+    info = parse_greeting('ЭВМ-3,Т017'.encode('utf-8'))
+    assert info.machine == 3
+    assert info.terminal == 17
 
 
 def test_banner_without_machine_leaves_it_unknown():

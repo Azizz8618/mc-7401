@@ -377,3 +377,41 @@ def test_footer_height_stable_while_scrolling(monkeypatch):
         f'подвал вырос с {before} до {win.footer_px()} при прокрутке')
     assert not win.diag.entries, (
         f'прокрутка пишет в журнал: {list(win.diag.entries)[:2]}')
+
+
+def test_function_keys_do_not_append_a_diagnostics_row(monkeypatch):
+    """Служебные клавиши не добавляют строку журнала в подвал.
+
+    Строка журнала выводится последней строкой подвала, и запись в
+    журнал идёт **с меткой времени** — на F7 внизу «вылезали часы», а
+    подвал оттого рос на ряд, и кадр дёргался.  Состояние этих
+    клавиш и так видно в ячейках панели (`ПЕРО=`, `ИНСТ=`, `ТИП=`,
+    `ТОЛ=`, `РЕЖИМ`, `ЭХО=`, `ВЫД=`).
+    """
+    from test_frontend import make_window, FakeEvent
+    win = make_window(monkeypatch)
+    win.paint()
+    before = win.footer_px()
+    for keysym in ('F2', 'F3', 'F4', 'F6', 'F7'):
+        win._on_key(FakeEvent(keysym, ''))
+        assert not win.diag.entries, (
+            f'{keysym} пишет в журнал: {list(win.diag.entries)[:1]}')
+        assert win.footer_px() == before, (
+            f'{keysym}: подвал вырос с {before} до {win.footer_px()}')
+
+
+def test_diagnostics_row_has_no_clock(monkeypatch):
+    """Строка журнала в подвале идёт без метки времени.
+
+    Часы в подвале уже есть (строка состояния), а время в журнале —
+    время компьютера, а не ЭВМ, и на фоне выдачи читалось как лишнее.
+    """
+    from mc7401.panel import Diagnostics
+    diag = Diagnostics()
+    diag.add('ошибка связи', 'err')
+    rows = diag.lines(1)
+    text = ' '.join(''.join(t for t, _ in cell) for cell in rows)
+    assert 'ОШИБ' in text
+    assert ':' not in text, f'в строке журнала осталось время: {text!r}'
+    # Отметка времени в самом журнале сохраняется — для разбора.
+    assert diag.recent(1)[0][0], 'в журнале пропала отметка времени'
