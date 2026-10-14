@@ -481,9 +481,12 @@ class TerminalApp:
         self.session = Session()
         #: Настройки из файла конфигурации.
         self.config = config or Config.default()
-        self.session.mode = self.config.mode
+        # Режим — через `set_mode`, а не присваиванием: так эхо
+        # пересчитывается по нему (`echo = auto`: в С ЭВМ эхо делает ЭВМ,
+        # и локальное печатало бы каждый знак второй раз).
+        self.session.set_mode(self.config.mode)
         self.session.set_charset(self.config.charset)
-        self.session.echo = self.config.echo
+        self.session.set_echo(self.config.echo)
         self.pen.enabled = self.config.pen
         self.grid = self.config.grid or grid
         self.graphics = self.config.graphics or graphics
@@ -506,6 +509,12 @@ class TerminalApp:
         self._best_n = 0
         #: История очищенных экранов — на неё возвращает `ЭКРАН↑`.
         self._history: list = []
+        #: Какой кадр из `_history` показан: `None` — текущий.  Заполняется
+        #: при листании, когда строки выдачи уже кончились.
+        self._hist_at: Optional[int] = None
+        #: На сколько строк окно выдачи отошло назад (`ЭКРАН↑`/`ЭКРАН↓`).
+        #: Ноль — показан текущий конец выдачи.
+        self._text_back = 0
         #: Нажат ли `Ctrl`: служебные клавиши эмулятора — только с ним.
         self.ctrl = False
         #: Для какого кадра и при какой геометрии окна подгонка уже
@@ -687,12 +696,36 @@ class TerminalApp:
         return self._best_fb
 
     def _text_window(self, cols: int, rows: int) -> list:
-        """Строки текста ЭВМ под картинкой, ровно `rows` штук."""
+        """Строки текста ЭВМ под картинкой, ровно `rows` штук.
+
+        Окно листается назад по `_text_back` строк (`ЭКРАН↑`/`ЭКРАН↓`):
+        строки, ушедшие с экрана, остаются в `_raw_text`, и оператор
+        может вернуться к прежней выдаче.  Без этого `ЭКРАН↑` двигал
+        только кадр, а текст ЭВМ уезжал безвозвратно.
+        """
         text = self._text_lines()
-        lines = text[-rows:] if rows > 0 else []
+        if rows <= 0:
+            return []
+        end = max(0, len(text) - self._text_back)
+        lines = text[max(0, end - rows):end]
+        # Добор пустыми строками — **вниз**: как и прежде, чтобы окно
+        # не прыгало по высоте, пока выдача короче экрана.
         while len(lines) < rows:
             lines.append('')
-        return lines[:max(0, rows)]
+        return lines[:rows]
+
+    def scroll_text(self, direction: int, rows: int) -> int:
+        """Листать выдачу текста: `-1` — назад, `1` — к текущему.
+
+        Возвращает, на сколько строк окно отошло назад.  Дальше самой
+        старой строки не ходим — прокрутка останавливается на первой
+        выданной строке, пустоту не листаем (как на 15ИЭ).
+        """
+        text = self._text_lines()
+        page = max(1, rows)
+        limit = max(0, len(text) - page)
+        self._text_back = max(0, min(limit, self._text_back - direction * page))
+        return self._text_back
 
     def _body_lines(self, cols: int, rows: int) -> list:
         """Содержимое окна: текст ЭВМ, заставка и кадр — вместе.
@@ -700,15 +733,26 @@ class TerminalApp:
         Текст, присланный ЭВМ (приглашения и ответы ОС Диспак), идёт
         сверху; под ним — рисунок, если кадр есть.  Окно одно: и надпись,
         и графика видны одновременно, как на настоящем терминале.
+
+        При листании назад (`_text_back`) кадр и заставка уступают место
+        тексту: оператор вернулся к прежней выдаче, и рисунок под ней —
+        не то, что он смотрит.
         """
         from . import chars
         text = self._text_lines()
         has_fb = self._visible_fb() is not None
-        # Текста берём столько, сколько помещается, кадру оставляем
-        # хотя бы треть окна — иначе при длинном ответе ЭВМ рисунок
-        # совсем пропадёт.
+        # Листаем назад: окно целиком отдано тексту, кадр не рисуем.
+        if self._text_back:
+            end = max(0, len(text) - self._text_back)
+            take = min(rows, end)
+            lines = text[max(0, end - take):end]
+            return lines[:rows]
+        # Показываем **конец** выдачи: терминал открыт на последнем
+        # ответе ЭВМ, а не на первом.  Текста берём столько, сколько
+        # помещается; с кадром — не больше, чем под ним остаётся хотя
+        # бы треть окна, иначе при длинном ответе ЭВМ рисунок пропадёт.
         take = min(len(text), max(0, rows - max(3, rows // 3))) if has_fb \
-            else len(text)
+            else min(len(text), rows)
         lines = text[len(text) - take:] if take else []
         rest = max(0, rows - len(lines))
         if rest == 0:
@@ -1177,10 +1221,10 @@ class TerminalApp:
             vp.x = min(self.emu.fb.width, vp.x + step)
         elif key == 'KEY_RIGHT':                 # кадр вправо
             vp.x = max(0, vp.x - step)
-        elif key == 'KEY_PAGEUP':                # ЭКРАН↑
-            self._scroll_screen(-1)
-        elif key == 'KEY_PAGEDOWN':              # ЭКРАН↓
-            self._scroll_screen(1)
+        elif key == 'KEY_PAGEUP':                # ЭКРАН↑ — назад по выдаче
+            self._page_text(-1)
+        elif key == 'KEY_PAGEDOWN':              # ЭКРАН↓ — к текущему
+            self._page_text(1)
         elif key == 'KEY_BACKSPACE' or key == '\x7f':
             self.input_line = self.input_line[:-1]
             if self.session.echo and self.echo_buf \
@@ -1302,7 +1346,14 @@ class TerminalApp:
             self.message = 'перерисовано'
 
     def _scroll_screen(self, direction: int) -> None:
-        """`ЭКРАН↑` / `ЭКРАН↓` — листание окна просмотра, как на 15ИЭ."""
+        """Листание окна просмотра **графики** — по стрелкам с `Ctrl`.
+
+        Раньше `ЭКРАН↑`/`ЭКРАН↓` двигали именно кадр, а строки текста ЭВМ
+        уезжали с экрана безвозвратно: оператор не мог вернуться к прежней
+        выдаче.  Теперь эти клавиши листают выдачу (`_page_text`), а
+        кадр сдвигают стрелки с `Ctrl` — как на 15ИЭ, где `ЭКРАН` ходит
+        по общему потоку, а кадр смотрит отдельно.
+        """
         vp = self.renderer.vp
         step = max(8, vp.scale * 8) * 4
         if direction < 0:
@@ -1310,10 +1361,44 @@ class TerminalApp:
         else:
             vp.y = max(0, vp.y - step)
 
+    def _page_text(self, direction: int) -> None:
+        """`ЭКРАН↑`/`ЭКРАН↓` — листание выдачи на страницу.
+
+        Истории две и они разного рода: **строки** — всё, что ЭВМ
+        выдала (их много, и они мельче), а **кадры** — то, что стёрто
+        по `F5 ОЧИСТКА`.  Сперва листаются строки, а как только
+        прокрутка упирается в самую старую, колесо переходит к кадрам:
+        так до самого начала выдачи можно дойти одной страницей.
+        """
+        rows = max(1, self.layout()[1])
+        before = self._text_back
+        back = self.scroll_text(direction, rows)
+        if direction < 0 and back == before:
+            # Строки кончились — идём по кадрам, стёртым `F5`.
+            self._scroll_screen(-1)
+            self.message = (f'кадр {self._hist_at + 1}'
+                            if self._hist_at is not None else 'начало')
+            return
+        if direction > 0 and back == before and self._hist_at is not None:
+            self._hist_at = max(0, self._hist_at - 1)
+            if self._hist_at == 0:
+                self._hist_at = None
+            self.message = 'выдача'
+            return
+        if back:
+            self.message = f'история: назад {back}'
+        elif direction < 0:
+            self.message = 'выдача: начало'
+        else:
+            self.message = ''
+
     def _clear_screen(self) -> None:
         """`ОЧИСТКА` (F5): экран — в историю, кадр — в начало.
 
-        Прежний кадр сохраняется: к нему возвращает `ЭКРАН↑`.
+        Прежний кадр сохраняется: к нему возвращает `ЭКРАН↑`.  Окно
+        выдачи при этом возвращается к текущему концу — после очистки
+        оператор смотрит на новый экран, а не на пустоту прежней
+        выдачи.
         """
         shown = self._visible_fb()
         if shown is not None:
@@ -1325,6 +1410,8 @@ class TerminalApp:
             self.emu.execute(self.emu.parser.parse(b'S\x55'))
         self._best_fb = None
         self._best_n = 0
+        self._text_back = 0
+        self._hist_at = None
         self.message = 'экран очищен'
 
 

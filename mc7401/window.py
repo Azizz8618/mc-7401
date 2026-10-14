@@ -135,10 +135,13 @@ class TerminalWindow:
         self.session = Session()
         if config is not None:
             # Настройки сеанса — как в `tui.py`: режим, набор знаков, эхо.
-            self.session.mode = getattr(config, 'mode', self.session.mode)
+            # Режим задаётся через `set_mode`, а не присваиванием: так
+            # эхо пересчитывается по нему (`echo = auto` — в С ЭВМ эхо
+            # делает ЭВМ, и локальное печатало бы знак второй раз).
+            self.session.set_mode(getattr(config, 'mode', self.session.mode))
             self.session.set_charset(
                 getattr(config, 'charset', self.session.charset_set))
-            self.session.echo = getattr(config, 'echo', self.session.echo)
+            self.session.set_echo(getattr(config, 'echo', None))
         self.best, self.best_n = self.emu.fb.copy(), 0
         self.running = True
         self._tk = None

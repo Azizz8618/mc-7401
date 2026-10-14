@@ -650,9 +650,14 @@ def test_window_host_text_moves_with_cursor(monkeypatch):
 
 
 def test_window_letters_type_at_cursor(monkeypatch):
-    """Набор: знак уходит в линию и рисуется глифом в позиции курсора."""
+    """Набор: знак уходит в линию и рисуется глифом в позиции курсора.
+
+    Эхо включаем явно: по умолчанию в режиме С ЭВМ его нет — эхо делает
+    ЭВМ, и локальное печатало бы каждый знак второй раз.
+    """
     win = make_window(monkeypatch)
     win.driver = FakeDriver()
+    win.session.set_echo(True)
     win.console.goto(0, 0)
     win._on_key(FakeEvent('e', 'e'))
     assert win.session.mode == 'host'
@@ -668,10 +673,32 @@ def test_window_echo_off_skips_glyph(monkeypatch):
     """Без эхо набранный знак не рисуется (например, пароль)."""
     win = make_window(monkeypatch)
     win.driver = FakeDriver()
-    win.session.toggle_echo()
+    win.session.set_echo(False)
     win._on_key(FakeEvent('e', 'e'))
     assert win.driver.sent == ['e'], 'e не ушла в линию'
     assert win.emu.fb.count_set() == 0, 'эхо выключено — знака быть не должно'
+
+
+def test_window_no_double_echo_when_evm_echoes_back(monkeypatch):
+    """Знак не печатается дважды, когда ЭВМ возвращает его сама.
+
+    Режим С ЭВМ: терминал шлёт знак в линию, ОС Диспак echoes его назад.
+    С локальным эхом знак выходил бы на экране дважды — «лишнее эхо
+    каждого символа».
+    """
+    win = make_window(monkeypatch)
+    win.driver = FakeDriver()
+    win.console.goto(0, 0)
+    assert win.session.mode == 'host'
+    assert win.session.echo is False, 'в С ЭВМ локальное эхо лишнее'
+    win._on_key(FakeEvent('e', 'e'))
+    assert win.driver.sent == ['e'], 'e не ушла в линию'
+    assert win.emu.fb.count_set() == 0, 'знак нарисован до ответа ЭВМ'
+    # ЭВМ echoes знак обратно — он и рисуется, один раз.
+    win.session_text(b'e')
+    assert win.emu.fb.count_set() > 0, 'знак от ЭВМ не нарисован'
+    win.console.goto(1, 0)
+    win.console.home()
 
 
 def test_window_arrows_move_cursor_by_cells(monkeypatch):
@@ -1543,9 +1570,14 @@ def test_click_without_pen_moves_text_cursor(monkeypatch):
 
 
 def test_window_backspace_erases_glyph(monkeypatch):
-    """ВК стирает знакомёст слева от курсора."""
+    """ВК стирает знакомёст слева от курсора.
+
+    Эхо включаем явно: проверка о стирании, а не об эхо (по умолчанию
+    в режиме С ЭВМ его нет — эхо делает ЭВМ).
+    """
     win = make_window(monkeypatch)
     win.driver = FakeDriver()
+    win.session.set_echo(True)
     win.console.goto(0, 0)
     win._on_key(FakeEvent('e', 'e'))
     assert win.emu.fb.count_set() > 0

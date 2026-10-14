@@ -40,8 +40,18 @@ class Session:
     mode: str = MODE_HOST
     #: Накопленный автономный набор; в режиме HOST не растёт.
     buffer: list[str] = field(default_factory=list)
-    #: Эхо набираемого текста на экране (клавиша «ЭХО»).
-    echo: bool = True
+    #: Локальное эхо набираемого: терминал печатает знак сам.
+    #:
+    #: Нужно только там, где **никто другой не echoes**.  В режиме
+    #: С ЭВМ эхо делает ЭВМ (ОС Диспак возвращает каждый знак), и
+    #: вместе с локальным эхом знак выходил бы на экран дважды —
+    #: «лишнее эхо каждого символа».  В АВТОНОМНО эха больше ниоткуда,
+    #: и без него набор не видно.  Поэтому по умолчанию эхо **следует
+    #: за режимом** (`_echo_follows`), а клавиша «ЭХО» (F6) задаёт его
+    #: вручную — например, чтобы не печатать пароль.
+    echo: bool = False
+    #: Эхо не задано вручную и следует за режимом сеанса.
+    _echo_follows: bool = True
     #: Русская раскладка (ФОН/ПОЗ) живёт только в наборе Н1 — в Н0 и Н2
     #: её нет, иначе позиционная таблица съедала бы знаки международной
     #: строки.  Это тоже из 15ИЭ.
@@ -51,6 +61,7 @@ class Session:
 
     def __post_init__(self) -> None:
         self._check_layout()
+        self._apply_echo()
 
     # ── режим ───────────────────────────────────────────────────────────────
 
@@ -66,6 +77,7 @@ class Session:
         out = self.send(line_end=0) if mode == MODE_HOST else b''
         self.mode = mode
         self._check_layout()
+        self._apply_echo()
         return out
 
     def toggle_mode(self) -> bytes:
@@ -79,6 +91,7 @@ class Session:
             return self.set_mode(MODE_HOST)
         self.mode = MODE_LOCAL
         self._check_layout()
+        self._apply_echo()
         return b''
 
     # ── набор ───────────────────────────────────────────────────────────────
@@ -137,11 +150,35 @@ class Session:
             return b''
         return b'S' + bytes((VK,))
 
-    def set_echo(self, value: bool) -> bool:
-        self.echo = bool(value)
+    def echo_for_mode(self) -> bool:
+        """Эхо, уместное для текущего режима сеанса.
+
+        В **С ЭВМ** — выключено: эхо делает ЭВМ, и локальное эхо
+        выводило бы каждый знак дважды.  В **АВТОНОМНО** — включено:
+        больше никто не echoes, и без него набор не видно.
+        """
+        return self.mode == MODE_LOCAL
+
+    def _apply_echo(self) -> None:
+        """Обновить эхо по режиму — пока оно не задано вручную."""
+        if self._echo_follows:
+            self.echo = self.echo_for_mode()
+
+    def set_echo(self, value: Optional[bool]) -> bool:
+        """Задать эхо вручную.
+
+        `None` — вернуть «следует за режимом»: значение снова будет
+        пересчитываться при каждой смене режима (F9).
+        """
+        self._echo_follows = value is None
+        if self._echo_follows:
+            self._apply_echo()
+        else:
+            self.echo = bool(value)
         return self.echo
 
     def toggle_echo(self) -> bool:
+        """Переключить эхо вручную (F6) — на пароль и обратно."""
         return self.set_echo(not self.echo)
 
     # ── набор знаков и раскладка ────────────────────────────────────────────
@@ -168,11 +205,22 @@ class Session:
     # ── панель ──────────────────────────────────────────────────────────────
 
     def panel(self) -> str:
-        """Сведения для строки состояния."""
+        """Сведения для строки состояния.
+
+        Про эхо сказано прямо — **кто** echoes: в С ЭВМ по умолчанию
+        эхо делает ЭВМ, и подпись «эхо» без уточнения читалась бы как
+        «эхо выключено совсем».
+        """
         from .chars import SET_LABELS
+        if self.echo:
+            echo = 'эхо терминала'
+        elif self.mode == MODE_HOST:
+            echo = 'эхо ЭВМ'
+        else:
+            echo = 'эхо выкл'
         bits = [MODE_LABELS[self.mode],
                 SET_LABELS.get(self.charset_set, self.charset_set),
-                'эхо' if self.echo else 'эхо выкл']
+                echo]
         if self.layout:
             bits.append('ФОН' if self.layout == 'phonetic' else 'ПОЗ')
         if self.buffer:

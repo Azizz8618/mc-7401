@@ -955,10 +955,42 @@ def test_echo_toggles():
     """Клавиша ЭХО: снята — набираемое не печатается."""
     from mc7401.session import Session
     s = Session()
-    assert s.echo is True
-    assert s.toggle_echo() is False
-    assert 'эхо выкл' in s.panel()
+    # По умолчанию эхо **следует за режимом**, а режим по умолчанию —
+    # С ЭВМ, где эхо делает ЭВМ.  Если бы терминал печатал знак ещё и
+    # сам, каждый символ выходил бы на экран дважды.
+    assert s.echo is False, 'в С ЭВМ локальное эхо лишнее'
+    assert 'эхо ЭВМ' in s.panel(), 'не сказано, что echoes ЭВМ'
     assert s.toggle_echo() is True
+    assert 'эхо терминала' in s.panel()
+    assert s.toggle_echo() is False
+    assert 'эхо ЭВМ' in s.panel()
+
+
+def test_echo_follows_the_session_mode():
+    """`echo = auto`: в С ЭВМ эха нет, в АВТОНОМНО — есть.
+
+    В С ЭВМ эхо делает ЭВМ (знак уходит в линию и возвращается
+    нарисованным), и локальное эхо выводило бы его второй раз.  В
+    АВТОНОМНО больше никто не echoes — без него набор не видно.
+    """
+    from mc7401.session import Session, MODE_HOST, MODE_LOCAL
+    s = Session(mode=MODE_HOST)
+    assert s.echo is False
+    s.set_mode(MODE_LOCAL)
+    assert s.echo is True, 'в АВТОНОМНО без эха набора не видно'
+    s.set_mode(MODE_HOST)
+    assert s.echo is False
+    # Ручное решение (F6) держится до смены режима: пароль не печатается
+    # и в АВТОНОМНО, пока оператор сам его не включил.
+    s.toggle_echo()
+    assert s.echo is True
+    s.set_mode(MODE_LOCAL)
+    assert s.echo is True, 'ручное решение должно пережить смену режима'
+    # Возврат к «по режиму» — снова пересчитывается.
+    s.set_echo(None)
+    assert s.echo is True
+    s.set_mode(MODE_HOST)
+    assert s.echo is False
 
 
 def test_russian_layout_exists_only_in_koi8r():
@@ -981,8 +1013,23 @@ def test_config_defaults_without_file():
     c = Config.default()
     assert c.charset == 'n2'
     assert c.mode == 'host'
-    assert c.echo is True
+    # `None` — «по режиму сеанса»: в С ЭВМ эхо делает ЭВМ, в АВТОНОМНО —
+    # терминал.  `true` в режиме С ЭВМ давало бы лишнее эхо каждого
+    # символа: знак выходил на экран дважды.
+    assert c.echo is None
     assert c.endpoint == '127.0.0.1:4202-4223'
+
+
+def test_config_echo_auto_and_manual():
+    """`[terminal] echo`: `auto` — по режиму, `true`/`false` — вручную."""
+    from mc7401.config import parse_echo
+    assert parse_echo('auto') is None
+    assert parse_echo('') is None
+    assert parse_echo('true') is True
+    assert parse_echo('false') is False
+    # Непонятное значение не молча превращается в «печатать»: лишнее
+    # эхо заметнее его отсутствия, и оставляем прежнее.
+    assert parse_echo('мусор', False) is False
 
 
 def test_config_reads_sections(tmp_path):

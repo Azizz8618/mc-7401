@@ -71,6 +71,22 @@ def parse_eol(value: Optional[str], default: int = 0o015) -> int:
     return code
 
 
+def parse_echo(value, default=None):
+    """Значение `[terminal] echo`: `True`, `False` или `None` (по режиму).
+
+    `auto`/`по режиму`/пусто — `None`: эхо пересчитывается при смене
+    режима сеанса.  Прочие значения разбираются как булевы, и непонятное
+    не молча превращается в «печатать», а остаётся прежним: лишнее эхо
+    заметнее его отсутствия.
+    """
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ('auto', 'mode', 'по режиму', ''):
+        return None
+    return configparser.ConfigParser.BOOLEAN_STATES.get(text, default)
+
+
 def clamp_glyph(value: int) -> int:
     """Размер знака текстового слоя кадра — целое 1…4.
 
@@ -117,8 +133,14 @@ mode = host
 #              koi8r — КОИ-8Р (кириллица в 0x60…0x7F).
 # Клавиша `z` переключает набор по кругу.
 charset = n2
-# Эхо набираемого на экране (клавиша `e`). Снято — пароль не печатается.
-echo = true
+# Локальное эхо набора: терминал сам печатает каждый знак.
+#   auto  — по режиму сеанса (по умолчанию): в С ЭВМ эхо делает ЭВМ,
+#           в АВТОНОМНО — терминал.  Совпадённое давало «лишнее эхо
+#           каждого символа»: знак выходил на экран дважды.
+#   true  — всегда печатать самому (например, линия молчит).
+#   false — никогда (пароль не печатается).
+# Клавиша `e` (F6) переключает эхо вручную до смены режима.
+echo = auto
 # Размер знака текстового слоя кадра: во сколько раз растр знакогенератора
 # (7×8 точек) увеличен на кадре.  1 — как в ПЗУ: знакомест 8×10,
 # сетка 70×40 (**по умолчанию**).  2 — вдвое крупнее: растр 14×16,
@@ -202,7 +224,10 @@ class Config:
     # [terminal]
     mode: str = 'host'
     charset: str = 'n2'
-    echo: bool = True
+    #: Локальное эхо набора.  `None` — **по режиму сеанса**: в С ЭВМ
+    #: эхо делает ЭВМ (иначе знак выходит на экран дважды), в
+    #: АВТОНОМНО — терминал.  `True`/`False` — задать вручную.
+    echo: Optional[bool] = None
     pen: bool = False
     grid: bool = False
     #: Ряды-легенды подвала (справка по клавишам) — как `--no-help` в 15ИЭ.
@@ -276,7 +301,8 @@ class Config:
         if p.has_section('terminal'):
             self.mode = p.get('terminal', 'mode', fallback=self.mode)
             self.charset = p.get('terminal', 'charset', fallback=self.charset)
-            self.echo = p.getboolean('terminal', 'echo', fallback=self.echo)
+            self.echo = parse_echo(p.get('terminal', 'echo', fallback=None),
+                                  self.echo)
             self.pen = p.getboolean('terminal', 'pen', fallback=self.pen)
             self.grid = p.getboolean('terminal', 'grid', fallback=self.grid)
             self.glyph = clamp_glyph(p.getint('terminal', 'glyph',
