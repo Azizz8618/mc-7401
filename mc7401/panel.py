@@ -294,7 +294,7 @@ def state_rows(st: Status, width: int = COLW) -> list[Cell]:
              'on' if st.pen else 'off'),
         cell('ИНСТ=', PEN_TOOLS.get(st.pen_tool, st.pen_tool)
              if st.pen and not st.pen_mode else EMPTY),
-        cell('ЛИН=', str(st.pen_line_type) if st.pen and not st.pen_mode
+        cell('ТИП=', str(st.pen_line_type) if st.pen and not st.pen_mode
              else EMPTY,
              'on' if st.pen else 'off'),
         cell('ТОЛ=', str(st.pen_width) if st.pen and not st.pen_mode

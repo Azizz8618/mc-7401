@@ -334,3 +334,46 @@ def test_render_accepts_pen_modes(pen):
     fb = Framebuffer(SCREEN_WIDTH, 400)
     chrome.render(fb, chrome.status_rows(st),
                   chrome.footer_rows(st), frame_height=400)
+
+def test_panel_cell_labels_are_unique():
+    """Метки ячеек подвала не повторяются.
+
+    Тип линии пера получил метку `ЛИН=` — ту же, что у линии ДКС, и в
+    подвале читались два одинаковых `ЛИН=` подряд: видно было не то,
+    что за линия и не то за тип пера.  Переименование в `ТИП=` —
+    единственное, что нужно; проверка не дастcollision'у вернуться.
+    """
+    st = make_status()
+    st.pen = True
+    labels = []
+    for row in chrome.footer_rows(st, help_=False):
+        for cell in row:
+            if row == [panel.RULE]:
+                continue
+            for text, style in cell:
+                if text.endswith('='):
+                    labels.append(text)
+    dupes = {x for x in labels if labels.count(x) > 1}
+    assert not dupes, f'метки повторяются: {dupes}'
+
+
+def test_footer_height_stable_while_scrolling(monkeypatch):
+    """Прокрутка не меняет высоту подвала.
+
+    Запись в журнал диагностики идёт **с меткой времени**: на каждом
+    щелчке колеса в подвале появлялась строка «часов», подвал оттого
+    рос, менялась высота кадра — и вся прокрутка дёргалась.  Положение
+    окна и так видно в ячейке `ИСТ=`, поэтому в журнал оно не пишется.
+    """
+    from test_frontend import make_window
+    win = make_window(monkeypatch)
+    fill_console = '\r\n'.join(f' stroka {i:03d}' for i in range(1, 120))
+    win.feed(fill_console.encode('latin-1'))
+    win._touch_frame()
+    before = win.footer_px()
+    for _ in range(6):
+        win.scroll_display(-1)
+    assert win.footer_px() == before, (
+        f'подвал вырос с {before} до {win.footer_px()} при прокрутке')
+    assert not win.diag.entries, (
+        f'прокрутка пишет в журнал: {list(win.diag.entries)[:2]}')

@@ -730,8 +730,11 @@ class TerminalWindow:
         step = max(1, int(step))
         before = self.hist.position
         if self.hist.scroll(direction * step) != before:
-            self.diag.add(f'история: {self.hist.size} строк, '
-                          f'назад {self.hist.position}')
+            # Положение окна показывает ячейка `ИСТ=` — писать ещё и в
+            # журнал незачем, и вредно: запись диагностики идёт **с
+            # меткой времени**, поэтому на каждом щелчке колеса в подвале
+            # появлялась строка «часов».  Подвал оттого растёт, а с ним
+            # меняется высота кадра — и прокрутка дёргала весь экран.
             self.last_key = 'ИСТОРИЯ'
             self._dirty = True
             self.paint()
@@ -758,9 +761,8 @@ class TerminalWindow:
         Возвращает, на сколько строк окно отошло назад.
         """
         back = self.hist.scroll(direction)
-        if back:
-            self.diag.add(f'история: {self.hist.size} строк, '
-                          f'назад {back}')
+        # Без записи в журнал — см. `scroll_display`: метка времени в
+        # подвале вырастала на каждом шаге прокрутки.
         self.last_key = 'ИСТОРИЯ'
         self._dirty = True
         self.paint()
