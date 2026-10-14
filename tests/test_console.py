@@ -191,11 +191,66 @@ def test_write_ignores_control_codes():
 
 
 def test_line_wraps_at_screen_edge():
+    """Строка переносится по первому знаку за последним знакоместом.
+
+    Раньше курсор переходил немедленно, и хвостовые пробелы занимали
+    лишний ряд: записи каталога КТЛ идут 71 знаком при сетке в 70, и
+    каждая вставала на два ряда.  Теперь ряд замыкается только когда
+    знак за ним правда есть.
+    """
     fb = Framebuffer()
     con = Console(fb)
     con.goto(COLS - 1, 3)
     con.write(b'A')
-    assert con.col == 0 and con.row == 4, 'перенос на новую строку'
+    assert (con.row, con.col) == (3, COLS - 1), 'перенос вырвался сразу'
+    assert con.pending_wrap, 'строка не помечена заполненной'
+    con.write(b'B')
+    assert (con.row, con.col) == (4, 1), 'перенос не случился'
+    assert not con.pending_wrap, 'перенос не снят'
+
+
+def test_trailing_spaces_do_not_take_an_extra_row():
+    """Строка в 70 знаков и хвостовые пробелы не съедают ряд.
+
+    Ровно случай КТЛ: запись из 71 знака, последний — пробел.  На
+    экране должен быть один ряд, а не два, и текст не должен
+    потеряться.
+    """
+    fb = Framebuffer()
+    con = Console(fb)
+    con.write(b'x' * COLS + b'   ')
+    con.write(b'\n')
+    assert con.row == 1, 'хвостовые пробелы заняли лишний ряд'
+    con.write(b'y' * COLS + b'Z')          # 71-й знак — уже не пробел
+    assert con.row == 2, 'строка из 71 знака должна занять два ряда'
+    from mc7401.console import ROWS as _R, CELL_H as _H, read_row
+    row0 = read_row(fb, (_R - 1 - 0) * _H)
+    row1 = read_row(fb, (_R - 1 - 1) * _H)
+    assert row0.startswith('x' * COLS), row0[:12]
+    assert row1.startswith('y' * COLS + 'Z'), row1[:12]
+
+
+def test_carriage_return_cancels_pending_wrap():
+    """Возврат каретки отменяет отложенный перенос."""
+    fb = Framebuffer()
+    con = Console(fb)
+    con.write(b'z' * COLS)
+    assert con.pending_wrap
+    con.carriage_return()
+    assert not con.pending_wrap, 'перенос не отменён'
+    con.write(b'A')
+    assert (con.row, con.col) == (0, 1), 'строка перенеслась зря'
+
+
+def test_cursor_positioning_cancels_pending_wrap():
+    """Установка позиции отменяет отложенный перенос."""
+    fb = Framebuffer()
+    con = Console(fb)
+    con.write(b'z' * COLS)
+    con.goto(0, 5)
+    assert not con.pending_wrap
+    con.write(b'A')
+    assert (con.row, con.col) == (5, 1)
 
 
 def test_autoscroll_at_bottom():

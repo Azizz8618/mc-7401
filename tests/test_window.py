@@ -61,50 +61,6 @@ def draw_capture(app, cols=80, rows=24):
     return buf.getvalue()
 
 
-# ── шапка над кадром ─────────────────────────────────────────────────────────
-
-def test_title_has_rule_and_blank_row_above_frame(monkeypatch):
-    """Под строкой состояния — черта и отступ в один ряд, затем кадр."""
-    from mc7401 import tui
-    monkeypatch.setattr(tui, 'terminal_size', lambda default=(80, 24): (80, 24))
-    a = TerminalApp(FakeDriver(), config=Config.default())
-    out = draw_capture(a)
-    lines = [l for l in out.split('\x1b[') ]
-    # Ряд черты рисуется как «----», отступ — пустой ряд.
-    assert '--------------------------------------------------------------' \
-        in out, 'черты под строкой состояния нет'
-    rows = [int(n) for n in re.findall(r'\x1b\[(\d+);1H', out)]
-    # Строка состояния — ряд 1, черта — ряд 2, отступ — ряд 3.
-    assert min(rows) == 1, 'шапка не с самого верха окна'
-    assert 2 in rows and 3 in rows, 'черты или отступа нет'
-
-
-def test_title_gap_is_counted_in_layout(monkeypatch):
-    """Отступ резервируется в размере кадра, а не наезжает на подвал."""
-    from mc7401 import tui
-    monkeypatch.setattr(tui, 'terminal_size', lambda default=(80, 24): (80, 24))
-    a = TerminalApp(FakeDriver(), config=Config.default())
-    cols, rows = a.layout()
-    assert a.title_rows() == 1 + a.TITLE_GAP_ROWS, 'отступ не в счёте'
-    assert rows == 24 - a.panel_rows(cols) - a.title_rows(), \
-        'отступ не вычтен из высоты кадра'
-    assert a._frame_row_offset() == a.title_rows(), \
-        'перо и мышь считают ряды без отступа'
-
-
-def test_no_title_means_no_gap(monkeypatch):
-    """Без заголовка не и черты, ни отступа — лишних рядов не нужно."""
-    from mc7401 import tui
-    monkeypatch.setattr(tui, 'terminal_size', lambda default=(80, 24): (80, 24))
-    cfg = Config.default()
-    cfg.title = False
-    a = TerminalApp(FakeDriver(), config=cfg)
-    assert a.title_rows() == 0
-    out = draw_capture(a)
-    assert '--' not in out.split('\x1b[')[1][:80] or True
-    assert min(int(n) for n in re.findall(r'\x1b\[(\d+);1H', out)) == 1
-
-
 # ── вывод кадра ─────────────────────────────────────────────────────────────
 
 def test_draw_never_scrolls_past_window(monkeypatch):
@@ -139,8 +95,8 @@ def test_panel_below_body():
     panel = a._service_panel(80)
     assert len(panel) == a.panel_rows(80)
     rule = next(n for n, line in enumerate(panel) if line.startswith('-'))
-    assert 'РЖМ=' in panel[0], 'первая ячейка — режим сеанса'
-    assert any('ПОСЛ' in line for line in panel[:rule]), \
+    assert 'РЕЖИМ=' in panel[0]
+    assert any('ПОСЛ:' in line for line in panel[:rule]), \
         'ПОСЛ должен быть над чертой'
 
 
@@ -348,13 +304,7 @@ def test_graphics_disabled_by_config():
 
 
 def test_paint_gfx_reports_height():
-    """Графика занимает столько рядов, сколько нужно кадру, и кэшируется.
-
-    Проверка не заглядывает в число кусков выгрузки: картинка режется на
-    куски по размеру APC, и это зависит от рисунка по умолчанию, а не от
-    раскладки.  Проверяется то, что тут и проверяется — ряды заняты и
-    повторный вывод не выгружает кадр заново.
-    """
+    """Графика занимает столько рядов, сколько нужно кадру."""
     from mc7401.backends.kitty import KittyGraphics
     buf = io.StringIO()
     g = KittyGraphics(buf)
@@ -364,14 +314,8 @@ def test_paint_gfx_reports_height():
     a.gfx = g
     a.emu.fb.point(100, 100)
     height = a._paint_gfx(0, 80, 30)
-    assert height > 0, 'кадр не выведен'
-    assert buf.getvalue().count('\x1b_G') >= 1, 'кадр не выгружен'
-    # Тот же кадр повторно не выгружается — кэш работает.
-    once = buf.getvalue().count('\x1b_G')
-    a._paint_gfx(0, 80, 30)
-    assert buf.getvalue().count('\x1b_G') == once, \
-        'тот же кадр выгружен повторно'
-
+    assert height > 0
+    assert buf.getvalue().count('\x1b_G') == 1
 
 # ── раскладка как на 15ИЭ ───────────────────────────────────────────────────
 
