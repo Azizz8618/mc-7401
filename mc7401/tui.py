@@ -555,6 +555,11 @@ class TerminalApp:
         # состояния (`ДКС`, `ЭВМ=`, `ТЕРМ=`).
         #: Данные получены? до них показывается начальный экран.
         self._got_data = False
+        #: Заглушка выдачи ЭВМ (`KEY_F1` «ТИШИ»): принятое отбрасывается,
+        #: экран остаётся как есть — для работы в АВТОНОМНО.
+        self.silence = False
+        #: Сколько байт отброшено заглушкой (видно в ячейке `ТИШИ=`).
+        self.silenced = 0
         #: Последняя нажатая клавиша — строка «ПОСЛ:» подвала.
         self.last_key = ''
         #: Байты последнего набора, ушедшие на линию — для «ПОСЛ:».
@@ -588,6 +593,12 @@ class TerminalApp:
     def feed(self, data: bytes) -> None:
         """Принять данные: графику — в кадр, текст — в строку сообщений."""
         if not data:
+            return
+        if self.silence:
+            # Заглушка (F1 «ТИШИ»): данные читаются и отбрасываются, иначе
+            # приёмное окно переполнилось бы и ЭВМ встала бы.  Экран
+            # остаётся как есть — это и нужно для работы в АВТОНОМНО.
+            self.silenced += len(data)
             return
         if not self.is_command_stream(data):
             # Текст от ЭВМ: приглашения ОС Диспак и ответы программ.
@@ -1022,7 +1033,7 @@ class TerminalApp:
             return f'ЭВМ: {text[-200:]}'
         if self.message:
             return self.message
-        return ('РЕЖИМ=L  ПЕРЕДАЧА=S  ЭХО=e  ОЧИСТКА=x  НАБОР=z  '
+        return ('ТИШИ=F1  РЕЖИМ=L  ПЕРЕДАЧА=S  ЭХО=e  ОЧИСТКА=x  НАБОР=z  '
                 'ПЕРО=p  МАСШТАБ=+/-  ВПИСАТЬ=0  ЦЕНТР=c  '
                 'ЦВЕТ=m  СЕТКА=g  ВЫХОД=q')
 
@@ -1094,6 +1105,8 @@ class TerminalApp:
             cursor='0,0',
             graphics=('протокол' if self.gfx and self.gfx.active
                       else 'псевдографика'),
+            silence=self.silence,
+            silenced=self.silenced,
         )
 
     def _line_info(self):
@@ -1209,7 +1222,19 @@ class TerminalApp:
             return
 
         # ── служебные клавиши терминала (клавиатура 15ВВВ-97-006) ──
-        if key == KEY_MODE:                      # F9 — СЕТЬ
+        if key == 'KEY_F1':                    # F1 — ТИШИНА выдачи ЭВМ
+            # Пока включено, принятое с линии отбрасывается, а экран и
+            # текст остаются как есть: в АВТОНОМНО машина не должна
+            # затирать кадр, в котором работает оператор.
+            if self.silence:
+                skipped = self.silenced
+                self.silence, self.silenced = False, 0
+                self.message = f'выдача возвращена: отброшено {skipped} Б'
+            else:
+                self.silence, self.silenced = True, 0
+                self.message = 'выдача ЭВМ подавлена — экран не меняется'
+            self.last_key = 'ТИШИ ' + ('ВЫКЛ' if not self.silence else 'ВКЛ')
+        elif key == KEY_MODE:                      # F9 — СЕТЬ
             self.session.toggle_mode()
             self.message = 'сеть: ' + self.session.panel()
         elif key == KEY_SEND:                    # F10 — ПЕРЕДАЧА

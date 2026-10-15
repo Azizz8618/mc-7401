@@ -173,6 +173,12 @@ class TerminalWindow:
         self.show_help = bool(getattr(config, 'help', True))
         #: Сетка поверх кадра (`Ctrl-g`) — для привязки к координатам.
         self.grid = bool(getattr(config, 'grid', False))
+        #: Заглушка выдачи ЭВМ (`F1` «ТИШИ»): принятое отбрасывается, экран
+        #: остаётся как есть.  Нужна для работы в АВТОНОМНО, когда машина
+        #: сама пишет в кадр и затирает то, что набирает оператор.
+        self.silence = False
+        #: Сколько байт отброшено заглушкой (видно в ячейке `ТИШИ=`).
+        self.silenced = 0
         #: Кадр или состояние изменились — окно пора перерисовать.
         self._dirty = True
         self._clock_at = 0.0
@@ -214,6 +220,15 @@ class TerminalWindow:
     def feed(self, data: bytes) -> None:
         """Принять данные: графику — в кадр, текст ОС — на кадр глифами."""
         if not data:
+            return
+        if self.silence:
+            # Заглушка (F1 «ТИШИ»): данные читаются и отбрасываются — иначе
+            # приёмное окно линии переполнилось бы и ЭВМ встала бы.  Кадр
+            # и текст остаются как есть: на время работы в АВТОНОМНО это
+            # то, ради чего заглушку и включают.  Счётчик виден в `ТИШИ=`
+            # и снимается снятием заглушки.
+            self.silenced += len(data)
+            self._dirty = True                 # подвал: счётчик пошёл
             return
         self._dirty = True
         # Данные от ЭВМ — тоже повод снять заставку: терминал начал
@@ -1109,6 +1124,25 @@ class TerminalWindow:
         if key == 'F5':                       # ОЧИСТКА
             self.clear_screen()
             return 'break'
+        if key == 'F1':                       # ТИШИНА выдачи ЭВМ
+            # Пока включено, принятое с линии отбрасывается, а экран и
+            # текст остаются как есть: в АВТОНОМНО машина не должна
+            # затирать кадр, в котором работает оператор.  Снятие
+            # заглушки показывает, сколько выдачи было отброшено.
+            if self.silence:
+                skipped = self.silenced
+                self.silence, self.silenced = False, 0
+                self.last_key = 'ТИШИ ВЫКЛ'
+                self.diag.add(f'выдача возвращена: отброшено {skipped} Б',
+                              'state')
+            else:
+                self.silence, self.silenced = True, 0
+                self.last_key = 'ТИШИ ВКЛ'
+                self.diag.add('выдача ЭВМ подавлена — экран не меняется',
+                              'warn')
+            self._dirty = True
+            self.paint()
+            return 'break'
         if key == 'F6':                       # ЭХО
             self.session.toggle_echo()
             # Эхо видно в ячейке `ЭХО=`; в журнал не пишем — см. F7.
@@ -1467,6 +1501,10 @@ class TerminalWindow:
             # Показ образных знаков управляющих кодов (F12): режим виден
             # в подвале, а не только тем, что знаки замигали на кадре.
             ctrl_glyphs=self.console.show_ctrl,
+            # Заглушка выдачи (F1 «ТИШИ»): режим и счётчик отброшенного —
+            # в подвале, иначе «молчащий» экран неотличим от зависшего.
+            silence=self.silence,
+            silenced=self.silenced,
         )
 
     def _line_info(self) -> Line:

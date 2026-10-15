@@ -1870,6 +1870,78 @@ def test_link_disables_nagle():
     assert sock.opts.get((_socket.IPPROTO_TCP, _socket.TCP_NODELAY)) == 1
 
 
+def test_window_silence_keeps_the_frame_while_the_machine_talks(monkeypatch):
+    """`F1` «ТИШИ»: выдача ЭВМ подавлена, экран остаётся как есть.
+
+    Нужно для работы в АВТОНОМНО: машина пишет в кадр сама и затирает то,
+    что набирает оператор.  Данные при этом **читаются** — иначе приёмное
+    окно линии переполнилось бы и ЭВМ встала бы, — и только отбрасываются.
+    """
+    win = make_window(monkeypatch)
+    win.driver = FakeDriver()
+    win.splash = False
+    win.console.goto(0, 0)
+    win.session.set_echo(True)
+    win._on_key(FakeEvent('Л', 'Л'))          # оператор рисует своё
+    drawn = win.emu.fb.count_set()
+    assert drawn > 0
+
+    win._on_key(FakeEvent('F1', ''))
+    assert win.silence
+    listing = '4103 2530\r\nСИПРОД\r\n'.encode('koi8-r')
+    win.feed(listing)
+    assert win.emu.fb.count_set() == drawn, 'выдача ЭВМ затерла кадр'
+    assert win.silenced == len(listing)
+    # Заглушка снимается — выдача идёт на экран снова.
+    win._on_key(FakeEvent('F1', ''))
+    assert not win.silence and win.silenced == 0
+    win.feed('ЕЩЁ ОДНА\r\n'.encode('koi8-r'))
+    assert win.emu.fb.count_set() > drawn, 'после снятия заглушки выдачи нет'
+
+
+def test_window_silence_is_visible_in_the_footer(monkeypatch):
+    """Заглушка и счётчик отброшенного видны в подвале: `ТИШИ=`."""
+    from mc7401.panel import Status, cell_text, state_rows
+    win = make_window(monkeypatch)
+
+    def cell(label):
+        for c in state_rows(Status(silence=win.silence,
+                                   silenced=win.silenced)):
+            if c[0][0] == label:
+                return cell_text(c)
+        return ''                            # pragma: no cover
+
+    assert cell('ТИШИ=') == 'ТИШИ=ВЫКЛ'
+    win.silence, win.silenced = True, 12345
+    assert cell('ТИШИ=') == 'ТИШИ=12,3К'
+
+
+def test_tui_silence_drops_machine_output(app):
+    """В консольном интерфейсе заглушка работает так же."""
+    listing = '4103 2530\r\n'.encode('koi8-r')
+    app.handle_key('KEY_F1')
+    assert app.silence
+    app.feed(listing)
+    assert app.silenced == len(listing)
+    assert not app._raw_text, 'выдача попала в строку сообщений'
+    app.handle_key('KEY_F1')
+    assert not app.silence
+    answer = 'СИПРОД\r\n'.encode('koi8-r')
+    app.feed(answer)
+    assert bytes(app._raw_text) == answer
+
+
+def test_footer_did_not_grow_a_row():
+    """Новая ячейка и подпись клавиши не съели ряд кадра."""
+    from mc7401 import chrome
+    from mc7401.panel import Status
+    st = Status()
+    st.ctrl_glyphs = True
+    st.pen = True
+    rows = chrome.footer_rows(st, help_=True, diag=None)
+    assert len(rows) == 7, [r for r in rows]
+
+
 def test_last_label_shows_code_and_symbol(app):
     """«ПОСЛ» — код выданного знака и сам знак (`≡104 'D'`).
 
