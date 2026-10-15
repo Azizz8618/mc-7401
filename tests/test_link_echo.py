@@ -212,3 +212,27 @@ def test_send_keys_records_echo(monkeypatch):
     assert drv.poll(0) == b''
     line.rx.append(b'AB')
     assert drv.poll(0) == b''
+
+
+def test_stale_echo_queue_stops_eating_machine_output(monkeypatch):
+    """Просроченная очередь эха не съедает выдачу ЭВМ.
+
+    Внутри программы ЭВМ линия не эхит: очередь накапливалась, а когда
+    машина наконец отвечала, срезка съедала первые байты ответа — выдача
+    массива по `В` начинается с таких же байтов и пропадала.  Через
+    `ECHO_TTL` очередь снимается целиком.
+    """
+    drv, line = _driver(monkeypatch)
+    drv.send_keys('В')                   # линия не эхит (внутри программы)
+    drv._echo._sent_at -= drv._echo.ECHO_TTL + 1
+    answer = 'В\r\n' + '4103 2530'
+    line.rx.append(answer.encode('koi8-r'))
+    assert drv.poll(0) == answer.encode('koi8-r')
+    assert not drv._echo.pending
+
+
+def test_echo_queue_is_bounded(monkeypatch):
+    """Очередь эха не растёт без предела."""
+    drv, line = _driver(monkeypatch)
+    drv.send_keys('x' * 500)
+    assert len(drv._echo.pending) <= drv._echo.MAX_PENDING

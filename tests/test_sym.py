@@ -183,6 +183,74 @@ def test_input_label_shows_what_the_terminal_will_show():
     assert chars.input_label('\r') == ''          # управляющий не рисуется
 
 
+def test_os_listing_is_not_taken_for_graphics_either_way():
+    """Выдача ОС не уходит в разбор графики — в обоих фронтендах.
+
+    Консольный интерфейс и окно решали это по-разному: окно — по рамке
+    потока команд, консоль — по **первому знаку** записи
+    (`COMMAND_LETTERS`).  Поэтому в сеансе с КРАБ выдача массива по `В`,
+    где записи начинаются с цифр и с `K`/`S`/`J`, уходила в разбор
+    графики и пропадала: на экране было пусто.
+    """
+    from mc7401.reader import is_command_stream
+    from mc7401.tui import TerminalApp
+    from mc7401.window import _is_commands
+
+    listing = [b'4103\r\n', b'2530\r\n', b'KEY:\r\n', b'SIPROD 123400\r\n',
+               b'1 2 3 4 5\r\n', b'J 1 2 3\r\n', b'* 100\r\n',
+               b'0000111111\r\n']
+    for line in listing:
+        assert not _is_commands(line), f'окно: {line!r} принят за графику'
+        assert not is_command_stream(line), f'общее правило: {line!r}'
+        assert not TerminalApp.is_command_stream(line), \
+            f'консоль: {line!r} принят за графику'
+
+
+def test_command_stream_still_recognised_by_the_shared_rule():
+    """Правило по рамке узнаёт графику и текстовые записи терминала.
+
+    Рамка — маркер блока ВУК `АР2 'F'` и начало блока `'/' ВК`.  Запись
+    без рамки (одинокая `S` + `ВК`) идёт **текстом**: так осторожнее, и
+    именно на этом стоит сохранение выдачи ОС — в потоке от ЭВМ записи
+    без рамки встречаются постоянно.
+    """
+    from mc7401.constants import AR2, VK
+    from mc7401.reader import is_command_stream
+    from mc7401.tui import TerminalApp
+
+    frame = bytes((AR2,)) + b'F'
+    streams = [frame,
+               b'/' + bytes((VK,)) + frame,
+               frame + b'S' + bytes((VK,)) + frame,        # ОЧИСТКА в кадре
+               frame + b'9\x01' + bytes((VK,)) + b';\x00' + 'ПРИВЕТ'.encode(
+                   'koi8-r') + bytes((VK,)),               # строка текста
+               b';\x00' + 'ПРИВЕТ'.encode('koi8-r') + bytes((VK,))]
+    for data in streams:
+        assert is_command_stream(data), data
+        assert TerminalApp.is_command_stream(data), data
+
+
+def test_reader_does_not_hold_unterminated_text_forever():
+    """Текст ОС без `ВК` не затыкает разбор намертво.
+
+    Пока в буфере не встретился `ВК`, читатель держит данные и ждёт.
+    Если в разбор попал текст выдачи (например, массива по `В`), то **вся
+    последующая выдача** оставалась в буфере и на экране было пусто.
+    Теперь запись длиннее `MAX_RECORD` отдаётся как есть: разбор её не
+    узнает, но поток не встанет.
+    """
+    from mc7401.constants import VK
+    from mc7401.reader import CommandStreamReader, EventKind
+    r = CommandStreamReader()
+    payload = '4103 2530 СИПРОД '.encode('koi8-r') + b'A' * r.MAX_RECORD
+    r.feed(payload)
+    assert r.pop(), 'текст без ВК удержан в буфере — выдача подавлена'
+    r.feed(bytes((VK,)))                # следующая выдача идёт свободно
+    assert any(ev.kind is EventKind.COMMAND for ev in r.pop()), \
+        'последующая выдача застряла за текстом'
+    assert r.pending == 0, r.pending
+
+
 def test_hard_sign_is_a_documented_substitute():
     """«Ъ»/«ъ» заменены типографскими знаками — слотов в ПЗУ нет.
 

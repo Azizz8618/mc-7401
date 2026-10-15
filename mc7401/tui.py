@@ -32,6 +32,7 @@ from typing import Callable, Optional
 
 from .emulator import TerminalEmulator
 from . import panel
+from . import reader
 from . import startup
 from .chars import SET_SHORT, encode_input
 from .config import Config
@@ -569,27 +570,20 @@ class TerminalApp:
 
     # ── приём данных ────────────────────────────────────────────────────────
 
-    #: Буквы команд терминала в начале записи.  Запись, начинающаяся с
-    #: одной из них, — операция графики; всё остальное — текст.
-    COMMAND_LETTERS = b'J01245789]}>*3+KS/'
-
     @classmethod
     def is_command_stream(cls, data: bytes) -> bool:
-        """Похоже ли это на поток команд терминала, а не на текст ОС.
+        """Поток команд терминала или текст ОС?
 
-        Признаки: маркер кадра `АР2` или начало блока ВУК `'/' ВК`,
-        либо запись, начинающаяся с буквы команды.  Сообщения ОС Диспак
-        («ЭВМ-3», приглашения) под это не подходят и идут как текст.
+        Правило общее с окном (`reader.is_command_stream`): решает **рамка**
+        потока команд, а не вид текста.
+
+        Раньше здесь стоял разбор по **первому знаку** записи
+        (`COMMAND_LETTERS = J01245789]}>*3+KS/`), и текст ОС с ним делился:
+        выдача, начинающаяся с цифры или с `K`/`S`/`J` (записи каталога,
+        приглашения ключа, выдача массива по `В`), уходила в разбор графики
+        и пропадала.  По правилу из окна такие пакеты идут текстом.
         """
-        from .constants import AR2, VK
-        if bytes((AR2,)) + b'F' in data:
-            return True
-        if b'/' + bytes((VK,)) in data:
-            return True
-        for rec in data.split(bytes((VK,))):
-            if rec[:1] in (bytes((c,)) for c in cls.COMMAND_LETTERS):
-                return True
-        return False
+        return reader.is_command_stream(data)
 
     def feed(self, data: bytes) -> None:
         """Принять данные: графику — в кадр, текст — в строку сообщений."""
@@ -1471,7 +1465,8 @@ class TerminalApp:
         self.session.reset_buffer()
         if out:
             self._send_raw(out)
-            self.message = f'отправлено {len(out)} Б'
+            self.message = (f'отправлено {len(out)} Б — '
+                            + self.session.panel())
 
     def _submit(self) -> None:
         """`ПРПС` (Enter): конец строки.
@@ -1512,6 +1507,12 @@ class TerminalApp:
 
     # ── главный цикл ────────────────────────────────────────────────────────
 
+    #: Сколько ждать данных линии, с.  Короткое: ожидание блокирует и
+    #: ввод, и вывод, а линия ДКС отвечает сразу.
+    POLL_TIMEOUT = 0.05
+    #: Сколько ждать нажатия в простое, с.
+    KEY_TIMEOUT = 0.08
+
     def run(self) -> int:
         cols, rows = self.layout()
         self.renderer.vp.fit(self.emu.fb, cols, rows)
@@ -1521,20 +1522,37 @@ class TerminalApp:
         # Экран перерисовывается только по изменению: полная отрисовка на
         # каждом обороте делала приём клавиш очень медленным.
         dirty = True
-        clock_at = 0.0
+        clock_at = time.monotonic()
         try:
             with RawTerminal():
                 self._probe_gfx()
                 while self.running:
+                    # **Ввод — первым делом.** Раньше клавиатура читалась
+                    # только после того, как линия замолчит: пакет данных
+                    # вызывал `continue`, экран перерисовывался целиком,
+                    # и нажатия копились во входе терминала, пока машина
+                    # пишет.  На эхирующей линии ДКС (каждый знак
+                    # возвращается отдельным пакетом) это выглядело как
+                    # автономный набор: набираешь — уходит рывками.
+                    typed = False
+                    key = read_key(timeout=0.0)
+                    while key:
+                        self.handle_key(key)
+                        dirty = True
+                        typed = True
+                        key = read_key(timeout=0.0)
+                    if typed:
+                        continue          # серия нажатий — одна перерисовка
                     if dirty:
                         self.draw()
                         dirty = False
-                    data = self.driver.poll(0.05)
+                        continue
+                    data = self.driver.poll(self.POLL_TIMEOUT)
                     if data:
                         self.feed(data)
                         dirty = True
                         continue
-                    key = read_key(timeout=0.08)
+                    key = read_key(timeout=self.KEY_TIMEOUT)
                     if key:
                         self.handle_key(key)
                         dirty = True

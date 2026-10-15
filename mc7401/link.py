@@ -185,24 +185,51 @@ class EchoStrip:
     #: Как линия эхит отправленные управляющие знаки.
     ECHO_OF = {0x0D: b"\n", 0x08: b"\x08 \x08"}
 
+    #: Сколько байт эха ждать, с.  Эхо линии приходит сразу; если за это
+    #: время ответа не было — не будет и позже (например, внутри программы
+    #: ЭВМ эхирование выключено).  Держать очередь дальше нельзя: с каждой
+    #: стертой в линию буквой выдача машины теряет первый байт, а выдача
+    #: массива по `В` начинается с таких же байтов — и в итоге пропадает
+    #: именно она.
+    ECHO_TTL = 2.0
+    #: Предел очереди эха: строка экрана — 70 знаков.  Длиннее не бывает.
+    MAX_PENDING = 128
+
     def __init__(self) -> None:
         self.pending = bytearray()
+        #: Когда в очередь последний раз клали эхо — для срока ожидания.
+        self._sent_at = 0.0
 
     def sent(self, data: bytes) -> None:
         """Запомнить, что вернёт линия в эхо на отданные байты."""
         for b in data:
             self.pending += self.ECHO_OF.get(b, bytes((b,)))
+        if len(self.pending) > self.MAX_PENDING:
+            del self.pending[:-self.MAX_PENDING]   # эха столько не будет
+        self._sent_at = time.monotonic()
+
+    def _expired(self) -> bool:
+        """Очередь эха просрочена — эха не будет, снимаем её."""
+        if not self.pending:
+            return True
+        if time.monotonic() - self._sent_at > self.ECHO_TTL:
+            self.pending.clear()
+            return True
+        return False
 
     def strip(self, data: bytes) -> bytes:
-        """Убрать из `data` эхо-ответ; остаток — настоящий вывод ЭВМ.
+        """Убрать из `data` эхо-ответ; остальное — настоящий вывод ЭВМ.
 
         ПР и ПС при сверке неразличимы (линия эхит ПР как ПС).
         Сверка идёт по префиксу: совпавшие байты — эхо, первое
         несовпадение — вывод машины, он показывается целиком
         (как в 15ИЭ `_strip_pending_echo`: очередь сохраняется —
         эхо опоздавших знаков придёт позже и будет срезано).
+
+        Очередь, которая пережила `ECHO_TTL`, снимается целиком: иначе
+        она годами съедает первые байты настоящей выдачи ЭВМ.
         """
-        if not self.pending:
+        if self._expired():
             return data
         i, n = 0, len(data)
         pend = self.pending
@@ -548,6 +575,14 @@ class DKSLink:
                 continue
             self.sock, self.port = s, port
             s.settimeout(self.timeout)
+            # Без `TCP_NODELAY` ядро держит мелкие пакеты ввода до
+            # подтверждения от другой стороны (алгоритм Нейгла): знак,
+            # отправленный по линии ДКС, мог уйти на десятки миллисекунд
+            # позже — ввод шёл рывками, темп задавала сеть, а не оператор.
+            try:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except (OSError, AttributeError):        # pragma: no cover
+                log.debug('TCP_NODELAY недоступен, сеть может копить ввод')
             # Приветствие, пришедшее сразу после accept(), нельзя
             # выбрасывать: на стенде это «Connected to the БЭСМ-6
             # simulator TTY device, line N» — первое, что видит

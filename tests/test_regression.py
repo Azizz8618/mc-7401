@@ -949,6 +949,25 @@ def test_local_mode_buffers_until_send():
     assert s.pending() == b''                    # буфер очищен
 
 
+def test_send_returns_the_terminal_to_host_mode():
+    """После ПЕРЕДАЧА терминал снова в С ЭВМ.
+
+    Иначе он остаётся в АВТОНОМНО, следующий набор снова копится и ждёт
+    ПЕРЕДАЧА — на живой линии это читалось как «передача работает только
+    один раз».  На 15ИЭ SEND снимает автономный режим.
+    """
+    from mc7401.session import Session
+    s = Session()
+    s.toggle_mode()
+    assert s.mode == 'local'
+    s.type_line('ЛИН 3 ')
+    s.send()
+    assert s.mode == 'host', 'после ПЕРЕДАЧА режим не С ЭВМ'
+    # Сразу после передачи знак уходит в линию, а не копится
+    # (Н2: строчная латинская идёт заглавной).
+    assert s.type_line('x') == b'X'
+
+
 def test_clear_command_goes_to_computer_only_in_host_mode():
     """ОЧИСТКА: в HOST команда `S` уходит на ЭВМ, в LOCAL — локально."""
     from mc7401.session import Session

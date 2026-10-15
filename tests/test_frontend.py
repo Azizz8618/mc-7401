@@ -1702,6 +1702,7 @@ def test_window_return_sends_buffer_in_local(monkeypatch):
     win._on_return()
     # Н2 (КОИ-7): «лин» → 0x6C 0x69 0x6E — строка `0x60…0x7E` кириллица
     assert win.driver.sent == ['lin3\r']
+    assert win.session.mode == 'host', 'ПРПС из АВТОНОМНО не вернул С ЭВМ'
 
 
 def test_window_escape_clears_input_not_closes(monkeypatch):
@@ -1770,6 +1771,103 @@ def test_gfx_upload_cached_until_frame_changes(app):
     app.emu.fb.point(20, 20)               # кадр изменился
     app._paint_gfx(1, 80, 24)
     assert app.gfx.uploads == 2
+
+
+class ChattyDriver(FakeDriver):
+    """Линия, которая не замолкает: эхо каждого знака, как на ДКС.
+
+    `poll` отдаёт пакет за пакетом — ровно та картина, из-за которой
+    ввод вставал: нажатия копились, пока машина пишет.
+    """
+
+    def __init__(self, *, packets: int = 50) -> None:
+        super().__init__()
+        self.packets = packets
+        self.polls = 0
+
+    def poll(self, timeout: float) -> bytes:
+        self.polls += 1
+        if self.polls > self.packets:
+            raise _LoopOver('линия замолчала')
+        return b'x'
+
+
+class _LoopOver(Exception):
+    """Страховка теста: цикл не должен крутиться вечно."""
+
+
+def test_keys_are_read_while_the_line_keeps_talking(monkeypatch):
+    """Ввод не ждёт, пока линия замолчит.
+
+    Раньше главный цикл `tui.run` читал клавиатуру только после того, как
+    `poll` вернёт пусто: пакет данных вызывал `continue`, а экан
+    перерисовывался целиком.  На эхирующей линии ДКС набор уходил рывками
+    — выглядело как автономный режим, где знаки копятся в буфере.
+    """
+    from mc7401 import tui as tui_mod
+    app = TerminalApp(ChattyDriver(), config=Config.default())
+    keys = list('abc')
+
+    def fake_read_key(timeout=None):
+        return keys.pop(0) if keys else None
+
+    monkeypatch.setattr(tui_mod, 'read_key', fake_read_key)
+    monkeypatch.setattr(sys, 'stdout', io.StringIO())
+    monkeypatch.setattr(app, 'draw', lambda: None)
+    monkeypatch.setattr(app, '_probe_gfx', lambda: None)
+    typed = []
+    monkeypatch.setattr(app, 'handle_key', typed.append)
+
+    with pytest.raises(_LoopOver):
+        app.run()
+    assert typed == ['a', 'b', 'c'], 'нажатия ждали молчания линии'
+
+
+def test_window_poll_does_not_block_the_ui(monkeypatch):
+    """Опрос линии в окне короткий: нажатие ждёт его целиком.
+
+    Ожидание в тике Tk — это время, в течение которого очередь событий
+    не разбирается: полсекундный опрос давал постоянную задержку ввода.
+    """
+    win = make_window(monkeypatch)
+    win.driver = ChattyDriver(packets=0)
+    assert win.POLL_TIMEOUT <= 0.02, win.POLL_TIMEOUT
+
+
+def test_window_repaint_is_throttled(monkeypatch):
+    """Кадр перерисовывается не чаще `REPAINT_MS`, а не на каждый пакет."""
+    win = make_window(monkeypatch)
+    assert 0 < win.REPAINT_MS <= win.TICK_MS, win.REPAINT_MS
+
+
+def test_link_disables_nagle():
+    """Линия ДКС не копит мелкие пакеты: ввод не должен ждать сеть."""
+    import socket as _socket
+    from mc7401 import link as link_mod
+
+    class _Sock:
+        def __init__(self):
+            self.opts = {}
+            self.timeout = None
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def setsockopt(self, level, opt, value):
+            self.opts[(level, opt)] = value
+
+        def recv(self, n):
+            return b''
+
+        def close(self):
+            pass
+
+    sock = _Sock()
+    original = link_mod.socket.create_connection
+    link_mod.socket.create_connection = lambda addr, timeout: sock
+    link_mod.DKSLink('127.0.0.1', ['4202']).connect()
+    link_mod.socket.create_connection = original
+    assert sock.opts.get((_socket.IPPROTO_TCP, _socket.TCP_NODELAY)) == 1
 
 
 def test_last_label_shows_code_and_symbol(app):

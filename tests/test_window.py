@@ -199,6 +199,11 @@ def test_local_mode_accumulates_then_sends(app):
     app.handle_key(KEY_SEND)                  # F10 — ПЕРЕДАЧА
     assert app.driver.sent == ['lin3\r']
     assert app.session.buffer == []
+    # После ПЕРЕДАЧА терминал снова в С ЭВМ: иначе следующий набор
+    # опять копился бы и ждал ПЕРЕДАЧА.
+    assert app.session.mode == 'host'
+    app.handle_key('l')                  # Н2: строчная латинская → заглавная
+    assert app.driver.sent == ['lin3\r', 'L'], app.driver.sent
 
 
 def test_line_end_configurable():
